@@ -76,14 +76,21 @@ with $$u = [\sigma; \lambda_\text{tor}; \lambda_\text{pol}]$$ and geometry param
 ## Geometry Representation
 
 The surface $$\Gamma$$ is parameterized as a **tubular surface** built around a 3D **centerline** $$\mathbf{r}_0(s)$$:
+
 $$
 \mathbf{r}(s,\alpha) = \mathbf{r}_0(s) + a(s,\alpha)\, [\cos(\alpha)\mathbf{e}_1(s) + \sin(\alpha)\mathbf{e}_2(s)],
 $$
+
 where:
+
 - $$s \in [0,1)$$ is the arc-length parameter along the axis (periodic),
+
 - $$\alpha \in [0,2\pi)$$ is the poloidal angle,
+
 - $$\mathbf{e}_1, \mathbf{e}_2$$ form a **Bishop (parallel-transport) frame** [1],
+
 - $$a(s,\alpha)$$ is a cross-section radius function:
+
   $$
   a(s,\alpha) = a_0(s)\left[ 1 + \sum_m \left( e_c^{(m)}(s)\cos[m(\alpha-\alpha_0(s))] + e_s^{(m)}(s)\sin[m(\alpha-\alpha_0(s))] \right) \right].
   $$
@@ -91,6 +98,7 @@ where:
 All quantities ($$a_0$$$, $$\alpha_0$$, $$e_c^{(m)}$$, $$e_s^{(m)}$$) are smooth B-splines in $$s$$ and differentiable in JAX.
 
 The design vector is:
+
 $$
 p = \{ \text{centerline control points}, \text{twist}, a_0(s), e_c^{(m)}(s), e_s^{(m)}(s), \text{scales} \}.
 $$
