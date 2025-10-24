@@ -54,34 +54,34 @@ $$
 \int_{S_\text{pol}} \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y}) \, \lambda_\text{pol} \, dS_{\mathbf{y}},
 $$
 where:
-- $G(\mathbf{x},\mathbf{y}) = \frac{1}{4\pi|\mathbf{x}-\mathbf{y}|}$ is the Laplace Green’s function,
-- $\sigma(\mathbf{y})$ is the single-layer source density on the boundary $\Gamma$,
-- $\lambda_\text{tor}, \lambda_\text{pol}$ are uniform strengths of the double-layer potentials over toroidal and poloidal cuts.
+- $$G(\mathbf{x},\mathbf{y}) = \frac{1}{4\pi|\mathbf{x}-\mathbf{y}|}$$ is the Laplace Green’s function,
+- $$\sigma(\mathbf{y})$$ is the single-layer source density on the boundary $$\Gamma$$,
+- $$\lambda_\text{tor}, \lambda_\text{pol}$$ are uniform strengths of the double-layer potentials over toroidal and poloidal cuts.
 
-Enforcing the **Neumann condition** $\mathbf{n}\cdot\nabla \Phi = 0$ on $\Gamma$ leads to a dense boundary integral system:
+Enforcing the **Neumann condition** $$\mathbf{n}\cdot\nabla \Phi = 0$$ on $$\Gamma$$ leads to a dense boundary integral system:
 $$
 A(p)\,u = b(p),
 $$
-with $u = [\sigma; \lambda_\text{tor}; \lambda_\text{pol}]$ and geometry parameters $p$.
+with $$u = [\sigma; \lambda_\text{tor}; \lambda_\text{pol}]$$ and geometry parameters $p$.
 
 ---
 
 ## Geometry Representation
 
-The surface $\Gamma$ is parameterized as a **tubular surface** built around a 3D **centerline** $\mathbf{r}_0(s)$:
+The surface $$\Gamma$$ is parameterized as a **tubular surface** built around a 3D **centerline** $$\mathbf{r}_0(s)$$:
 $$
 \mathbf{r}(s,\alpha) = \mathbf{r}_0(s) + a(s,\alpha)\, [\cos(\alpha)\mathbf{e}_1(s) + \sin(\alpha)\mathbf{e}_2(s)],
 $$
 where:
-- $s \in [0,1)$ is the arc-length parameter along the axis (periodic),
-- $\alpha \in [0,2\pi)$ is the poloidal angle,
-- $\mathbf{e}_1, \mathbf{e}_2$ form a **Bishop (parallel-transport) frame** [1],
-- $a(s,\alpha)$ is a cross-section radius function:
+- $$s \in [0,1)$$ is the arc-length parameter along the axis (periodic),
+- $$\alpha \in [0,2\pi)$$ is the poloidal angle,
+- $$\mathbf{e}_1, \mathbf{e}_2$$ form a **Bishop (parallel-transport) frame** [1],
+- $$a(s,\alpha)$$ is a cross-section radius function:
   $$
   a(s,\alpha) = a_0(s)\left[ 1 + \sum_m \left( e_c^{(m)}(s)\cos[m(\alpha-\alpha_0(s))] + e_s^{(m)}(s)\sin[m(\alpha-\alpha_0(s))] \right) \right].
   $$
 
-All quantities ($a_0$, $\alpha_0$, $e_c^{(m)}$, $e_s^{(m)}$) are smooth B-splines in $s$ and differentiable in JAX.
+All quantities ($$a_0$$$, $$\alpha_0$$, $$e_c^{(m)}$$, $$e_s^{(m)}$$) are smooth B-splines in $s$ and differentiable in JAX.
 
 The design vector is:
 $$
@@ -95,10 +95,10 @@ $$
 LX uses a **Nyström discretization** of the boundary integral equation:
 - Discretize $\Gamma$ at $S\times A$ quadrature points.
 - Evaluate kernels via vectorized JAX `vmap` operations.
-- Assemble dense matrices $A(p)$ and right-hand side $b(p)$.
-- Solve $A u = b$ via least-squares (`jax.numpy.linalg.lstsq`).
+- Assemble dense matrices $$A(p)$$ and right-hand side $$b(p)$$.
+- Solve $$A u = b$$ via least-squares (`jax.numpy.linalg.lstsq`).
 
-Once $u$ is known, the field is evaluated as:
+Once $$u$$ is known, the field is evaluated as:
 $$
 \mathbf{B}(\mathbf{x}) = \int_\Gamma \nabla_x G(\mathbf{x},\mathbf{y})\,\sigma(\mathbf{y})\,dS_y +
 \lambda_\text{tor}\!\!\int_{S_\text{tor}}\!\!\nabla_x \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y})\,dS_y +
