@@ -95,7 +95,7 @@ where:
   a(s,\alpha) = a_0(s)\left[ 1 + \sum_m \left( e_c^{(m)}(s)\cos[m(\alpha-\alpha_0(s))] + e_s^{(m)}(s)\sin[m(\alpha-\alpha_0(s))] \right) \right].
   $$
 
-All quantities ($$a_0$$$, $$\alpha_0$$, $$e_c^{(m)}$$, $$e_s^{(m)}$$) are smooth B-splines in $$s$$ and differentiable in JAX.
+All quantities ($$a_0$$, $$\alpha_0$$, $$e_c^{(m)}$$, $$e_s^{(m)}$$) are smooth B-splines in $$s$$ and differentiable in JAX.
 
 The design vector is:
 
