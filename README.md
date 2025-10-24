@@ -89,7 +89,9 @@ where:
 
 - $$\mathbf{e}_1, \mathbf{e}_2$$ form a **Bishop (parallel-transport) frame** [1],
 
-- $$a(s,\alpha)$$ is a cross-section radius function:
+- $$a(s,\alpha)$$
+
+is a cross-section radius function:
 
   $$
   a(s,\alpha) = a_0(s)\left[ 1 + \sum_m \left( e_c^{(m)}(s)\cos[m(\alpha-\alpha_0(s))] + e_s^{(m)}(s)\sin[m(\alpha-\alpha_0(s))] \right) \right].
