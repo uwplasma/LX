@@ -45,7 +45,7 @@ $$
 \nabla^2 \Phi = 0.
 $$
 
-Inside a **toroidal region**, $\Phi$ is *multi-valued* — it can jump by a constant around each non-contractible loop (toroidal and poloidal directions). These discontinuities correspond to **harmonic circulations** of $$\mathbf{B}$$, represented by uniform densities on “cut” surfaces that span the holes of the torus.
+Inside a **toroidal region**, $$\Phi$$ is *multi-valued* — it can jump by a constant around each non-contractible loop (toroidal and poloidal directions). These discontinuities correspond to **harmonic circulations** of $$\mathbf{B}$$, represented by uniform densities on “cut” surfaces that span the holes of the torus.
 
 In LX, we model this as:
 $$
@@ -62,7 +62,7 @@ Enforcing the **Neumann condition** $$\mathbf{n}\cdot\nabla \Phi = 0$$ on $$\Gam
 $$
 A(p)\,u = b(p),
 $$
-with $$u = [\sigma; \lambda_\text{tor}; \lambda_\text{pol}]$$ and geometry parameters $p$.
+with $$u = [\sigma; \lambda_\text{tor}; \lambda_\text{pol}]$$ and geometry parameters $$p$$.
 
 ---
 
@@ -81,7 +81,7 @@ where:
   a(s,\alpha) = a_0(s)\left[ 1 + \sum_m \left( e_c^{(m)}(s)\cos[m(\alpha-\alpha_0(s))] + e_s^{(m)}(s)\sin[m(\alpha-\alpha_0(s))] \right) \right].
   $$
 
-All quantities ($$a_0$$$, $$\alpha_0$$, $$e_c^{(m)}$$, $$e_s^{(m)}$$) are smooth B-splines in $s$ and differentiable in JAX.
+All quantities ($$a_0$$$, $$\alpha_0$$, $$e_c^{(m)}$$, $$e_s^{(m)}$$) are smooth B-splines in $$s$$ and differentiable in JAX.
 
 The design vector is:
 $$
@@ -93,7 +93,7 @@ $$
 ## Numerical Method
 
 LX uses a **Nyström discretization** of the boundary integral equation:
-- Discretize $\Gamma$ at $S\times A$ quadrature points.
+- Discretize $$\Gamma$$ at $$S\times A$$ quadrature points.
 - Evaluate kernels via vectorized JAX `vmap` operations.
 - Assemble dense matrices $$A(p)$$ and right-hand side $$b(p)$$.
 - Solve $$A u = b$$ via least-squares (`jax.numpy.linalg.lstsq`).
