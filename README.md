@@ -114,7 +114,7 @@ Run the script directly:
 python laplace_solver.py
 ```
 
-## Typical output:
+<!-- ## Typical output:
 
 Objective: 3.21e-06
 ||∂L/∂ctrl||        : 1.45e-03
@@ -122,10 +122,10 @@ Objective: 3.21e-06
 ||∂L/∂a0_s||        : 6.52e-05
 ||∂L/∂ec_s||        : 4.87e-05
 ||∂L/∂es_s||        : 5.12e-05
-||∂L/∂alpha0_s||    : 9.10e-05
+||∂L/∂alpha0_s||    : 9.10e-05 -->
 
 
-The objective flattens $|\mathbf{B}|$ along a straight segment of the axis, with small regularizers enforcing smoothness and field energy control.
+The objective flattens $$|\mathbf{B}|$$ along a straight segment of the axis, with small regularizers enforcing smoothness and field energy control.
 
 What to Change
 Parameter	Meaning	Typical Range
@@ -155,20 +155,20 @@ Fast Multipole Acceleration
 Replace dense integrals with a JAX-compatible FMM [4].
 
 Higher-Order Quadrature
-Use product Gauss–Legendre quadrature in $(s,\alpha)$ instead of uniform grids for better accuracy.
+Use product Gauss–Legendre quadrature in $$(s,\alpha)$$ instead of uniform grids for better accuracy.
 
 Additional Harmonic Modes
-Replace scalar $\lambda_\text{tor}$ and $\lambda_\text{pol}$ with a small basis on each cut to represent richer harmonic fields.
+Replace scalar $$\lambda_\text{tor}$$ and $$\lambda_\text{pol}$$ with a small basis on each cut to represent richer harmonic fields.
 
 Zernike Basis for Inner Surfaces
-To represent interior flux surfaces smoothly, fit $r(\rho,\alpha)$ using Zernike polynomials as in [DESC, Ref. 5].
+To represent interior flux surfaces smoothly, fit $$r(\rho,\alpha)$$ using Zernike polynomials as in [DESC, Ref. 5].
 
 Optimization
 Use jaxopt or optax for differentiable optimization with Adam or L-BFGS-B.
 
 Gotchas & Numerical Tips
 
-The Neumann problem for Laplace’s equation is singular up to an additive constant. Fix it by adding one extra constraint, e.g., $\int_\Gamma \sigma,dS = 0$.
+The Neumann problem for Laplace’s equation is singular up to an additive constant. Fix it by adding one extra constraint, e.g., $$\int_\Gamma \sigma,dS = 0$$.
 
 When S_SAMPLES or A_SAMPLES is small, the Bishop frame may accumulate twist; reorthonormalize if needed.
 
