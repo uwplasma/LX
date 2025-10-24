@@ -9,13 +9,13 @@
 **LX** is a differentiable, JAX-based solver for the Laplace equation inside toroidal domains (such as stellarator or mirror geometries). It computes **vacuum magnetic fields**  
 
 $$
-\nabla^2 \Phi = 0, \quad {B} = \nabla \Phi,
+\nabla^2 \Phi = 0, \quad \mathbf{B} = \nabla \Phi,
 $$  
 
 subject to **magnetic flux surface** boundary conditions  
 
 $$
-{n} \cdot {B} = 0 \quad \text{on } \Gamma,
+\mathbf{n} \cdot \mathbf{B} = 0 \quad \text{on } \Gamma,
 $$  
 
 where the surface $$\Gamma$$ represents a magnetic surface of constant flux, analogous to the flux surfaces in magnetohydrodynamic (MHD) equilibrium codes like [DESC](https://desc-docs.readthedocs.io/en/stable/).
@@ -30,13 +30,13 @@ This makes LX suitable for **geometry optimization**, **shape design**, and **in
 The magnetic field in a current-free region (no plasma currents, no coils) satisfies:
 
 $$
-\nabla \cdot {B} = 0, \quad \nabla \times {B} = 0.
+\nabla \cdot \mathbf{B} = 0, \quad \nabla \times \mathbf{B} = 0.
 $$
 
 Thus, the field can be expressed as the gradient of a scalar potential:
 
 $$
-{B} = \nabla \Phi,
+\mathbf{B} = \nabla \Phi,
 $$
 
 and the potential satisfies **Laplace’s equation**:
@@ -45,37 +45,44 @@ $$
 \nabla^2 \Phi = 0.
 $$
 
-Inside a **toroidal region**, $$\Phi$$ is *multi-valued* — it can jump by a constant around each non-contractible loop (toroidal and poloidal directions). These discontinuities correspond to **harmonic circulations** of $${B}$$, represented by uniform densities on “cut” surfaces that span the holes of the torus.
+Inside a **toroidal region**, $$\Phi$$ is *multi-valued* — it can jump by a constant around each non-contractible loop (toroidal and poloidal directions). These discontinuities correspond to **harmonic circulations** of $$\mathbf{B}$$, represented by uniform densities on “cut” surfaces that span the holes of the torus.
 
 In LX, we model this as:
+
 $$
-\Phi({x}) = \int_{\Gamma} G({x},{y}) \, \sigma({y}) \, dS_{{y}} +
-\int_{S_\text{tor}} \frac{\partial G}{\partial n_y}({x},{y}) \, \lambda_\text{tor} \, dS_{{y}} +
-\int_{S_\text{pol}} \frac{\partial G}{\partial n_y}({x},{y}) \, \lambda_\text{pol} \, dS_{{y}},
+\Phi(\mathbf{x}) = \int_{\Gamma} G(\mathbf{x},\mathbf{y}) \, \sigma(\mathbf{y}) \, dS_{\mathbf{y}} +
+\int_{S_\text{tor}} \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y}) \, \lambda_\text{tor} \, dS_{\mathbf{y}} +
+\int_{S_\text{pol}} \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y}) \, \lambda_\text{pol} \, dS_{\mathbf{y}},
 $$
+
 where:
-- $$G({x},{y}) = \frac{1}{4\pi|{x}-{y}|}$$ is the Laplace Green’s function,
-- $$\sigma({y})$$ is the single-layer source density on the boundary $$\Gamma$$,
+
+- $$G(\mathbf{x},\mathbf{y}) = \frac{1}{4\pi|\mathbf{x}-\mathbf{y}|}$$ is the Laplace Green’s function,
+
+- $$\sigma(\mathbf{y})$$ is the single-layer source density on the boundary $$\Gamma$$,
+
 - $$\lambda_\text{tor}, \lambda_\text{pol}$$ are uniform strengths of the double-layer potentials over toroidal and poloidal cuts.
 
-Enforcing the **Neumann condition** $${n}\cdot\nabla \Phi = 0$$ on $$\Gamma$$ leads to a dense boundary integral system:
+Enforcing the **Neumann condition** $$\mathbf{n}\cdot\nabla \Phi = 0$$ on $$\Gamma$$ leads to a dense boundary integral system:
+
 $$
 A(p)\,u = b(p),
 $$
+
 with $$u = [\sigma; \lambda_\text{tor}; \lambda_\text{pol}]$$ and geometry parameters $$p$$.
 
 ---
 
 ## Geometry Representation
 
-The surface $$\Gamma$$ is parameterized as a **tubular surface** built around a 3D **centerline** $${r}_0(s)$$:
+The surface $$\Gamma$$ is parameterized as a **tubular surface** built around a 3D **centerline** $$\mathbf{r}_0(s)$$:
 $$
-{r}(s,\alpha) = {r}_0(s) + a(s,\alpha)\, [\cos(\alpha){e}_1(s) + \sin(\alpha){e}_2(s)],
+\mathbf{r}(s,\alpha) = \mathbf{r}_0(s) + a(s,\alpha)\, [\cos(\alpha)\mathbf{e}_1(s) + \sin(\alpha)\mathbf{e}_2(s)],
 $$
 where:
 - $$s \in [0,1)$$ is the arc-length parameter along the axis (periodic),
 - $$\alpha \in [0,2\pi)$$ is the poloidal angle,
-- $${e}_1, {e}_2$$ form a **Bishop (parallel-transport) frame** [1],
+- $$\mathbf{e}_1, \mathbf{e}_2$$ form a **Bishop (parallel-transport) frame** [1],
 - $$a(s,\alpha)$$ is a cross-section radius function:
   $$
   a(s,\alpha) = a_0(s)\left[ 1 + \sum_m \left( e_c^{(m)}(s)\cos[m(\alpha-\alpha_0(s))] + e_s^{(m)}(s)\sin[m(\alpha-\alpha_0(s))] \right) \right].
@@ -100,9 +107,9 @@ LX uses a **Nyström discretization** of the boundary integral equation:
 
 Once $$u$$ is known, the field is evaluated as:
 $$
-{B}({x}) = \int_\Gamma \nabla_x G({x},{y})\,\sigma({y})\,dS_y +
-\lambda_\text{tor}\!\!\int_{S_\text{tor}}\!\!\nabla_x \frac{\partial G}{\partial n_y}({x},{y})\,dS_y +
-\lambda_\text{pol}\!\!\int_{S_\text{pol}}\!\!\nabla_x \frac{\partial G}{\partial n_y}({x},{y})\,dS_y.
+\mathbf{B}(\mathbf{x}) = \int_\Gamma \nabla_x G(\mathbf{x},\mathbf{y})\,\sigma(\mathbf{y})\,dS_y +
+\lambda_\text{tor}\!\!\int_{S_\text{tor}}\!\!\nabla_x \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y})\,dS_y +
+\lambda_\text{pol}\!\!\int_{S_\text{pol}}\!\!\nabla_x \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y})\,dS_y.
 $$
 
 ### Performance & Differentiability
@@ -134,7 +141,7 @@ Objective: 3.21e-06
 ||∂L/∂alpha0_s||    : 9.10e-05 -->
 
 
-The objective flattens $$|{B}|$$ along a straight segment of the axis, with small regularizers enforcing smoothness and field energy control.
+The objective flattens $$|\mathbf{B}|$$ along a straight segment of the axis, with small regularizers enforcing smoothness and field energy control.
 
 What to Change
 Parameter	Meaning	Typical Range
