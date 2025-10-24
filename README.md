@@ -116,6 +116,7 @@ LX uses a **Nyström discretization** of the boundary integral equation:
 - Solve $$A u = b$$ via least-squares (`jax.numpy.linalg.lstsq`).
 
 Once $$u$$ is known, the field is evaluated as:
+
 $$
 \mathbf{B}(\mathbf{x}) = \int_\Gamma \nabla_x G(\mathbf{x},\mathbf{y})\,\sigma(\mathbf{y})\,dS_y +
 \lambda_\text{tor}\!\!\int_{S_\text{tor}}\!\!\nabla_x \frac{\partial G}{\partial n_y}(\mathbf{x},\mathbf{y})\,dS_y +
