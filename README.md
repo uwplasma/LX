@@ -7,14 +7,18 @@
 ## Overview
 
 **LX** is a differentiable, JAX-based solver for the Laplace equation inside toroidal domains (such as stellarator or mirror geometries). It computes **vacuum magnetic fields**  
+
 $$
 \nabla^2 \Phi = 0, \quad \mathbf{B} = \nabla \Phi,
 $$  
+
 subject to **magnetic flux surface** boundary conditions  
+
 $$
 \mathbf{n} \cdot \mathbf{B} = 0 \quad \text{on } \Gamma,
 $$  
-where the surface $\Gamma$ represents a magnetic surface of constant flux, analogous to the flux surfaces in magnetohydrodynamic (MHD) equilibrium codes like [DESC](https://desc-docs.readthedocs.io/en/stable/).
+
+where the surface $$\Gamma$$ represents a magnetic surface of constant flux, analogous to the flux surfaces in magnetohydrodynamic (MHD) equilibrium codes like [DESC](https://desc-docs.readthedocs.io/en/stable/).
 
 LX supports **automatic differentiation**, allowing exact gradients of objectives (e.g. magnetic field uniformity, quasi-symmetry proxies) with respect to all geometry degrees of freedom.  
 This makes LX suitable for **geometry optimization**, **shape design**, and **inverse problems** in plasma confinement.
@@ -24,19 +28,24 @@ This makes LX suitable for **geometry optimization**, **shape design**, and **in
 ## Physics Background
 
 The magnetic field in a current-free region (no plasma currents, no coils) satisfies:
+
 $$
 \nabla \cdot \mathbf{B} = 0, \quad \nabla \times \mathbf{B} = 0.
 $$
+
 Thus, the field can be expressed as the gradient of a scalar potential:
+
 $$
 \mathbf{B} = \nabla \Phi,
 $$
+
 and the potential satisfies **Laplace’s equation**:
+
 $$
 \nabla^2 \Phi = 0.
 $$
 
-Inside a **toroidal region**, $\Phi$ is *multi-valued* — it can jump by a constant around each non-contractible loop (toroidal and poloidal directions). These discontinuities correspond to **harmonic circulations** of $\mathbf{B}$, represented by uniform densities on “cut” surfaces that span the holes of the torus.
+Inside a **toroidal region**, $\Phi$ is *multi-valued* — it can jump by a constant around each non-contractible loop (toroidal and poloidal directions). These discontinuities correspond to **harmonic circulations** of $$\mathbf{B}$$, represented by uniform densities on “cut” surfaces that span the holes of the torus.
 
 In LX, we model this as:
 $$
