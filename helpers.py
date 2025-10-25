@@ -1,15 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, Tuple
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (import side effect for 3D)
-
-# ======================= Optimizer front-end (pack/unpack) =======================
-import numpy as np
 from typing import Dict, Tuple, Any
-
-# We assume you already have in this module:
-# - controls_from_fourier(...)
-# - build_surface(...)
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (import side effect for 3D)
 
 def make_param_dict(
     *,
@@ -606,17 +598,21 @@ def make_spitzer_like_fig8_ctrl(
 # =============================================================================
 # ------------------------------ VISUALIZATION --------------------------------
 # =============================================================================
-
 def plot_surface_package(data: Dict,
                          n_frame_arrows: int = 24,
                          n_cross_sections: int = 8,
-                         figsize=(15, 10)) -> None:
+                         figsize=(15, 10),
+                         surface_scalar: np.ndarray = None,
+                         scalar_label: str = 'a(s, α)') -> None:
     """
     Three-panel visualization package:
-      1) 3D surface (colored by a(s,α)) + axis + Bishop frame arrows
+      1) 3D surface (colored by a(s,α) or user-supplied scalar) + axis + Bishop frame arrows
       2) Several cross-sections (XY projection)
       3) Heatmap of a(s,α) vs (s,α)
     """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
+
     s, alpha = data['s'], data['alpha']
     r0, e1, e2, a, X = data['r0'], data['e1'], data['e2'], data['a'], data['X']
     S, A = a.shape
@@ -630,7 +626,6 @@ def plot_surface_package(data: Dict,
     # --- 1) 3D surface ---
     ax3d.plot(r0[:,0], r0[:,1], r0[:,2], 'k-', lw=2, label='axis')
 
-    # frame arrows
     idxs = np.linspace(0, S-1, n_frame_arrows, endpoint=False).astype(int)
     scale = 0.35*np.max(a) if np.isfinite(np.max(a)) else 0.1
     for i in idxs:
@@ -638,21 +633,31 @@ def plot_surface_package(data: Dict,
         ax3d.quiver(p[0], p[1], p[2], e1[i,0], e1[i,1], e1[i,2], length=scale, color='C1', linewidth=1)
         ax3d.quiver(p[0], p[1], p[2], e2[i,0], e2[i,1], e2[i,2], length=scale, color='C2', linewidth=1)
 
-    # surface (downsample for speed if large)
+    # downsample for speed
     skip_s = max(1, S//160)
     skip_a = max(1, A//180)
-    Xs = X[::skip_s, ::skip_a, :]
-    a_col = a[::skip_s, ::skip_a]
-    rng = np.ptp(a_col) + 1e-12
-    norm = (a_col - np.min(a_col)) / rng
+    Xs = X[::skip_s, ::skip_a, :]  # expects X with shape (S, A, 3)
+
+    # choose scalar to color the surface
+    if surface_scalar is None:
+        scalar = a
+        scalar_full_label = 'a(s, α)'
+    else:
+        scalar = surface_scalar
+        scalar_full_label = scalar_label
+
+    scalar_col = scalar[::skip_s, ::skip_a]
+    rng = np.ptp(scalar_col) + 1e-12
+    norm = (scalar_col - np.min(scalar_col)) / rng
     facecolors = plt.cm.viridis(norm)
+
     ax3d.plot_surface(Xs[:,:,0], Xs[:,:,1], Xs[:,:,2],
                       facecolors=facecolors, rstride=1, cstride=1,
-                      linewidth=0, antialiased=False, alpha=0.35)
-    m = plt.cm.ScalarMappable(cmap='viridis'); m.set_array(a)
-    cb = plt.colorbar(m, ax=ax3d, shrink=0.6, pad=0.1); cb.set_label('a(s, α)')
+                      linewidth=0, antialiased=False, alpha=0.9)
+    m = plt.cm.ScalarMappable(cmap='viridis'); m.set_array(scalar)
+    cb = plt.colorbar(m, ax=ax3d, shrink=0.6, pad=0.1); cb.set_label(scalar_full_label)
 
-    ax3d.set_title("Surface and Bishop frame")
+    ax3d.set_title("Surface colored by " + scalar_full_label)
     ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
     ax3d.view_init(elev=28, azim=38)
 
@@ -661,43 +666,34 @@ def plot_surface_package(data: Dict,
     idx_cs = np.linspace(0, S-1, n_cross_sections, endpoint=False).astype(int)
     colors = plt.cm.tab10(np.linspace(0, 1, len(idx_cs)))
 
-    # helper: project a section into its local cross-section plane
     def local_uv_section(i):
-        # Xsec: (A,3), center r0[i], basis (e1[i], e2[i])
-        rel = X[i, :, :] - r0[i][None, :]            # (A,3)
-        u = rel @ e1[i]                               # (A,)
-        v = rel @ e2[i]                               # (A,)
+        rel = X[i, :, :] - r0[i][None, :]
+        u = rel @ e1[i]
+        v = rel @ e2[i]
         return u, v
 
-    # set symmetric limits based on max radius in the selected sections
     max_a_sel = 0.0
     for i in idx_cs:
         max_a_sel = max(max_a_sel, float(np.max(a[i])))
     lim = 1.1 * max_a_sel if np.isfinite(max_a_sel) and max_a_sel > 0 else 0.1
-    ax_xsec.set_xlim(-lim, lim)
-    ax_xsec.set_ylim(-lim, lim)
+    ax_xsec.set_xlim(-lim, lim); ax_xsec.set_ylim(-lim, lim)
 
     for k, i in enumerate(idx_cs):
         u, v = local_uv_section(i)
         ax_xsec.plot(u, v, '-', color=colors[k], lw=1.6, label=f's={s[i]:.2f}')
-
-        # draw local basis arrows and a reference circle of radius a0 (mean) if you want
-        # estimate a0(s_i) as the mean radius in the section:
         a0_i = float(np.mean(np.sqrt(u**2 + v**2)))
         ax_xsec.add_artist(plt.Circle((0, 0), a0_i, fill=False, color=colors[k], alpha=0.25, lw=1.0))
-
-        # draw local axes (e1,e2) arrows in uv coordinates
         ax_xsec.arrow(0.0, 0.0, 0.6*a0_i, 0.0, color=colors[k], head_width=0.02*lim,
                       length_includes_head=True, alpha=0.6)
         ax_xsec.arrow(0.0, 0.0, 0.0, 0.6*a0_i, color=colors[k], head_width=0.02*lim,
                       length_includes_head=True, alpha=0.6)
 
-    ax_xsec.set_title("Cross-sections (local (e1,e2) plane; no foreshortening)")
+    ax_xsec.set_title("Cross-sections (local (e1,e2) plane)")
     ax_xsec.legend(ncol=2, fontsize=8, loc='upper right')
     ax_xsec.grid(True, alpha=0.3)
     ax_xsec.set_xlabel('u (along e1)'); ax_xsec.set_ylabel('v (along e2)')
 
-    # --- 3) a(s, α) heatmap ---
+    # --- 3) a(s, α) heatmap (keep this panel as your original diagnostic) ---
     im = ax_map.imshow(a.T, origin='lower', aspect='auto',
                        extent=[s[0], s[-1] + (s[1]-s[0]), 0, 2*np.pi], cmap='viridis')
     plt.colorbar(im, ax=ax_map, orientation='horizontal', pad=0.2, label='a(s, α)')
