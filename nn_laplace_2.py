@@ -50,8 +50,8 @@ kappa   = 1.0           # u_mv = kappa * atan2(y,x) / R0; set 0 for single-value
 
 # ----- Sampling -----
 N_in            = 10_000   # interior sample count
-N_bdry_theta    = 28       # boundary θ resolution
-N_bdry_phi      = 50      # boundary φ resolution
+N_bdry_theta    = 32       # boundary θ resolution
+N_bdry_phi      = 64      # boundary φ resolution
 rng_seed        = 0
 
 # ----- Neural Network (Equinox MLP) -----
@@ -523,7 +523,7 @@ def main():
     ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
     cax = fig3d.add_subplot(gs[0, 2])  # colorbar axis (skinny)
 
-    offset = 0.05 * float(a0 + abs(a1))
+    offset = 0.08 * float(a0 + abs(a1))
 
     m1 = plot_surface_with_vectors_ax(ax1, Xg, Yg, Zg, Gmag_init, Nhat_grid, Gvec=Gvec_init,
                                     title="Initial |∇u| and vectors (boundary)",
