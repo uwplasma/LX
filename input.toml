@@ -1,0 +1,37 @@
+# Configuration for nn_laplace_2.py
+
+[checkpoint]
+path = "pinn_torus_model.eqx"  # model checkpoint file path
+
+[batch]
+interior = 2048  # interior points per step
+boundary = 2048  # boundary points per step
+
+[geometry]
+R0 = 1.0      # major radius
+a0 = 0.35     # minor radius base
+a1 = 0.20     # minor radius modulation amplitude
+N_harm = 3    # mode in a(φ) = a0 + a1 cos(N_harm φ)
+
+[multi_valued]
+kappa = 1.0   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
+
+[sampling]
+N_in = 10000          # interior sample count
+N_bdry_theta = 32     # boundary θ resolution
+N_bdry_phi = 64       # boundary φ resolution
+rng_seed = 0
+
+[model]
+hidden_sizes = [32, 32]   # MLP hidden layer sizes
+activation = "tanh"       # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity
+
+[optimization]
+steps = 1000
+lr = 0.003
+lam_bc = 5.0
+
+[plot]
+cmap = "viridis"
+figsize = [8.0, 4.5]
+

@@ -1,0 +1,79 @@
+import jax.numpy as jnp
+from jax import random, grad
+import equinox as eqx
+import jax
+
+from _network_and_loss import PotentialMLP, u_total, grad_u_total_batch, lap_u_total_batch
+
+
+def eval_on_boundary(params: PotentialMLP, P_bdry, N_bdry, Xg, Yg, Zg):
+    """
+    Returns:
+      Gvec: (nθ, nφ, 3)  gradient vectors at boundary grid
+      Gmag: (nθ, nφ)     |∇u| at boundary grid
+    """
+    Gvec_flat = grad_u_total_batch(params, P_bdry)     # (Nb,3)
+    Gmag_flat = jnp.linalg.norm(Gvec_flat, axis=-1)    # (Nb,)
+
+    Gvec = Gvec_flat.reshape(Xg.shape + (3,))          # (nθ,nφ,3)
+    Gmag = Gmag_flat.reshape(Xg.shape)                 # (nθ,nφ)
+    Nhat = N_bdry.reshape(Xg.shape + (3,))             # (nθ,nφ,3)
+    return Gvec, Gmag, Nhat
+
+def u_multivalued(xyz: jnp.ndarray) -> jnp.ndarray:
+    x, y = xyz[..., 0], xyz[..., 1]
+    return kappa * jnp.arctan2(y, x) / R0
+
+def grad_u_mv(xyz: jnp.ndarray) -> jnp.ndarray:
+    """∇(kappa * atan2(y,x)/R0) = kappa/R0 * (-y/(x^2+y^2), x/(x^2+y^2), 0)"""
+    x, y = xyz[..., 0], xyz[..., 1]
+    r2 = x*x + y*y
+    inv = jnp.where(r2 > 1e-18, 1.0 / r2, 0.0)             # guard axis
+    gx = -y * inv
+    gy =  x * inv
+    gz = jnp.zeros_like(x)
+    return (kappa / R0) * jnp.stack([gx, gy, gz], axis=-1)
+
+@eqx.filter_jit
+def lap_u_mv_zero(_params, _xyz):
+    # Laplacian of atan2(y,x) is 0 away from r=0 (singular on axis only).
+    return jnp.array(0.0)
+
+def u_total(params: PotentialMLP, xyz: jnp.ndarray) -> jnp.ndarray:
+    return u_multivalued(xyz) + params(xyz)
+
+# Gradient of the NN-only part
+@eqx.filter_jit
+def grad_u_nn_scalar(params: PotentialMLP, xyz: jnp.ndarray) -> jnp.ndarray:
+    return grad(lambda q: params(q))(xyz)
+
+# Laplacian via three Hessian–vector products (no full Hessian materialization)
+# e_i are standard basis vectors in R^3
+E1 = jnp.array([1.0, 0.0, 0.0])
+E2 = jnp.array([0.0, 1.0, 0.0])
+E3 = jnp.array([0.0, 0.0, 1.0])
+
+@eqx.filter_jit
+def lap_u_nn_scalar(params: PotentialMLP, xyz: jnp.ndarray) -> jnp.ndarray:
+    # g(x) = ∇u_nn(x); jvp(g, (x,), (e_i,)) = H(x) e_i
+    def g(q): return grad_u_nn_scalar(params, q)
+    _, He1 = jax.jvp(g, (xyz,), (E1,))
+    _, He2 = jax.jvp(g, (xyz,), (E2,))
+    _, He3 = jax.jvp(g, (xyz,), (E3,))
+    # e_i^T H e_i is the ith component of H e_i (since e_i picks that component)
+    return He1[0] + He2[1] + He3[2]
+
+# Batched wrappers
+u_total_batch = jax.vmap(u_total, in_axes=(None, 0))
+u_nn_batch = jax.vmap(lambda p, q: p(q), in_axes=(None, 0))
+grad_u_nn_batch = jax.vmap(grad_u_nn_scalar, in_axes=(None, 0))
+lap_u_nn_batch  = jax.vmap(lap_u_nn_scalar,  in_axes=(None, 0))
+
+@eqx.filter_jit
+def grad_u_total_batch(params: PotentialMLP, xyz_batch: jnp.ndarray) -> jnp.ndarray:
+    return grad_u_mv(xyz_batch) + grad_u_nn_batch(params, xyz_batch)
+
+@eqx.filter_jit
+def lap_u_total_batch(params: PotentialMLP, xyz_batch: jnp.ndarray) -> jnp.ndarray:
+    # Lap(u_mv)=0 away from r=0  ⇒ just Lap(u_nn)
+    return lap_u_nn_batch(params, xyz_batch)
