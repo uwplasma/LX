@@ -30,10 +30,15 @@ import numpy as np
 import equinox as eqx
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from pathlib import Path
+
 
 # =============================================================================
 # ============================= USER PARAMETERS ===============================
 # =============================================================================
+
+# ----- Checkpointing -----
+CHECKPOINT_PATH = Path("pinn_torus_model.eqx")   # change path/name if you like
 
 # ----- Batching -----
 BATCH_IN   = 2048    # interior points per step
@@ -413,6 +418,26 @@ def eval_full(params: PotentialMLP,
     total   = loss_in + lam_bc * loss_bc
     return total, (loss_in, loss_bc, lap, n_dot)
 
+def save_model(model, path: Path = CHECKPOINT_PATH):
+    """Serialize model parameters to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    eqx.tree_serialise_leaves(str(path), model)
+    print(f"[CKPT] Saved model to: {path}")
+
+def load_model_if_exists(template: eqx.Module, path: Path = CHECKPOINT_PATH) -> eqx.Module:
+    """If checkpoint exists, load into the provided template model; else return template."""
+    if path.exists():
+        try:
+            loaded = eqx.tree_deserialise_leaves(str(path), template)
+            print(f"[CKPT] Loaded model from: {path}")
+            return loaded
+        except Exception as e:
+            print(f"[CKPT] Failed to load checkpoint ({path}). Using fresh model. Reason: {e}")
+    else:
+        print(f"[CKPT] No checkpoint found at {path}. Starting fresh.")
+    return template
+
+
 # =============================================================================
 # ================================== MAIN =====================================
 # =============================================================================
@@ -457,7 +482,9 @@ def main():
 
     # Model + optimizer
     model = PotentialMLP(k_model, hidden_sizes=MLP_HIDDEN_SIZES, act=MLP_ACT)
-    # optimizer = optax.adam(lr)
+    # Try to resume from an existing checkpoint (architecture must match)
+    model = load_model_if_exists(model, CHECKPOINT_PATH)
+
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(optax.cosine_decay_schedule(init_value=lr, decay_steps=steps), weight_decay=0.0)
@@ -489,6 +516,8 @@ def main():
             print(f"[{it:5d}] loss={float(L):.6e}  lap={float(Lin):.6e}  bc={float(Lbc):.6e}  "
                 f"|lap|_rms={lap_rms:.3e}  |n·∇u|_rms={n_rms:.3e}")
             sys.stdout.flush()
+    
+    save_model(model, CHECKPOINT_PATH)
 
     # Final diagnostics
     (Lf, (Linf, Lbcf, lapf, nf)) = eval_full(model, P_in, P_bdry, N_bdry)
@@ -523,7 +552,7 @@ def main():
     ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
     cax = fig3d.add_subplot(gs[0, 2])  # colorbar axis (skinny)
 
-    offset = 0.08 * float(a0 + abs(a1))
+    offset = 0.1 * float(a0 + abs(a1))
 
     m1 = plot_surface_with_vectors_ax(ax1, Xg, Yg, Zg, Gmag_init, Nhat_grid, Gvec=Gvec_init,
                                     title="Initial |∇u| and vectors (boundary)",
