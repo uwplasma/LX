@@ -1,4 +1,25 @@
-# Configuration for nn_laplace_2.py
+[surfaces]                # use either "torus" or "single" mode for now
+mode = "torus"
+
+# Torus family to pretrain on:
+# (You can list dozens; keep R0 fixed at 1.0 if you want.)
+[[surfaces.torus_list]]
+name = "T1"
+a0 = 0.35
+a1 = 0.20
+N_harm = 3
+
+[[surfaces.torus_list]]
+name = "T2"
+a0 = 0.30
+a1 = 0.10
+N_harm = 2
+
+[[surfaces.torus_list]]
+name = "T3"
+a0 = 0.40
+a1 = 0.25
+N_harm = 4
 
 [checkpoint]
 path = "pinn_torus_model.eqx"  # model checkpoint file path
@@ -10,8 +31,8 @@ boundary = 2048  # boundary points per step
 [geometry]
 R0 = 1.0      # major radius
 a0 = 0.35     # minor radius base
-a1 = 0.20     # minor radius modulation amplitude
-N_harm = 3    # mode in a(φ) = a0 + a1 cos(N_harm φ)
+a1 = 0.15     # minor radius modulation amplitude
+N_harm = 4    # mode in a(φ) = a0 + a1 cos(N_harm φ)
 
 [multi_valued]
 kappa = 1.0   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
@@ -23,13 +44,20 @@ N_bdry_phi = 64       # boundary φ resolution
 rng_seed = 0
 
 [model]
-hidden_sizes = [32, 32]   # MLP hidden layer sizes
+hidden_sizes = [64, 64, 64]   # MLP hidden layer sizes
 activation = "tanh"       # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity
 
 [optimization]
-steps = 1000
+steps = 5000
 lr = 0.003
 lam_bc = 5.0
+
+[box]
+# z-extent of the fixed sampling box (x,y are computed from geometry each run)
+zmin = -0.8
+zmax =  0.8
+points_total = 200000
+seed = 42
 
 [plot]
 cmap = "viridis"

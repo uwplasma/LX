@@ -93,6 +93,19 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         figsize = [8.0, 4.5]
     p["figsize"] = (float(figsize[0]), float(figsize[1]))
 
+    # --- box (fixed sampling domain) ---
+    # Assume major radius ~ 1 and z ∈ [-0.5, 0.5].
+    # We'll compute x,y from geometry (R0 + a0 + |a1|) each run.
+    p["box_zmin"] = float(cfg.get("box", {}).get("zmin", -0.5))
+    p["box_zmax"] = float(cfg.get("box", {}).get("zmax",  0.5))
+    # How many candidate points to generate deterministically in the box
+    p["box_points_total"] = int(cfg.get("box", {}).get("points_total", 200_000))
+    # PRNG seed for the fixed box points
+    p["box_seed"] = int(cfg.get("box", {}).get("seed", 42))
+
+    # --- surfaces list (raw dict; parsed in main) ---
+    p["surfaces_cfg"] = cfg.get("surfaces", {})
+
     return p
 
 

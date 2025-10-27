@@ -6,7 +6,16 @@ import optax
 from pathlib import Path
 from _state import runtime 
 
-from _physics import u_total, grad_u_total_batch, lap_u_total_batch
+from _physics import u_total, grad_u_total_batch, lap_u_total_batch, u_total_batch
+
+ZERO_MEAN_WEIGHT = 0.1  # small regularization
+
+import functools
+_running = {"lin": 1.0, "lbc": 1.0}  # simple running averages for scaling
+_decay = 0.98
+def _update_running(key: str, val: jnp.ndarray):
+    v = jnp.asarray(val, dtype=jnp.float64)
+    _running[key] = _decay * _running[key] + (1.0 - _decay) * float(v)
 
 def _identity(x): return x
 
@@ -27,21 +36,56 @@ class PotentialMLP(eqx.Module):
         return self.mlp(xyz).squeeze(-1)
 
 def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
-    """Sample a random interior and boundary mini-batch and compute MSE losses."""
     ni, nb = pts_interior.shape[0], pts_bdry.shape[0]
     key_i, key_b = random.split(key)
-    idx_i = random.choice(key_i, ni, (min(runtime.BATCH_IN, ni),), replace=False)
-    idx_b = random.choice(key_b, nb, (min(runtime.BATCH_BDRY, nb),), replace=False)
-    Pi, Pb, Nb_hat = pts_interior[idx_i], pts_bdry[idx_b], normals_bdry[idx_b]
 
+    # ---- Interior: uniform random subset (Python ints only) ----
+    n_in_take = int(min(runtime.BATCH_IN, ni))
+    idx_i = random.choice(key_i, ni, (n_in_take,), replace=False)
+    Pi = pts_interior[idx_i]
+
+    # ---- Boundary: importance sampling with Python ints only ----
+    # pre-sample size m and final size K must be Python ints (not JAX arrays)
+    m = int(min(8 * runtime.BATCH_BDRY, nb))
+    m = max(m, 1)  # avoid zero-size
+    key_b_pre, key_b_top = random.split(key_b)
+
+    pre_idx = random.choice(key_b_pre, nb, (m,), replace=False)
+    Pb_pre, Nb_pre = pts_bdry[pre_idx], normals_bdry[pre_idx]
+
+    # estimate residuals on the pre-sample
+    gb_pre = grad_u_total_batch(params, Pb_pre)
+    r_pre = jnp.sum(Nb_pre * gb_pre, axis=-1) ** 2
+
+    K = int(min(runtime.BATCH_BDRY, m))
+    K = max(K, 1)
+    topk_idx = jnp.argsort(-r_pre)[:K]
+    Pb, Nb_hat = Pb_pre[topk_idx], Nb_pre[topk_idx]
+
+    # ---- Zero-mean regularizer ----
+    u_vals = u_total_batch(params, Pi)
+    mean_u = jnp.mean(u_vals)
+    loss_zero_mean = mean_u * mean_u
+
+    # ---- Physics residuals ----
     lap = lap_u_total_batch(params, Pi)
     g_b = grad_u_total_batch(params, Pb)
     n_dot = jnp.sum(Nb_hat * g_b, axis=-1)
 
-    loss_in = jnp.mean(lap * lap)
-    loss_bc = jnp.mean(n_dot * n_dot)
-    total   = loss_in + runtime.lam_bc * loss_bc 
-    return total, (loss_in, loss_bc, lap, n_dot)
+    loss_in_raw = jnp.mean(lap * lap)
+    loss_bc_raw = jnp.mean(n_dot * n_dot)
+
+    _update_running("lin", loss_in_raw)
+    _update_running("lbc", loss_bc_raw)
+    s_in = 1.0 / (1e-12 + _running["lin"])
+    s_bc = 1.0 / (1e-12 + _running["lbc"])
+
+    loss_in = s_in * loss_in_raw
+    loss_bc = s_bc * loss_bc_raw
+
+    total = loss_in + runtime.lam_bc * loss_bc + ZERO_MEAN_WEIGHT * loss_zero_mean
+    return total, (loss_in_raw, loss_bc_raw, lap, n_dot)
+
 
 # Filtered versions keep non-JAX parts (if any) out of JIT
 loss_value_and_grad = eqx.filter_value_and_grad(loss_fn_batch, has_aux=True)
@@ -61,10 +105,13 @@ def eval_full(params, pts_interior, pts_bdry, normals_bdry):
     lap = lap_u_total_batch(params, pts_interior)
     g_b = grad_u_total_batch(params, pts_bdry)
     n_dot = jnp.sum(normals_bdry * g_b, axis=-1)
-    loss_in = jnp.mean(lap * lap)
-    loss_bc = jnp.mean(n_dot * n_dot)
-    total   = loss_in + runtime.lam_bc * loss_bc
-    return total, (loss_in, loss_bc, lap, n_dot)
+    loss_in_raw = jnp.mean(lap * lap)
+    loss_bc_raw = jnp.mean(n_dot * n_dot)
+    # scale for consistency with training display
+    s_in = 1.0 / (1e-12 + _running["lin"])
+    s_bc = 1.0 / (1e-12 + _running["lbc"])
+    total = s_in * loss_in_raw + runtime.lam_bc * s_bc * loss_bc_raw
+    return total, (loss_in_raw, loss_bc_raw, lap, n_dot)
 
 def save_model(model, path: Path | str = "pinn_torus_model.eqx"):
     path = Path(path)

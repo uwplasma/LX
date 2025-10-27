@@ -96,3 +96,20 @@ def plot_surface_with_vectors_ax(ax, X, Y, Z, Gmag, Nhat, Gvec=None,
     m.set_array(Gmag)
     m.set_clim(gmin, gmax)
     return m
+
+def draw_box_edges(ax, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6):
+    """Draw a rectangular box as 12 edges."""
+    # 8 corners
+    C = np.array([
+        [xmin, ymin, zmin], [xmax, ymin, zmin],
+        [xmin, ymax, zmin], [xmax, ymax, zmin],
+        [xmin, ymin, zmax], [xmax, ymin, zmax],
+        [xmin, ymax, zmax], [xmax, ymax, zmax],
+    ])
+    # edges as pairs of indices
+    E = [(0,1),(0,2),(1,3),(2,3),
+         (4,5),(4,6),(5,7),(6,7),
+         (0,4),(1,5),(2,6),(3,7)]
+    for i,j in E:
+        ax.plot([C[i,0],C[j,0]], [C[i,1],C[j,1]], [C[i,2],C[j,2]],
+                linewidth=lw, alpha=alpha, color="k")

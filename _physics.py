@@ -31,16 +31,16 @@ def grad_u_nn_scalar(params, xyz: jnp.ndarray) -> jnp.ndarray:
 
 # Laplacian via three Hessian–vector products (no full Hessian materialization)
 # e_i are standard basis vectors in R^3
-E1 = jnp.array([1.0, 0.0, 0.0])
-E2 = jnp.array([0.0, 1.0, 0.0])
-E3 = jnp.array([0.0, 0.0, 1.0])
-
 @eqx.filter_jit
 def lap_u_nn_scalar(params, xyz: jnp.ndarray) -> jnp.ndarray:
-    def g(q): return grad_u_nn_scalar(params, q)
-    _, He1 = jax.jvp(g, (xyz,), (E1,))
-    _, He2 = jax.jvp(g, (xyz,), (E2,))
-    _, He3 = jax.jvp(g, (xyz,), (E3,))
+    """Compute Laplacian via three JVPs with dtype-safe unit vectors."""
+    def g(q):  # grad of NN-only potential
+        return jax.grad(lambda q_: params(q_))(q)
+
+    e = jnp.eye(3, dtype=xyz.dtype)  # unit basis with the SAME dtype as xyz
+    _, He1 = jax.jvp(g, (xyz,), (e[0],))
+    _, He2 = jax.jvp(g, (xyz,), (e[1],))
+    _, He3 = jax.jvp(g, (xyz,), (e[2],))
     return He1[0] + He2[1] + He3[2]
 
 # Batched wrappers

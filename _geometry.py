@@ -54,29 +54,55 @@ def surface_points_and_normals(nθ, nφ):
     P       = jnp.stack([X, Y, Z], axis=-1)
     return (P.reshape(-1,3), Nhat.reshape(-1,3), X, Y, Z)  # flattened + original grids
 
-def sample_interior(key, n_points: int, oversample_factor: int = 8):
-    """
-    Single-shot JAX sampler: oversample once, keep first n_points valid points.
-    Falls back to a second pass with larger oversampling if needed.
-    """
-    def _one_shot(key, n_points, factor):
-        a_max = runtime.a0 + jnp.abs(runtime.a1)
-        Lxy   = runtime.R0 + a_max
-        M     = factor * n_points
-        kx, ky, kz = random.split(key, 3)
-        X = random.uniform(kx, (M,), minval=-Lxy,  maxval=Lxy)
-        Y = random.uniform(ky, (M,), minval=-Lxy,  maxval=Lxy)
-        Z = random.uniform(kz, (M,), minval=-a_max, maxval=a_max)
-        mask = inside_torus_mask(X, Y, Z)                 # [M] boolean
-        # Fixed-size index vector (pads with zeros):
-        idx  = jnp.nonzero(mask, size=n_points, fill_value=0)[0]  # [n_points]
-        # How many valid did we actually get?
-        got  = jnp.sum(mask)
-        pts  = jnp.stack([X[idx], Y[idx], Z[idx]], axis=-1)       # [n_points,3]
-        return pts, got
+# def sample_interior(key, n_points: int, oversample_factor: int = 8):
+#     """
+#     Single-shot JAX sampler: oversample once, keep first n_points valid points.
+#     Falls back to a second pass with larger oversampling if needed.
+#     """
+#     def _one_shot(key, n_points, factor):
+#         a_max = runtime.a0 + jnp.abs(runtime.a1)
+#         Lxy   = runtime.R0 + a_max
+#         M     = factor * n_points
+#         kx, ky, kz = random.split(key, 3)
+#         X = random.uniform(kx, (M,), minval=-Lxy,  maxval=Lxy)
+#         Y = random.uniform(ky, (M,), minval=-Lxy,  maxval=Lxy)
+#         Z = random.uniform(kz, (M,), minval=-a_max, maxval=a_max)
+#         mask = inside_torus_mask(X, Y, Z)                 # [M] boolean
+#         # Fixed-size index vector (pads with zeros):
+#         idx  = jnp.nonzero(mask, size=n_points, fill_value=0)[0]  # [n_points]
+#         # How many valid did we actually get?
+#         got  = jnp.sum(mask)
+#         pts  = jnp.stack([X[idx], Y[idx], Z[idx]], axis=-1)       # [n_points,3]
+#         return pts, got
 
-    pts, got = _one_shot(key, n_points, oversample_factor)
-    # If not enough points, try once more with a bigger factor (Python guard, no JIT).
-    if int(got) < n_points:
-        pts, _ = _one_shot(key, n_points, oversample_factor * 2)
-    return pts
+#     pts, got = _one_shot(key, n_points, oversample_factor)
+#     # If not enough points, try once more with a bigger factor (Python guard, no JIT).
+#     if int(got) < n_points:
+#         pts, _ = _one_shot(key, n_points, oversample_factor * 2)
+#     return pts
+
+def fixed_box_points(seed: int, n_total: int, bounds=None):
+    """
+    Deterministically generate n_total random points in a rectangular box.
+    bounds = (xmin, xmax, ymin, ymax, zmin, zmax)
+    """
+    if bounds is None:
+        bounds = runtime.box_bounds
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    key = random.PRNGKey(seed)
+    kx, ky, kz = random.split(key, 3)
+    dtype = jnp.float64            # ensure 64-bit samples
+    X = random.uniform(kx, (n_total,), minval=xmin, maxval=xmax, dtype=dtype)
+    Y = random.uniform(ky, (n_total,), minval=ymin, maxval=ymax, dtype=dtype)
+    Z = random.uniform(kz, (n_total,), minval=zmin, maxval=zmax, dtype=dtype)
+    return jnp.stack([X, Y, Z], axis=-1)
+
+def select_interior_from_fixed(P_box: jnp.ndarray, n_want: int) -> jnp.ndarray:
+    """
+    Filter the fixed box points to the *current* torus interior and keep the first n_want.
+    If fewer than n_want exist (unlikely if box dense enough), we just return what's available.
+    """
+    X, Y, Z = P_box[:,0], P_box[:,1], P_box[:,2]
+    mask = inside_torus_mask(X, Y, Z)  # [M]
+    idx  = jnp.nonzero(mask, size=min(n_want, P_box.shape[0]), fill_value=0)[0]
+    return P_box[idx]

@@ -1,5 +1,5 @@
-# _state.py
 from dataclasses import dataclass
+from typing import Tuple
 
 @dataclass
 class Runtime:
@@ -14,5 +14,7 @@ class Runtime:
     BATCH_IN: int = 2048
     BATCH_BDRY: int = 2048
     lam_bc: float = 5.0
+    # box bounds (xmin,xmax,ymin,ymax,zmin,zmax)
+    box_bounds: Tuple[float, float, float, float, float, float] = (-1.5, 1.5, -1.5, 1.5, -0.5, 0.5)
 
 runtime = Runtime()
