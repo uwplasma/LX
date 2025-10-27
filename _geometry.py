@@ -1,35 +1,29 @@
 import jax.numpy as jnp
 from jax import random
+from _state import runtime
 
 # =============================================================================
 # =============================== GEOMETRY ====================================
 # =============================================================================
 
 def a_of_phi(phi: jnp.ndarray) -> jnp.ndarray:
-    """Minor radius a(φ) = a0 + a1 cos(N_harm φ)."""
-    return a0 + a1 * jnp.cos(N_harm * phi)
+    return runtime.a0 + runtime.a1 * jnp.cos(runtime.N_harm * phi)
 
 def cylindrical_phi(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
     return jnp.arctan2(y, x)
 
 def inside_torus_mask(x, y, z) -> jnp.ndarray:
-    """Inside test for variable-radius torus."""
     r   = jnp.sqrt(x*x + y*y)
     phi = cylindrical_phi(x, y)
-    rho = jnp.sqrt((r - R0)**2 + z*z)        # distance to circular axis at angle φ
+    rho = jnp.sqrt((r - runtime.R0)**2 + z*z)
     return rho <= a_of_phi(phi)
 
 def build_surface_torus(n_theta: int, n_phi: int):
-    """
-    Parameterization:
-      r(θ,φ) = [(R0 + a(φ) cosθ) cosφ, (R0 + a(φ) cosθ) sinφ, a(φ) sinθ]
-    Returns X,Y,Z with shape [nθ, nφ].
-    """
     theta = jnp.linspace(0, 2*jnp.pi, n_theta, endpoint=True)
     phi   = jnp.linspace(0, 2*jnp.pi, n_phi,   endpoint=True)
-    Θ, Φ  = jnp.meshgrid(theta, phi, indexing='ij')    # [nθ,nφ]
+    Θ, Φ  = jnp.meshgrid(theta, phi, indexing='ij')
     aφ    = a_of_phi(Φ)
-    Rring = R0 + aφ * jnp.cos(Θ)
+    Rring = runtime.R0 + aφ * jnp.cos(Θ)
     X = Rring * jnp.cos(Φ)
     Y = Rring * jnp.sin(Φ)
     Z = aφ * jnp.sin(Θ)
@@ -66,8 +60,8 @@ def sample_interior(key, n_points: int, oversample_factor: int = 8):
     Falls back to a second pass with larger oversampling if needed.
     """
     def _one_shot(key, n_points, factor):
-        a_max = a0 + jnp.abs(a1)
-        Lxy   = R0 + a_max
+        a_max = runtime.a0 + jnp.abs(runtime.a1)
+        Lxy   = runtime.R0 + a_max
         M     = factor * n_points
         kx, ky, kz = random.split(key, 3)
         X = random.uniform(kx, (M,), minval=-Lxy,  maxval=Lxy)

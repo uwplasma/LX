@@ -39,6 +39,7 @@ from _plotting import fix_matplotlib_3d, plot_surface_with_vectors_ax
 from _geometry import surface_points_and_normals, sample_interior
 from _network_and_loss import PotentialMLP, train_step, eval_full, load_model_if_exists, save_model
 from _physics import eval_on_boundary, grad_u_total_batch
+from _state import runtime
 
 # =============================================================================
 # ============================= CONFIG LOADING ================================
@@ -107,10 +108,20 @@ _apply_params(_DEFAULT_PARAMS)
 
 
 def main(config_path: str = "input.toml"):
-    # If a different config path was provided, apply it now
     if config_path and Path(config_path).exists():
         params = build_params_from_path(config_path)
         _apply_params(params)
+        
+    # >>> Set runtime state ONCE so all modules see it <<<
+    runtime.R0 = R0
+    runtime.a0 = a0
+    runtime.a1 = a1
+    runtime.N_harm = N_harm
+    runtime.kappa = kappa
+    runtime.BATCH_IN = BATCH_IN
+    runtime.BATCH_BDRY = BATCH_BDRY
+    runtime.lam_bc = lam_bc
+        
     print("=== PINN Laplace on Torus ===")
     print(f"Major radius R0={R0:.3f}")
     print(f"Minor radius a(φ)=a0 + a1 cos(Nφ) with a0={a0:.3f}, a1={a1:.3f}, N={N_harm}")
@@ -128,14 +139,19 @@ def main(config_path: str = "input.toml"):
     P_bdry, N_bdry, Xg, Yg, Zg = surface_points_and_normals(N_bdry_theta, N_bdry_phi)
     Nb = P_bdry.shape[0]
     # Quick normal sanity + auto-flip if needed
-    Rvec = jnp.stack([Xg, Yg, jnp.zeros_like(Zg)], axis=-1)
+    # Robust outwardness check: use centroid → point vector
+    P_grid = jnp.stack([Xg, Yg, Zg], axis=-1)                 # (nθ, nφ, 3)
+    centroid = jnp.mean(P_grid.reshape(-1, 3), axis=0, keepdims=True)  # (1,3)
+    Rvec = P_grid - centroid                                   # (nθ, nφ, 3)
     Rhat = Rvec / (jnp.linalg.norm(Rvec, axis=-1, keepdims=True) + 1e-12)
-    mean_out = jnp.mean(jnp.sum(N_bdry.reshape(Xg.shape + (3,)) * Rhat, axis=-1))
+
+    Nhat_grid = N_bdry.reshape(Xg.shape + (3,))                # (nθ, nφ, 3)
+    mean_out = jnp.mean(jnp.sum(Nhat_grid * Rhat, axis=-1))
     mean_out_val = float(mean_out)
-    print(f"[DEBUG] Mean outwardness of normals (dot with radial unit): {mean_out_val:+.4f} (≈positive expected)")
-    # If average is negative, flip all normals.
+    print(f"[DEBUG] Mean outwardness of normals (centroid test): {mean_out_val:+.4f} (≈positive expected)")
     if mean_out_val < 0:
         N_bdry = -N_bdry
+        Nhat_grid = -Nhat_grid
         print("[DEBUG] Normals flipped to ensure outward orientation.")
 
     # Interior points
