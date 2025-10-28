@@ -35,7 +35,7 @@ a1 = 0.15     # minor radius modulation amplitude
 N_harm = 4    # mode in a(φ) = a0 + a1 cos(N_harm φ)
 
 [multi_valued]
-kappa = 1.0   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
+kappa = 0.2   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
 
 [sampling]
 N_in = 10000          # interior sample count
@@ -45,12 +45,17 @@ rng_seed = 0
 
 [model]
 hidden_sizes = [64, 64, 64]   # MLP hidden layer sizes
-activation = "sin"       # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity, sin
+activation = "sin" # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity, sin
+siren = true            # turn on true SIREN init/forward
+siren_omega0 = 30.0     # standard choice from the SIREN paper
 
 [optimization]
 steps = 5000
 lr = 0.003
 lam_bc = 5.0
+log_every = 250
+mini_epoch = 5
+lam_warm = 200.0      # NEW: initial (warm-start) λ for boundary loss
 
 [box]
 # z-extent of the fixed sampling box (x,y are computed from geometry each run)

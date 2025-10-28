@@ -64,6 +64,7 @@ from _network_and_loss import (
     eval_full,
     load_model_if_exists,
     save_model,
+    debug_stats,
 )
 from _physics import eval_on_boundary, grad_u_total_batch
 from _state import runtime
@@ -93,6 +94,9 @@ lr: float
 lam_bc: float
 PLOT_CMAP: str
 FIGSIZE: Tuple[float, float]
+LOG_EVERY: int
+MINI_EPOCH: int
+LAM_WARM: float
 
 # box
 box_zmin: float
@@ -104,11 +108,11 @@ box_seed: int
 surfaces_cfg: dict
 
 def _lambda_bc_schedule(it, T):
-    # Start high, decay to ~your TOML lam_bc
-    warm = 1000.0   # very high early
-    end  = lam_bc   # target from TOML
-    alpha = (it / max(1, T)) ** 0.5
-    return end + (1.0 - alpha) * (warm - end)
+    # Start very high and decay to lam_bc
+    warm, end = LAM_WARM, lam_bc
+    # cosine schedule in [0, π]
+    cosfac = 0.5 * (1 + jnp.cos(jnp.pi * jnp.clip(it / T, 0., 1.)))
+    return float(end + (warm - end) * cosfac)
 
 def _apply_params(params: Dict[str, Any]) -> None:
     global CHECKPOINT_PATH, BATCH_IN, BATCH_BDRY, R0, a0, a1, N_harm, kappa
@@ -142,6 +146,10 @@ def _apply_params(params: Dict[str, Any]) -> None:
     lr     = float(params["lr"])                               # type: ignore
     lam_bc = float(params["lam_bc"])                           # type: ignore
 
+    global LOG_EVERY, MINI_EPOCH
+    LOG_EVERY  = int(params.get("log_every", max(1, steps // 20)))   # e.g., 250
+    MINI_EPOCH = int(params.get("mini_epoch", 5))                    # K per surface
+
     PLOT_CMAP = str(params["plot_cmap"])                       # type: ignore
     FIGSIZE   = tuple(params["figsize"])                       # type: ignore
 
@@ -154,11 +162,15 @@ def _apply_params(params: Dict[str, Any]) -> None:
     # Raw surfaces config blob (parsed in main)
     surfaces_cfg    = params.get("surfaces_cfg", {})           # type: ignore
 
+    global LAM_WARM
+    LAM_WARM = float(params.get("lam_warm", 200.0))
+
 
 # =============================================================================
 # ================================== MAIN =====================================
 # =============================================================================
 def main(config_path: str = "input.toml"):
+
     # Load config dict and bind globals
     params = build_params_from_path(config_path)
     _apply_params(params)
@@ -173,8 +185,9 @@ def main(config_path: str = "input.toml"):
     runtime.BATCH_BDRY = BATCH_BDRY
     runtime.lam_bc = lam_bc
 
+    act_name = getattr(MLP_ACT, "__name__", str(MLP_ACT))
     print("=== PINN Laplace (single or multi-surface) ===")
-    print(f"Network: hidden={MLP_HIDDEN_SIZES}, act={MLP_ACT.__name__}, optimizer=AdamW(lr={lr})")
+    print(f"Network: hidden={MLP_HIDDEN_SIZES}, act={act_name}, optimizer=AdamW(lr={lr})")
     print(f"Training steps: {steps}, λ_bc={lam_bc}")
     sys.stdout.flush()
 
@@ -196,7 +209,16 @@ def main(config_path: str = "input.toml"):
     P_box = fixed_box_points(box_seed, box_points_total, runtime.box_bounds)   # [M,3]
 
     # ---------------------- Build model + optimizer ----------------------------
-    model = PotentialMLP(k_model, hidden_sizes=MLP_HIDDEN_SIZES, act=MLP_ACT)
+    use_siren = bool(params.get("siren", False))
+    siren_omega0 = float(params.get("siren_omega0", 30.0))
+
+    if use_siren and (getattr(MLP_ACT, "__name__", "") == "sin" or MLP_ACT is jax.numpy.sin):
+        from _network_and_loss import SirenMLP
+        model = SirenMLP(k_model, in_size=3, out_size=1,
+                        widths=MLP_HIDDEN_SIZES, omega0=siren_omega0)
+    else:
+        model = PotentialMLP(k_model, hidden_sizes=MLP_HIDDEN_SIZES, act=MLP_ACT)
+
     model = load_model_if_exists(model, CHECKPOINT_PATH)
 
     optimizer = optax.chain(
@@ -244,25 +266,26 @@ def main(config_path: str = "input.toml"):
 
         # Train
         key_train = random.PRNGKey(1234)
-        log_every = max(1, steps // 20)
+        log_every = LOG_EVERY
         for it in range(1, steps + 1):
             cur_lam = _lambda_bc_schedule(it, steps)
             runtime.lam_bc = float(cur_lam)   # update runtime so loss sees it
             key_train, subkey = random.split(key_train)
-            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm = train_step(
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm, grads = train_step(
                 model, opt_state, optimizer, P_in, P_bdry, N_bdry, subkey
             )
             if (it % log_every) == 0 or it == 1:
-                lap_rms = float(jnp.sqrt(jnp.mean(lap_res**2)))
-                n_rms   = float(jnp.sqrt(jnp.mean(nres**2)))
-                lap_max = float(jnp.max(jnp.abs(lap_res)))
-                n_max   = float(jnp.max(jnp.abs(nres)))
-                print(f"[{it:5d}] loss={float(L):.6e}  "
-                    f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
-                    f"|lap|_rms={lap_rms:.3e} (max {lap_max:.2e})  "
-                    f"|n·∇u|_rms={n_rms:.3e} (max {n_max:.2e})  "
-                    f"|u|_mean={float(mean_u):.3e}  "
-                    f"||g||={float(gnorm):.3e}  λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
+                stats = debug_stats(model, grads, lap_res, nres)
+                # compute |∇u| on THIS boundary
+                gmag = jnp.linalg.norm(grad_u_total_batch(model, P_bdry), axis=-1)
+                mean_g = float(jnp.mean(gmag))
+                print(
+                    f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                    f"|lap|_rms={stats['lap_rms']:.3e} (max {stats['lap_max']:.2e})  "
+                    f"|n·∇u|_rms={stats['nbc_rms']:.3e} (max {stats['nbc_max']:.2e})  "
+                    f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
+                    f"λ_bc={runtime.lam_bc:.2f}  surf=single"
+                )
 
         save_model(model, CHECKPOINT_PATH)
 
@@ -271,6 +294,13 @@ def main(config_path: str = "input.toml"):
         print(f"[FINAL] loss={float(Lf):.6e}  lap={float(Linf):.6e}  bc={float(Lbcf):.6e}")
         print(f"[FINAL] |lap|_rms={float(jnp.sqrt(jnp.mean(lapf**2))):.3e}  "
               f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
+        
+        nbc_rms  = float(jnp.sqrt(jnp.mean(nf**2)))
+        lap_rms  = float(jnp.sqrt(jnp.mean(lapf**2)))
+        nbc_max  = float(jnp.max(jnp.abs(nf)))
+        lap_max  = float(jnp.max(jnp.abs(lapf)))
+        print(f"[CHECK] boundary n·∇u  rms={nbc_rms:.3e}  max={nbc_max:.3e}")
+        print(f"[CHECK] interior Δu     rms={lap_rms:.3e}  max={lap_max:.3e}")
 
         # Compute final boundary grad & plot side-by-side
         Gvec_final, Gmag_final, _ = eval_on_boundary(model, P_bdry, N_bdry, Xg, Yg, Zg)
@@ -350,8 +380,10 @@ def main(config_path: str = "input.toml"):
 
         # Train: at each step pick a random surface and train on it
         key_train = random.PRNGKey(1234)
-        log_every = max(1, steps // 20)
+        log_every = LOG_EVERY
         for it in range(1, steps + 1):
+            cur_lam = _lambda_bc_schedule(it, steps)
+            runtime.lam_bc = float(cur_lam)
             key_train, ks = random.split(key_train)
             # sample surface index
             idx = int(random.randint(ks, shape=(), minval=0, maxval=len(dataset)))
@@ -361,20 +393,23 @@ def main(config_path: str = "input.toml"):
             ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
             P_in = P_box[ids][:N_in]
 
-            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm = train_step(
-                model, opt_state, optimizer, P_in, surf.P_bdry, surf.N_bdry, ks
-            )
+            # mini-epoch K consecutive steps on the same surface
+            for _ in range(MINI_EPOCH):
+                cur_lam = _lambda_bc_schedule(it, steps)
+                runtime.lam_bc = float(cur_lam)
+                key_train, sub = random.split(key_train)
+                model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm, grads = train_step(
+                    model, opt_state, optimizer, P_in, surf.P_bdry, surf.N_bdry, sub
+                )
             if (it % log_every) == 0 or it == 1:
-                lap_rms = float(jnp.sqrt(jnp.mean(lap_res**2)))
-                n_rms   = float(jnp.sqrt(jnp.mean(nres**2)))
-                lap_max = float(jnp.max(jnp.abs(lap_res)))
-                n_max   = float(jnp.max(jnp.abs(nres)))
-                print(f"[{it:5d}] loss={float(L):.6e}  "
-                    f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
-                    f"|lap|_rms={lap_rms:.3e} (max {lap_max:.2e})  "
-                    f"|n·∇u|_rms={n_rms:.3e} (max {n_max:.2e})  "
-                    f"|u|_mean={float(mean_u):.3e}  "
-                    f"||g||={float(gnorm):.3e}  λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
+                stats = debug_stats(model, grads, lap_res, nres)
+                gmag = jnp.linalg.norm(grad_u_total_batch(model, surf.P_bdry), axis=-1)
+                mean_g = float(jnp.mean(gmag))
+                print(f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                    f"|lap|_rms={stats['lap_rms']:.3e} (max {stats['lap_max']:.2e})  "
+                    f"|n·∇u|_rms={stats['nbc_rms']:.3e} (max {stats['nbc_max']:.2e})  "
+                    f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
+                    f"λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
 
         save_model(model, CHECKPOINT_PATH)
 

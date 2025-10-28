@@ -80,11 +80,16 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         hidden = [32, 32]
     p["mlp_hidden_sizes"] = tuple(int(x) for x in hidden)
     p["mlp_activation"] = get_activation(cfg.get("model", {}).get("activation", "tanh"))
+    p["siren"] = bool(cfg.get("model", {}).get("siren", False))
+    p["siren_omega0"] = float(cfg.get("model", {}).get("siren_omega0", 30.0))
 
     # optimization
     p["steps"] = int(cfg.get("optimization", {}).get("steps", 1000))
     p["lr"] = float(cfg.get("optimization", {}).get("lr", 3e-3))
     p["lam_bc"] = float(cfg.get("optimization", {}).get("lam_bc", 5.0))
+    p["lam_warm"] = float(cfg.get("optimization", {}).get("lam_warm", 200.0))
+    p["log_every"] = int(cfg.get("optimization", {}).get("log_every", max(1, p["steps"] // 20)))
+    p["mini_epoch"] = int(cfg.get("optimization", {}).get("mini_epoch", 5))
 
     # plot
     p["plot_cmap"] = str(cfg.get("plot", {}).get("cmap", "viridis"))

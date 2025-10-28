@@ -5,12 +5,40 @@ import equinox as eqx
 import optax
 from pathlib import Path
 from _state import runtime 
+import numpy as np
+from typing import List, Tuple
 
 from _physics import u_total, grad_u_total_batch, lap_u_total_batch, u_total_batch
 
 ZERO_MEAN_WEIGHT = 0.1  # small regularization
 
 def _identity(x): return x
+
+
+def debug_stats(params, grads, lap_res, nres, s_in=None, s_bc=None):
+    """Return small dict of scalars for printing/logging."""
+    # param/grads norms (filtered already in train_step; re-filter here if needed)
+    p_f, _ = eqx.partition(params, eqx.is_inexact_array)
+    g_f, _ = eqx.partition(grads,  eqx.is_inexact_array)
+
+    # Flatten tree norms
+    def _l2(tree):
+        return np.sqrt(sum([np.asarray((x**2).sum()).item() for x in jax.tree_util.tree_leaves(tree)]))
+    def _inf(tree):
+        return max([float(jnp.max(jnp.abs(x))) for x in jax.tree_util.tree_leaves(tree)])
+
+    stats = {
+        "param_L2": _l2(p_f),
+        "grad_L2": _l2(g_f),
+        "grad_Linf": _inf(g_f),
+        "lap_rms": float(jnp.sqrt(jnp.mean(lap_res**2)) ),
+        "lap_max": float(jnp.max(jnp.abs(lap_res)) ),
+        "nbc_rms": float(jnp.sqrt(jnp.mean(nres**2)) ),
+        "nbc_max": float(jnp.max(jnp.abs(nres)) ),
+    }
+    if s_in is not None: stats["s_in"] = float(s_in)
+    if s_bc is not None: stats["s_bc"] = float(s_bc)
+    return stats
 
 class PotentialMLP(eqx.Module):
     mlp: eqx.nn.MLP
@@ -39,7 +67,7 @@ def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
 
     # ---- Boundary: importance sampling with Python ints only ----
     # pre-sample size m and final size K must be Python ints (not JAX arrays)
-    m = int(min(8 * runtime.BATCH_BDRY, nb))
+    m = int(min(16 * runtime.BATCH_BDRY, nb))
     m = max(m, 1)  # avoid zero-size
     key_b_pre, key_b_top = random.split(key_b)
 
@@ -87,7 +115,7 @@ def train_step(params, opt_state, optimizer, pts_interior, pts_bdry, normals_bdr
     updates, opt_state = optimizer.update(grads_f, opt_state, params_f)
     params_f = optax.apply_updates(params_f, updates)
     params = eqx.combine(params_f, params_s)
-    return params, opt_state, loss_val, aux, gnorm
+    return params, opt_state, loss_val, aux, gnorm, grads
 
 @eqx.filter_jit
 def eval_full(params, pts_interior, pts_bdry, normals_bdry):
@@ -117,3 +145,51 @@ def load_model_if_exists(template: eqx.Module, path: Path | str = "pinn_torus_mo
     else:
         print(f"[CKPT] No checkpoint found at {path}. Starting fresh.")
     return template
+
+# --- SIREN (minimal) ---------------------------------------------------------
+class SirenMLP(eqx.Module):
+    layers: List[Tuple[jnp.ndarray, jnp.ndarray]]
+    omega0: float
+
+    def __init__(self, key, in_size=3, out_size=1, widths=(64, 64, 64), omega0=30.0):
+        keys = jax.random.split(key, len(widths) + 1)
+        self.omega0 = float(omega0)
+        self.layers = []
+
+        # First layer init: U[-1/in, 1/in]
+        in_dim = in_size
+        w_key = keys[0]
+        W = jax.random.uniform(w_key, (widths[0], in_dim), minval=-1.0/in_dim, maxval=1.0/in_dim)
+        b = jnp.zeros((widths[0],))
+        self.layers.append((W, b))
+
+        # Hidden layers init: U[-sqrt(6/in)/omega0, +sqrt(6/in)/omega0]
+        for li, width in enumerate(widths[1:], start=1):
+            prev = widths[li-1]
+            w_key = keys[li]
+            bound = jnp.sqrt(6.0/prev) / self.omega0
+            W = jax.random.uniform(w_key, (width, prev), minval=-bound, maxval=bound)
+            b = jnp.zeros((width,))
+            self.layers.append((W, b))
+
+        # Final linear layer (small init)
+        w_key = keys[-1]
+        last = widths[-1] if len(widths) else in_size
+        W = jax.random.uniform(w_key, (out_size, last), minval=-1e-4, maxval=1e-4)
+        b = jnp.zeros((out_size,))
+        self.layers.append((W, b))
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # x: (..., 3)
+        # First layer: sin(omega0 * (W x + b))
+        W0, b0 = self.layers[0]
+        h = jnp.sin(self.omega0 * (x @ W0.T + b0))
+
+        # Hidden SIREN layers: sin(W h + b)
+        for W, b in self.layers[1:-1]:
+            h = jnp.sin(h @ W.T + b)
+
+        # Final linear
+        Wf, bf = self.layers[-1]
+        y = h @ Wf.T + bf
+        return y.squeeze(-1)
