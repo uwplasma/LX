@@ -193,3 +193,12 @@ class SirenMLP(eqx.Module):
         Wf, bf = self.layers[-1]
         y = h @ Wf.T + bf
         return y.squeeze(-1)
+    
+def _diagnostics(params, pts_interior, pts_bdry, normals_bdry):
+    """Return scalar diagnostics for printing (no JIT)."""
+    total, (Lin, Lbc, lap, n_dot) = eval_full(params, pts_interior, pts_bdry, normals_bdry)
+    lap_rms = float(jnp.sqrt(jnp.mean(lap**2)))
+    lap_max = float(jnp.max(jnp.abs(lap)))
+    nbc_rms = float(jnp.sqrt(jnp.mean(n_dot**2)))
+    nbc_max = float(jnp.max(jnp.abs(n_dot)))
+    return float(total), float(Lin), float(Lbc), lap_rms, lap_max, nbc_rms, nbc_max

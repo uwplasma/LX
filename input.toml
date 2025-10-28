@@ -44,18 +44,27 @@ N_bdry_phi = 64       # boundary φ resolution
 rng_seed = 0
 
 [model]
-hidden_sizes = [64, 64, 64]   # MLP hidden layer sizes
+hidden_sizes = [32, 32]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
 
 [optimization]
-steps = 5000
+steps = 300
 lr = 0.003
 lam_bc = 5.0
-log_every = 250
+log_every = 50
 mini_epoch = 5
-lam_warm = 200.0      # NEW: initial (warm-start) λ for boundary loss
+lam_warm = 50.0      # initial (warm-start) λ for boundary loss
+# --- LBFGS (polish) ---
+lbfgs_steps = 300        # set 0 to disable; 200–500 is typical
+lbfgs_tol = 1e-7
+lbfgs_print_every = 20
+# --- LBFGS (polish on all surfaces) ---
+# (optional caps; 0 = use all)
+lbfgs_interior = 5000     # per surface interior points used by LBFGS
+lbfgs_boundary = 2000     # per surface boundary points used by LBFGS
+lbfgs_weighting = "equal" # reserved for future weighting policies
 
 [box]
 # z-extent of the fixed sampling box (x,y are computed from geometry each run)

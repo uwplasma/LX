@@ -49,6 +49,7 @@ from jax import random
 import optax
 import equinox as eqx
 import matplotlib.pyplot as plt
+from jaxopt import LBFGS
 
 # ---------------- local imports ----------------
 from _initialization import build_params_from_path
@@ -97,6 +98,12 @@ FIGSIZE: Tuple[float, float]
 LOG_EVERY: int
 MINI_EPOCH: int
 LAM_WARM: float
+LBFGS_STEPS: int
+LBFGS_TOL: float
+LBFGS_PRINT_EVERY: int
+LBFGS_IN: int
+LBFGS_BDRY: int
+LBFGS_WEIGHTING: str
 
 # box
 box_zmin: float
@@ -106,6 +113,20 @@ box_seed: int
 
 # surfaces config (raw dict from TOML; parsed here)
 surfaces_cfg: dict
+
+def _take_first_n(x: jnp.ndarray, n: int) -> jnp.ndarray:
+    """Deterministic truncation: if n<=0 or n>=len(x), returns x."""
+    if n <= 0 or n >= int(x.shape[0]):
+        return x
+    return x[:int(n)]
+
+def _stride_take(x: jnp.ndarray, k: int) -> jnp.ndarray:
+    """Deterministic approx-uniform sub-sampling without randomness."""
+    n = int(x.shape[0])
+    if k <= 0 or k >= n:
+        return x
+    stride = max(n // k, 1)
+    return x[::stride][:k]
 
 def _lambda_bc_schedule(it, T):
     # Start very high and decay to lam_bc
@@ -165,6 +186,16 @@ def _apply_params(params: Dict[str, Any]) -> None:
     global LAM_WARM
     LAM_WARM = float(params.get("lam_warm", 200.0))
 
+    global LBFGS_STEPS, LBFGS_TOL, LBFGS_PRINT_EVERY
+    LBFGS_STEPS = int(params.get("lbfgs_steps", 0))
+    LBFGS_TOL = float(params.get("lbfgs_tol", 1e-7))
+    LBFGS_PRINT_EVERY = int(params.get("lbfgs_print_every", 25))
+
+    global LBFGS_IN, LBFGS_BDRY, LBFGS_WEIGHTING
+    LBFGS_IN        = int(params.get("lbfgs_interior", 0))
+    LBFGS_BDRY      = int(params.get("lbfgs_boundary", 0))
+    LBFGS_WEIGHTING = str(params.get("lbfgs_weighting", "equal"))
+
 
 # =============================================================================
 # ================================== MAIN =====================================
@@ -209,10 +240,10 @@ def main(config_path: str = "input.toml"):
     P_box = fixed_box_points(box_seed, box_points_total, runtime.box_bounds)   # [M,3]
 
     # ---------------------- Build model + optimizer ----------------------------
-    use_siren = bool(params.get("siren", False))
-    siren_omega0 = float(params.get("siren_omega0", 30.0))
+    use_siren     = bool(params.get("siren", False))
+    siren_omega0  = float(params.get("siren_omega0", 30.0))
 
-    if use_siren and (getattr(MLP_ACT, "__name__", "") == "sin" or MLP_ACT is jax.numpy.sin):
+    if use_siren and (MLP_ACT.__name__ == "sin" or MLP_ACT is jnp.sin):
         from _network_and_loss import SirenMLP
         model = SirenMLP(k_model, in_size=3, out_size=1,
                         widths=MLP_HIDDEN_SIZES, omega0=siren_omega0)
@@ -286,6 +317,14 @@ def main(config_path: str = "input.toml"):
                     f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
                     f"λ_bc={runtime.lam_bc:.2f}  surf=single"
                 )
+
+        # Optional LBFGS polish on this single surface
+        if LBFGS_STEPS > 0:
+            model = _lbfgs_polish(
+                model, P_in, P_bdry, N_bdry,
+                steps=LBFGS_STEPS, tol=LBFGS_TOL,
+                print_every=LBFGS_PRINT_EVERY, label="single"
+            )
 
         save_model(model, CHECKPOINT_PATH)
 
@@ -411,6 +450,30 @@ def main(config_path: str = "input.toml"):
                     f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
                     f"λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
 
+        # Optional LBFGS polish across **all** surfaces
+        if LBFGS_STEPS > 0:
+            packs = []
+            for surf in dataset:
+                # interior from common box (deterministic)
+                mask = surf.inside_mask_fn(P_box)
+                ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
+                P_in_all = P_box[ids][:N_in]
+                # Downselect interior for LBFGS if requested
+                P_in_use = _take_first_n(P_in_all, LBFGS_IN)
+
+                # boundary: optionally sub-sample deterministically to cap memory
+                P_b_all, N_b_all = surf.P_bdry, surf.N_bdry
+                P_b_use = _stride_take(P_b_all, LBFGS_BDRY)
+                N_b_use = _stride_take(N_b_all, LBFGS_BDRY)
+
+                packs.append((P_in_use, P_b_use, N_b_use, surf.name))
+
+            model = _lbfgs_polish_many(
+                model, packs,
+                steps=LBFGS_STEPS, tol=LBFGS_TOL,
+                print_every=LBFGS_PRINT_EVERY, label="torus:ALL"
+            )
+
         save_model(model, CHECKPOINT_PATH)
 
         # Final diagnostics on a couple of surfaces
@@ -460,6 +523,167 @@ def main(config_path: str = "input.toml"):
 
     return model
 
+def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
+                  steps: int, tol: float, print_every: int, label: str):
+    """
+    Run jaxopt.LBFGS on the full-batch objective with a Python loop so we can
+    print diagnostics every few iterations. Optimizes only inexact arrays.
+    """
+    if steps <= 0:
+        print(f"[LBFGS] Skipped (steps={steps}).")
+        return model
+
+    # Use the *final* λ_bc during polish
+    runtime.lam_bc = float(lam_bc)
+
+    # Partition: optimize only floating leaves
+    params_f, params_s = eqx.partition(model, eqx.is_inexact_array)
+
+    # Scalar objective over filtered params
+    def obj(params_f_opt):
+        m = eqx.combine(params_f_opt, params_s)
+        total, _ = eval_full(m, P_in, P_bdry, N_bdry)
+        return jnp.asarray(total, dtype=jnp.float64)
+
+    # Initial diagnostics
+    tot0, (Lin0, Lbc0, lap0, n0) = eval_full(model, P_in, P_bdry, N_bdry)
+    print(f"[LBFGS:{label} INIT] f={float(tot0):.6e}  lin={float(Lin0):.3e}  lbc={float(Lbc0):.3e}  "
+          f"|lap|_rms={float(jnp.sqrt(jnp.mean(lap0**2))):.3e}  "
+          f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(n0**2))):.3e}")
+
+    # Build solver
+    solver = LBFGS(
+        fun=obj,                 # obj(params) -> scalar
+        value_and_grad=False,    # let jaxopt wrap value_and_grad internally
+        has_aux=False,           # <— important: your obj returns a scalar only
+        tol=tol,
+        stepsize=1.0,
+        linesearch="hager-zhang",  # or "zoom"
+        maxls=20,
+        history_size=10,
+        verbose=False,
+    )
+
+    # Initialize state
+    state = solver.init_state(params_f)
+
+    # Manual loop so we can print every `print_every`
+    params_curr = params_f
+    for it in range(1, int(steps) + 1):
+        params_curr, state = solver.update(params_curr, state)
+
+        if (it % print_every) == 0 or it == 1 or it == steps:
+            m = eqx.combine(params_curr, params_s)
+            total, (Lin, Lbc, lap, n_dot) = eval_full(m, P_in, P_bdry, N_bdry)
+            lap_rms = float(jnp.sqrt(jnp.mean(lap**2)))
+            nbc_rms = float(jnp.sqrt(jnp.mean(n_dot**2)))
+            grad_norm = getattr(state, "grad_norm", None)
+            gtxt = (f"  grad_norm={float(grad_norm):.3e}" if grad_norm is not None else "")
+            print(f"[LBFGS:{label} {it:4d}/{steps}] f={float(total):.6e}  "
+                  f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                  f"|lap|_rms={lap_rms:.3e}  |n·∇u|_rms={nbc_rms:.3e}{gtxt}")
+
+        # Early stop if solver exposes an error metric and we’re below tol
+        err = getattr(state, "error", None)
+        if (err is not None) and (float(err) <= tol):
+            break
+
+    model_opt = eqx.combine(params_curr, params_s)
+
+    # Final diagnostics
+    totf, (Linf, Lbcf, lapf, nf) = eval_full(model_opt, P_in, P_bdry, N_bdry)
+    print(f"[LBFGS:{label} DONE] f={float(totf):.6e}  lin={float(Linf):.3e}  lbc={float(Lbcf):.3e}  "
+          f"|lap|_rms={float(jnp.sqrt(jnp.mean(lapf**2))):.3e}  "
+          f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
+    return model_opt
+
+def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int, label: str):
+    """
+    LBFGS polish over multiple surfaces simultaneously.
+
+    packs: tuple list of (P_in, P_bdry, N_bdry, name)
+      - Each array is **fixed** (no randomness) to keep objective deterministic.
+    The objective is the sum of full-batch totals across surfaces (equal weighting).
+    """
+    if steps <= 0:
+        print(f"[LBFGS-many] Skipped (steps={steps}).")
+        return model
+
+    runtime.lam_bc = float(lam_bc)  # use final λ_bc
+
+    # Filter model leaves (only inexact arrays are optimized)
+    params_f, params_s = eqx.partition(model, eqx.is_inexact_array)
+
+    # Make packs JAX-friendly (tuple of tuples of jnp arrays)
+    packs_tup = tuple((jnp.asarray(Pi), jnp.asarray(Pb), jnp.asarray(Nb), str(name))
+                      for (Pi, Pb, Nb, name) in packs)
+
+    def obj(params_f_opt):
+        m = eqx.combine(params_f_opt, params_s)
+        total = 0.0
+        # Python loop is fine: length is static during tracing
+        for (Pi, Pb, Nb, _nm) in packs_tup:
+            t, _ = eval_full(m, Pi, Pb, Nb)   # uses runtime.lam_bc
+            total = total + t
+        # Equal weighting (divide by number of surfaces)
+        total = total / float(len(packs_tup))
+        return jnp.asarray(total, dtype=jnp.float64)
+
+    # Initial diagnostics (aggregate)
+    def _agg_stats(mod):
+        vals = []
+        for (Pi, Pb, Nb, _nm) in packs_tup:
+            t, (Lin, Lbc, lap, n) = eval_full(mod, Pi, Pb, Nb)
+            vals.append((
+                float(t), float(Lin), float(Lbc),
+                float(jnp.sqrt(jnp.mean(lap**2)) ),
+                float(jnp.sqrt(jnp.mean(n**2)) )))
+        # mean over surfaces
+        import numpy as _np
+        arr = _np.array(vals)
+        return {
+            "f": arr[:,0].mean(), "lin": arr[:,1].mean(), "lbc": arr[:,2].mean(),
+            "lap_rms": arr[:,3].mean(), "nbc_rms": arr[:,4].mean()
+        }
+
+    s0 = _agg_stats(model)
+    print(f"[LBFGS-many:{label} INIT] f={s0['f']:.6e} lin={s0['lin']:.3e} lbc={s0['lbc']:.3e} "
+          f"|lap|_rms={s0['lap_rms']:.3e} |n·∇u|_rms={s0['nbc_rms']:.3e}")
+
+    # Build jaxopt solver (numeric stepsize! line-search controls updates)
+    solver = LBFGS(
+        fun=obj,
+        value_and_grad=False,
+        has_aux=False,
+        tol=tol,
+        stepsize=1.0,             # initial guess; actual step picked by line-search
+        linesearch="hager-zhang",  # or "zoom"
+        maxls=20,
+        history_size=10,
+        verbose=False,
+    )
+
+    state = solver.init_state(params_f)
+    params_curr = params_f
+
+    for it in range(1, int(steps) + 1):
+        params_curr, state = solver.update(params_curr, state)
+        if (it % print_every) == 0 or it == 1 or it == steps:
+            m = eqx.combine(params_curr, params_s)
+            si = _agg_stats(m)
+            gn = getattr(state, "grad_norm", None)
+            gtxt = (f"  grad_norm={float(gn):.3e}" if gn is not None else "")
+            print(f"[LBFGS-many:{label} {it:4d}/{steps}] f={si['f']:.6e} lin={si['lin']:.3e} "
+                  f"lbc={si['lbc']:.3e} |lap|_rms={si['lap_rms']:.3e} |n·∇u|_rms={si['nbc_rms']:.3e}{gtxt}")
+        err = getattr(state, "error", None)
+        if (err is not None) and (float(err) <= tol):
+            break
+
+    model_opt = eqx.combine(params_curr, params_s)
+    sf = _agg_stats(model_opt)
+    print(f"[LBFGS-many:{label} DONE] f={sf['f']:.6e} lin={sf['lin']:.3e} lbc={sf['lbc']:.3e} "
+          f"|lap|_rms={sf['lap_rms']:.3e} |n·∇u|_rms={sf['nbc_rms']:.3e}")
+    return model_opt
 
 if __name__ == "__main__":
     import argparse

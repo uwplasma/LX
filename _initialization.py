@@ -90,6 +90,10 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     p["lam_warm"] = float(cfg.get("optimization", {}).get("lam_warm", 200.0))
     p["log_every"] = int(cfg.get("optimization", {}).get("log_every", max(1, p["steps"] // 20)))
     p["mini_epoch"] = int(cfg.get("optimization", {}).get("mini_epoch", 5))
+    opt = cfg.get("optimization", {})
+    p["lbfgs_steps"] = int(opt.get("lbfgs_steps", 0))       # 0 disables polish
+    p["lbfgs_tol"] = float(opt.get("lbfgs_tol", 1e-7))
+    p["lbfgs_print_every"] = int(opt.get("lbfgs_print_every", 25))
 
     # plot
     p["plot_cmap"] = str(cfg.get("plot", {}).get("cmap", "viridis"))
@@ -110,6 +114,12 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- surfaces list (raw dict; parsed in main) ---
     p["surfaces_cfg"] = cfg.get("surfaces", {})
+
+    # control how many points are used per surface in LBFGS (to cap memory)
+    # 0 or missing => use "all" available points
+    p["lbfgs_interior"]      = int(opt.get("lbfgs_interior", 0))     # interior points per surface
+    p["lbfgs_boundary"]      = int(opt.get("lbfgs_boundary", 0))     # boundary points per surface
+    p["lbfgs_weighting"]     = str(opt.get("lbfgs_weighting", "equal"))  # "equal" (default)
 
     return p
 
