@@ -249,14 +249,20 @@ def main(config_path: str = "input.toml"):
             cur_lam = _lambda_bc_schedule(it, steps)
             runtime.lam_bc = float(cur_lam)   # update runtime so loss sees it
             key_train, subkey = random.split(key_train)
-            model, opt_state, L, (Lin, Lbc, lap_res, nres) = train_step(
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm = train_step(
                 model, opt_state, optimizer, P_in, P_bdry, N_bdry, subkey
             )
             if (it % log_every) == 0 or it == 1:
                 lap_rms = float(jnp.sqrt(jnp.mean(lap_res**2)))
                 n_rms   = float(jnp.sqrt(jnp.mean(nres**2)))
-                print(f"[{it:5d}] loss={float(L):.6e}  lap={float(Lin):.6e}  bc={float(Lbc):.6e}  "
-                      f"|lap|_rms={lap_rms:.3e}  |n·∇u|_rms={n_rms:.3e}")
+                lap_max = float(jnp.max(jnp.abs(lap_res)))
+                n_max   = float(jnp.max(jnp.abs(nres)))
+                print(f"[{it:5d}] loss={float(L):.6e}  "
+                    f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                    f"|lap|_rms={lap_rms:.3e} (max {lap_max:.2e})  "
+                    f"|n·∇u|_rms={n_rms:.3e} (max {n_max:.2e})  "
+                    f"|u|_mean={float(mean_u):.3e}  "
+                    f"||g||={float(gnorm):.3e}  λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
 
         save_model(model, CHECKPOINT_PATH)
 
@@ -355,14 +361,20 @@ def main(config_path: str = "input.toml"):
             ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
             P_in = P_box[ids][:N_in]
 
-            model, opt_state, L, (Lin, Lbc, lap_res, nres) = train_step(
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm = train_step(
                 model, opt_state, optimizer, P_in, surf.P_bdry, surf.N_bdry, ks
             )
             if (it % log_every) == 0 or it == 1:
                 lap_rms = float(jnp.sqrt(jnp.mean(lap_res**2)))
                 n_rms   = float(jnp.sqrt(jnp.mean(nres**2)))
-                print(f"[{it:5d}] loss={float(L):.6e}  lap={float(Lin):.6e}  bc={float(Lbc):.6e}  "
-                      f"|lap|_rms={lap_rms:.3e}  |n·∇u|_rms={n_rms:.3e}  surf={dataset[idx].name}")
+                lap_max = float(jnp.max(jnp.abs(lap_res)))
+                n_max   = float(jnp.max(jnp.abs(nres)))
+                print(f"[{it:5d}] loss={float(L):.6e}  "
+                    f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                    f"|lap|_rms={lap_rms:.3e} (max {lap_max:.2e})  "
+                    f"|n·∇u|_rms={n_rms:.3e} (max {n_max:.2e})  "
+                    f"|u|_mean={float(mean_u):.3e}  "
+                    f"||g||={float(gnorm):.3e}  λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
 
         save_model(model, CHECKPOINT_PATH)
 

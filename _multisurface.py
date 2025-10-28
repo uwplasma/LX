@@ -38,9 +38,9 @@ class SurfacesDataset:
         valid_ids = jnp.nonzero(mask, size=P_box.shape[0], fill_value=0)[0]
         # <- NEW: randomly choose interior points for this surface/step
         key, sub = random.split(key)
-        n_valid = jnp.sum(mask)
+        n_valid = int(mask.sum())                 # Python int
         # sample without replacement up to N_in; fall back to first N if too few
-        take = jnp.minimum(N_in, n_valid)
+        take = min(N_in, n_valid)                 # Python int
         sel = random.choice(sub, valid_ids[:n_valid], (take,), replace=False)
         P_in = P_box[sel]
         # If fewer than N_in exist (unlikely), pad by repeating
