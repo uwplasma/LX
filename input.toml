@@ -70,8 +70,8 @@ lbfgs_tol = 1e-7
 lbfgs_print_every = 20
 # --- LBFGS (polish on all surfaces) ---
 # (optional caps; 0 = use all)
-lbfgs_interior = 5000     # per surface interior points used by LBFGS
-lbfgs_boundary = 2000     # per surface boundary points used by LBFGS
+lbfgs_interior = 0     # per surface interior points used by LBFGS
+lbfgs_boundary = 0     # per surface boundary points used by LBFGS
 lbfgs_weighting = "equal" # reserved for future weighting policies
 use_augmented_lagrangian = true   # false keeps old behavior
 al_rho = 1.0                      # penalty (ρ) for the AL quadratic term
@@ -82,19 +82,21 @@ grad_clip_norm = 1.0
 weight_decay = 0.0           # decoupled WD in AdamW (set >0 to use)
 lr_warmup_steps = 0          # e.g., 200
 lr_min_ratio = 0.05          # cosine floor: lr_min = lr * lr_min_ratio
+use_ema = true
+ema_decay = 0.999                 # Polyak EMA decay
+ema_eval = true                   # use EMA params for eval & LBFGS init
 
 use_lookahead = true
 lookahead_sync_period = 5        # k steps between slow-weight syncs
 lookahead_slow_step = 0.5        # α (0..1), typical 0.5
 
+lbfgs_include_zero_mean = true
+lbfgs_include_aug_lagrangian = true
+
 [optimization.lbfgs]
 l2 = 1e-7                   # was lbfgs_l2
-include_zero_mean = false
-include_aug_lagrangian = false
-
-use_ema = true
-ema_decay = 0.999                 # Polyak EMA decay
-ema_eval = true                   # use EMA params for eval & LBFGS init
+include_zero_mean = true
+include_aug_lagrangian = true
 
 [box]
 # z-extent of the fixed sampling box (x,y are computed from geometry each run)

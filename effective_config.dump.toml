@@ -1,0 +1,117 @@
+# Auto-generated view of the EFFECTIVE configuration in use.
+# Diff this against your input.toml to catch silent fallbacks.
+
+[surfaces]
+mode = "torus"
+
+[[surfaces.torus_list]]
+name = "T1"
+a0 = 0.35
+a1 = 0.2
+N_harm = 3
+
+[[surfaces.torus_list]]
+name = "T2"
+a0 = 0.3
+a1 = 0.1
+N_harm = 2
+
+[[surfaces.torus_list]]
+name = "T3"
+a0 = 0.4
+a1 = 0.25
+N_harm = 4
+
+[checkpoint]
+path = "pinn_torus_model.eqx"
+
+[batch]
+interior = 2048
+boundary = 2048
+
+[geometry]
+R0 = 1
+a0 = 0.35
+a1 = 0.15
+N_harm = 4
+
+[multi_valued]
+kappa = 0.2
+
+[sampling]
+N_in = 10000
+N_bdry_theta = 32
+N_bdry_phi = 64
+rng_seed = 0
+bdry_presample_mult = 16
+
+[regularization]
+zero_mean_weight = 0.1
+
+[model]
+hidden_sizes = [32, 32]
+activation = "sin"
+siren = true
+siren_omega0 = 30
+use_fourier = true
+fourier_bands = [1, 2, 4, 8]
+fourier_scale = 6.283185307179586
+R0_for_fourier = 1
+
+[optimization]
+steps = 500
+lr = 0.003
+lam_bc = 5
+lam_warm = 50
+log_every = 50
+mini_epoch = 5
+grad_clip_norm = 1
+weight_decay = 0
+lr_warmup_steps = 0
+lr_min_ratio = 0.05
+use_lookahead = true
+lookahead_sync_period = 5
+lookahead_slow_step = 0.5
+use_ema = true
+ema_decay = 0.999
+ema_eval = true
+use_augmented_lagrangian = true
+al_rho = 1
+al_update_every = 10
+al_clip = 0
+lbfgs_steps = 200
+lbfgs_tol = 1.000000e-07
+lbfgs_print_every = 20
+lbfgs_interior = 0
+lbfgs_boundary = 0
+lbfgs_weighting = "equal"
+
+[optimization.lbfgs]
+l2 = 1.000000e-07
+include_zero_mean = true
+include_aug_lagrangian = true
+
+[box]
+zmin = -0.8
+zmax = 0.8
+points_total = 200000
+seed = 42
+
+[plot]
+cmap = "viridis"
+figsize = [8, 4.5]
+
+[__derived]
+runtime_lam_bc_current = 5
+runtime_al_enabled = true
+runtime_al_lambda = 0
+runtime_al_rho = 1
+runtime_al_update_every = 10
+runtime_al_clip = 0
+runtime_box_xmin = -1.5
+runtime_box_xmax = 1.5
+runtime_box_ymin = -1.5
+runtime_box_ymax = 1.5
+runtime_box_zmin = -0.5
+runtime_box_zmax = 0.5
+note = "Snapshot taken before training and LBFGS polish."

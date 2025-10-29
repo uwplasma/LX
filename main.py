@@ -71,9 +71,8 @@ from _network_and_loss import (
 )
 from _physics import eval_on_boundary, grad_u_total_batch
 from _state import runtime
-
-# Multi-surface dataset helpers
 from _multisurface import build_torus_family
+from _input_output import dump_effective_toml
 
 # =============================================================================
 # ========================== GLOBAL / PARAM BINDING ===========================
@@ -249,6 +248,13 @@ def main(config_path: str = "input.toml"):
     runtime.lbfgs_include_zero_mean = bool(params.get("lbfgs_include_zero_mean", True))
     runtime.lbfgs_include_aug_lagrangian = bool(params.get("lbfgs_include_aug_lagrangian", True))
     runtime.lbfgs_l2 = float(params.get("lbfgs_l2", 1e-8))
+
+    dump_effective_toml(
+        path="effective_config.dump.toml",
+        params=params,
+        runtime=runtime,
+        extra={"note": "Snapshot taken before training and LBFGS polish."}
+    )
 
     act_name = getattr(MLP_ACT, "__name__", str(MLP_ACT))
     print("=== PINN Laplace (single or multi-surface) ===")
