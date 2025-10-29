@@ -16,11 +16,6 @@ def grad_u_mv(xyz: jnp.ndarray) -> jnp.ndarray:
     gz = jnp.zeros_like(x)
     return (runtime.kappa / runtime.R0) * jnp.stack([gx, gy, gz], axis=-1)
 
-@eqx.filter_jit
-def lap_u_mv_zero(_params, _xyz):
-    # Laplacian of atan2(y,x) is 0 away from r=0 (singular on axis only).
-    return jnp.array(0.0)
-
 def u_total(params, xyz: jnp.ndarray) -> jnp.ndarray:
     return u_multivalued(xyz) + params(xyz)
 
@@ -33,15 +28,24 @@ def grad_u_nn_scalar(params, xyz: jnp.ndarray) -> jnp.ndarray:
 # e_i are standard basis vectors in R^3
 @eqx.filter_jit
 def lap_u_nn_scalar(params, xyz: jnp.ndarray) -> jnp.ndarray:
-    """Compute Laplacian via three JVPs with dtype-safe unit vectors."""
-    def g(q):  # grad of NN-only potential
+    """
+    Laplacian of the NN-only potential using a single reverse pass + forward JVPs.
+
+    We linearize g(x) = ∇u_nn(x) at the query point:
+        g_x, jvp_lin = jax.linearize(g, xyz)
+    Then columns of the Hessian H are jvp_lin(e_i). The Laplacian is trace(H).
+    This avoids re-evaluating the reverse pass three times.
+    """
+    def g(q):
         return jax.grad(lambda q_: params(q_))(q)
 
-    e = jnp.eye(3, dtype=xyz.dtype)  # unit basis with the SAME dtype as xyz
-    _, He1 = jax.jvp(g, (xyz,), (e[0],))
-    _, He2 = jax.jvp(g, (xyz,), (e[1],))
-    _, He3 = jax.jvp(g, (xyz,), (e[2],))
-    return He1[0] + He2[1] + He3[2]
+    # One reverse pass to build the linearized JVP
+    _, jvp_lin = jax.linearize(g, xyz)
+
+    # Apply to basis to get columns of H; trace = sum diag = sum_i (H e_i)_i
+    eye = jnp.eye(3, dtype=xyz.dtype)
+    cols = jax.vmap(jvp_lin)(eye)          # shape (3, 3) with cols[i] = H @ e_i
+    return jnp.trace(cols)
 
 # Batched wrappers
 # u_nn_batch = jax.vmap(lambda p, q: p(q), in_axes=(None, 0))

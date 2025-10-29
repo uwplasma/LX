@@ -37,7 +37,7 @@ def get_activation(name: str):
         "relu": jax.nn.relu,
         "gelu": jax.nn.gelu,
         "sigmoid": jax.nn.sigmoid,
-        "silu": jax.nn.silu,  # swish
+        "silu": jax.nn.silu,      # swish
         "swish": jax.nn.silu,
         "softplus": jax.nn.softplus,
         "identity": (lambda x: x),
@@ -73,53 +73,90 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     p["N_bdry_theta"] = int(cfg.get("sampling", {}).get("N_bdry_theta", 32))
     p["N_bdry_phi"] = int(cfg.get("sampling", {}).get("N_bdry_phi", 64))
     p["rng_seed"] = int(cfg.get("sampling", {}).get("rng_seed", 0))
+    # boundary presample multiplier (used by importance sampling)
+    p["bdry_presample_mult"] = int(cfg.get("sampling", {}).get("bdry_presample_mult", 16))
+
+    # regularization
+    p["zero_mean_weight"] = float(cfg.get("regularization", {}).get("zero_mean_weight", 0.1))
 
     # model
-    hidden = cfg.get("model", {}).get("hidden_sizes", [32, 32])
+    model_cfg = cfg.get("model", {})
+    hidden = model_cfg.get("hidden_sizes", [32, 32])
     if not isinstance(hidden, (list, tuple)):
         hidden = [32, 32]
     p["mlp_hidden_sizes"] = tuple(int(x) for x in hidden)
-    p["mlp_activation"] = get_activation(cfg.get("model", {}).get("activation", "tanh"))
-    p["siren"] = bool(cfg.get("model", {}).get("siren", False))
-    p["siren_omega0"] = float(cfg.get("model", {}).get("siren_omega0", 30.0))
+    p["mlp_activation"] = get_activation(model_cfg.get("activation", "tanh"))
+    p["siren"] = bool(model_cfg.get("siren", False))
+    p["siren_omega0"] = float(model_cfg.get("siren_omega0", 30.0))
+    p["use_fourier"] = bool(model_cfg.get("use_fourier", False))
+    p["fourier_bands"] = tuple(float(x) for x in model_cfg.get("fourier_bands", [1.0, 2.0, 4.0, 8.0]))
+    p["fourier_scale"] = float(model_cfg.get("fourier_scale", 2.0 * 3.141592653589793))
+    # this is read in main() with default to R0 if missing
+    p["R0_for_fourier"] = float(model_cfg.get("R0_for_fourier", p["R0"]))
 
     # optimization
-    p["steps"] = int(cfg.get("optimization", {}).get("steps", 1000))
-    p["lr"] = float(cfg.get("optimization", {}).get("lr", 3e-3))
-    p["lam_bc"] = float(cfg.get("optimization", {}).get("lam_bc", 5.0))
-    p["lam_warm"] = float(cfg.get("optimization", {}).get("lam_warm", 200.0))
-    p["log_every"] = int(cfg.get("optimization", {}).get("log_every", max(1, p["steps"] // 20)))
-    p["mini_epoch"] = int(cfg.get("optimization", {}).get("mini_epoch", 5))
     opt = cfg.get("optimization", {})
+    p["steps"] = int(opt.get("steps", 1000))
+    p["lr"] = float(opt.get("lr", 3e-3))
+    p["lam_bc"] = float(opt.get("lam_bc", 5.0))
+    p["lam_warm"] = float(opt.get("lam_warm", 200.0))
+    p["log_every"] = int(opt.get("log_every", max(1, p["steps"] // 20)))
+    p["mini_epoch"] = int(opt.get("mini_epoch", 5))
+
+    # optimizer extras used in main()
+    p["grad_clip_norm"] = float(opt.get("grad_clip_norm", 1.0))
+    p["weight_decay"]   = float(opt.get("weight_decay", 0.0))
+    p["lr_warmup_steps"] = int(opt.get("lr_warmup_steps", 0))
+    p["lr_min_ratio"]    = float(opt.get("lr_min_ratio", 0.0))
+
+    # LBFGS (top-level toggles)
     p["lbfgs_steps"] = int(opt.get("lbfgs_steps", 0))       # 0 disables polish
     p["lbfgs_tol"] = float(opt.get("lbfgs_tol", 1e-7))
     p["lbfgs_print_every"] = int(opt.get("lbfgs_print_every", 25))
 
+    # LBFGS (caps per surface)
+    p["lbfgs_interior"]  = int(opt.get("lbfgs_interior", 0))
+    p["lbfgs_boundary"]  = int(opt.get("lbfgs_boundary", 0))
+    p["lbfgs_weighting"] = str(opt.get("lbfgs_weighting", "equal"))
+
+    # LBFGS (nested table) e.g. [optimization.lbfgs]
+    opt_lbfgs = opt.get("lbfgs", {})
+    p["lbfgs_l2"] = float(opt.get("lbfgs_l2", opt_lbfgs.get("l2", 1e-8)))
+    p["lbfgs_include_zero_mean"] = bool(opt.get("lbfgs_include_zero_mean",
+                                                opt_lbfgs.get("include_zero_mean", True)))
+    p["lbfgs_include_aug_lagrangian"] = bool(opt.get("lbfgs_include_aug_lagrangian",
+                                                     opt_lbfgs.get("include_aug_lagrangian", True)))
+
+    # Augmented Lagrangian
+    p["use_augmented_lagrangian"] = bool(opt.get("use_augmented_lagrangian", False))
+    p["al_rho"] = float(opt.get("al_rho", 1.0))
+    p["al_update_every"] = int(opt.get("al_update_every", 10))
+    p["al_clip"] = float(opt.get("al_clip", 0.0))  # 0.0 => disabled
+
+    # Lookahead / EMA
+    p["use_lookahead"] = bool(opt.get("use_lookahead", False))
+    p["lookahead_sync_period"] = int(opt.get("lookahead_sync_period", 5))
+    p["lookahead_slow_step"] = float(opt.get("lookahead_slow_step", 0.5))
+    p["use_ema"] = bool(opt.get("use_ema", False))
+    p["ema_decay"] = float(opt.get("ema_decay", 0.999))
+    p["ema_eval"]  = bool(opt.get("ema_eval", True))
+
     # plot
-    p["plot_cmap"] = str(cfg.get("plot", {}).get("cmap", "viridis"))
-    figsize = cfg.get("plot", {}).get("figsize", [8.0, 4.5])
+    plot_cfg = cfg.get("plot", {})
+    p["plot_cmap"] = str(plot_cfg.get("cmap", "viridis"))
+    figsize = plot_cfg.get("figsize", [8.0, 4.5])
     if not isinstance(figsize, (list, tuple)) or len(figsize) != 2:
         figsize = [8.0, 4.5]
     p["figsize"] = (float(figsize[0]), float(figsize[1]))
 
     # --- box (fixed sampling domain) ---
-    # Assume major radius ~ 1 and z ∈ [-0.5, 0.5].
-    # We'll compute x,y from geometry (R0 + a0 + |a1|) each run.
     p["box_zmin"] = float(cfg.get("box", {}).get("zmin", -0.5))
     p["box_zmax"] = float(cfg.get("box", {}).get("zmax",  0.5))
-    # How many candidate points to generate deterministically in the box
     p["box_points_total"] = int(cfg.get("box", {}).get("points_total", 200_000))
-    # PRNG seed for the fixed box points
     p["box_seed"] = int(cfg.get("box", {}).get("seed", 42))
 
     # --- surfaces list (raw dict; parsed in main) ---
     p["surfaces_cfg"] = cfg.get("surfaces", {})
-
-    # control how many points are used per surface in LBFGS (to cap memory)
-    # 0 or missing => use "all" available points
-    p["lbfgs_interior"]      = int(opt.get("lbfgs_interior", 0))     # interior points per surface
-    p["lbfgs_boundary"]      = int(opt.get("lbfgs_boundary", 0))     # boundary points per surface
-    p["lbfgs_weighting"]     = str(opt.get("lbfgs_weighting", "equal"))  # "equal" (default)
 
     return p
 

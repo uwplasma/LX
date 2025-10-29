@@ -66,6 +66,8 @@ from _network_and_loss import (
     load_model_if_exists,
     save_model,
     debug_stats,
+    train_step_many,
+    _full_objective_like_training
 )
 from _physics import eval_on_boundary, grad_u_total_batch
 from _state import runtime
@@ -114,6 +116,9 @@ box_seed: int
 # surfaces config (raw dict from TOML; parsed here)
 surfaces_cfg: dict
 
+def _finite_or_big(x, big=1e30):
+    return jnp.nan_to_num(x, nan=big, posinf=big, neginf=big)
+
 def _take_first_n(x: jnp.ndarray, n: int) -> jnp.ndarray:
     """Deterministic truncation: if n<=0 or n>=len(x), returns x."""
     if n <= 0 or n >= int(x.shape[0]):
@@ -134,6 +139,14 @@ def _lambda_bc_schedule(it, T):
     # cosine schedule in [0, π]
     cosfac = 0.5 * (1 + jnp.cos(jnp.pi * jnp.clip(it / T, 0., 1.)))
     return float(end + (warm - end) * cosfac)
+
+def _ema_update(old, new, decay):
+    return jax.tree_util.tree_map(lambda o, n: decay * o + (1.0 - decay) * n, old, new)
+
+def _lookahead_sync(slow, fast, alpha):
+    # slow ← slow + α (fast - slow); then fast ← slow
+    new_slow = jax.tree_util.tree_map(lambda s, f: s + alpha * (f - s), slow, fast)
+    return new_slow
 
 def _apply_params(params: Dict[str, Any]) -> None:
     global CHECKPOINT_PATH, BATCH_IN, BATCH_BDRY, R0, a0, a1, N_harm, kappa
@@ -196,6 +209,12 @@ def _apply_params(params: Dict[str, Any]) -> None:
     LBFGS_BDRY      = int(params.get("lbfgs_boundary", 0))
     LBFGS_WEIGHTING = str(params.get("lbfgs_weighting", "equal"))
 
+    # zero-mean weight & boundary presample multiplier & optimizer knobs
+    global ZERO_MEAN_WEIGHT_CONF, BDRY_PRESAMPLE_MULT, GRAD_CLIP_NORM, WEIGHT_DECAY
+    ZERO_MEAN_WEIGHT_CONF = float(params.get("zero_mean_weight", 0.1))
+    BDRY_PRESAMPLE_MULT   = int(params.get("bdry_presample_mult", 16))
+    GRAD_CLIP_NORM        = float(params.get("grad_clip_norm", 1.0))
+    WEIGHT_DECAY          = float(params.get("weight_decay", 0.0))
 
 # =============================================================================
 # ================================== MAIN =====================================
@@ -215,6 +234,25 @@ def main(config_path: str = "input.toml"):
     runtime.BATCH_IN = BATCH_IN
     runtime.BATCH_BDRY = BATCH_BDRY
     runtime.lam_bc = lam_bc
+    runtime.zero_mean_weight = ZERO_MEAN_WEIGHT_CONF
+    runtime.bdry_presample_mult = int(params.get("bdry_presample_mult", 16))
+
+
+    # Augmented Lagrangian config
+    runtime.al_enabled = bool(params.get("use_augmented_lagrangian", False))
+    runtime.al_lambda = 0.0  # reset each run (or load from ckpt if you want stateful)
+    runtime.al_rho = float(params.get("al_rho", 1.0))
+    runtime.al_update_every = int(params.get("al_update_every", 10))
+    runtime.al_clip = float(params.get("al_clip", 0.0))
+
+    # ---- LBFGS flags into runtime so helpers can read them safely ----
+    runtime.lbfgs_include_zero_mean = bool(
+        params.get("lbfgs_include_zero_mean", params.get("lbfgs", {}).get("include_zero_mean", True))
+    )
+    runtime.lbfgs_include_aug_lagrangian = bool(
+        params.get("lbfgs_include_aug_lagrangian", params.get("lbfgs", {}).get("include_aug_lagrangian", True))
+    )
+    runtime.lbfgs_l2 = float(params.get("lbfgs_l2", params.get("lbfgs", {}).get("l2", 1e-8)))
 
     act_name = getattr(MLP_ACT, "__name__", str(MLP_ACT))
     print("=== PINN Laplace (single or multi-surface) ===")
@@ -239,6 +277,17 @@ def main(config_path: str = "input.toml"):
     print(f"[BOX] Generating {box_points_total} deterministic points (seed={box_seed})")
     P_box = fixed_box_points(box_seed, box_points_total, runtime.box_bounds)   # [M,3]
 
+    if runtime.al_enabled:
+        print(f"[AL] enabled: rho={runtime.al_rho}, update_every={runtime.al_update_every}, clip={runtime.al_clip or 'none'}")
+
+    use_ema   = bool(params.get("use_ema", False))
+    ema_decay = float(params.get("ema_decay", 0.999))
+    ema_eval  = bool(params.get("ema_eval", True))
+    if bool(params.get("use_lookahead", False)):
+        print(f"[OPT] Lookahead: k={int(params.get('lookahead_sync_period',5))}, alpha={float(params.get('lookahead_slow_step',0.5))}")
+    if use_ema:
+        print(f"[OPT] EMA: decay={ema_decay}, eval_with_ema={ema_eval}")
+
     # ---------------------- Build model + optimizer ----------------------------
     use_siren     = bool(params.get("siren", False))
     siren_omega0  = float(params.get("siren_omega0", 30.0))
@@ -246,17 +295,58 @@ def main(config_path: str = "input.toml"):
     if use_siren and (MLP_ACT.__name__ == "sin" or MLP_ACT is jnp.sin):
         from _network_and_loss import SirenMLP
         model = SirenMLP(k_model, in_size=3, out_size=1,
-                        widths=MLP_HIDDEN_SIZES, omega0=siren_omega0)
+                         widths=MLP_HIDDEN_SIZES, omega0=siren_omega0,
+                         use_fourier=bool(params.get("use_fourier", False)),
+                         fourier_bands=tuple(params.get("fourier_bands", ())),
+                         fourier_scale=float(params.get("fourier_scale", 2*jnp.pi)),
+                         R0_for_fourier=float(params.get("R0_for_fourier", R0)))
     else:
-        model = PotentialMLP(k_model, hidden_sizes=MLP_HIDDEN_SIZES, act=MLP_ACT)
+        model = PotentialMLP(k_model, hidden_sizes=MLP_HIDDEN_SIZES, act=MLP_ACT,
+                             use_fourier=bool(params.get("use_fourier", False)),
+                             fourier_bands=tuple(params.get("fourier_bands", ())),
+                             fourier_scale=float(params.get("fourier_scale", 2*jnp.pi)),
+                             R0_for_fourier=float(params.get("R0_for_fourier", R0)))
 
     model = load_model_if_exists(model, CHECKPOINT_PATH)
 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(optax.cosine_decay_schedule(init_value=lr, decay_steps=steps), weight_decay=0.0),
+    # --- LR schedule with optional warmup + cosine decay floor ---
+    warmup = int(params.get("lr_warmup_steps", 0))
+    min_ratio = float(params.get("lr_min_ratio", 0.0))  # e.g., 0.05
+    sched_main = optax.cosine_decay_schedule(
+        init_value=lr, decay_steps=steps, alpha=min_ratio
     )
+    if warmup > 0:
+        sched = optax.join_schedules(
+            schedules=[optax.linear_schedule(init_value=lr*0.1, end_value=lr, transition_steps=warmup),
+                       sched_main],
+            boundaries=[warmup]
+        )
+    else:
+        sched = sched_main
+
+    clip_norm = float(params.get("grad_clip_norm", 1.0))
+    wd = float(params.get("weight_decay", 0.0))
+
+    base_opt = optax.chain(
+        optax.clip_by_global_norm(clip_norm),
+        optax.adamw(learning_rate=sched, weight_decay=wd),
+    )
+
+    optimizer = base_opt
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    lookahead_enabled   = bool(params.get("use_lookahead", False))
+    lookahead_k         = int(params.get("lookahead_sync_period", 5))
+    lookahead_alpha     = float(params.get("lookahead_slow_step", 0.5))
+
+    # slow weights (trainable leaves only)
+    params_f_init, _ = eqx.partition(model, eqx.is_inexact_array)
+    slow_f = jax.tree_util.tree_map(lambda x: x.copy(), params_f_init) if lookahead_enabled else None
+    la_step = 0  # global counter
+
+    # Filter inexact (trainable) leaves
+    params_f, params_s = eqx.partition(model, eqx.is_inexact_array)
+    ema_f = jax.tree_util.tree_map(lambda x: x.copy(), params_f) if use_ema else None
 
     # ---------------------- Mode selection ------------------------------------
     mode = str(surfaces_cfg.get("mode", "single")).lower().strip()
@@ -302,31 +392,60 @@ def main(config_path: str = "input.toml"):
             cur_lam = _lambda_bc_schedule(it, steps)
             runtime.lam_bc = float(cur_lam)   # update runtime so loss sees it
             key_train, subkey = random.split(key_train)
-            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm, grads = train_step(
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step(
                 model, opt_state, optimizer, P_in, P_bdry, N_bdry, subkey
             )
+            if use_ema:
+                mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                ema_f = _ema_update(ema_f, mf, ema_decay)
+            if lookahead_enabled:
+                la_step += 1
+                if (la_step % lookahead_k) == 0:
+                    mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                    slow_f = _lookahead_sync(slow_f, mf, lookahead_alpha)
+                    # overwrite model fast weights with synced slow weights
+                    model = eqx.combine(slow_f, ms)
+            # --- Augmented Lagrangian update (outer loop) ---
+            if runtime.al_enabled and ((it % runtime.al_update_every) == 0):
+                # Gradient-ascent on λ: λ ← λ + ρ * c
+                runtime.al_lambda = float(runtime.al_lambda + runtime.al_rho * float(c_bc_mean))
+                # optional clipping
+                if runtime.al_clip and (runtime.al_clip > 0.0):
+                    runtime.al_lambda = float(jnp.clip(runtime.al_lambda, -runtime.al_clip, runtime.al_clip))
             if (it % log_every) == 0 or it == 1:
                 stats = debug_stats(model, grads, lap_res, nres)
                 # compute |∇u| on THIS boundary
-                gmag = jnp.linalg.norm(grad_u_total_batch(model, P_bdry), axis=-1)
+                if use_ema and ema_eval:
+                    # evaluate with EMA params
+                    mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                    model_eval = eqx.combine(ema_f, ms)
+                else:
+                    model_eval = model
+                gmag = jnp.linalg.norm(grad_u_total_batch(model_eval, P_bdry), axis=-1)
                 mean_g = float(jnp.mean(gmag))
                 print(
                     f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
-                    f"|lap|_rms={stats['lap_rms']:.3e} (max {stats['lap_max']:.2e})  "
-                    f"|n·∇u|_rms={stats['nbc_rms']:.3e} (max {stats['nbc_max']:.2e})  "
+                    f"|lap|_rms={stats['lap_rms']:.3e}  "
+                    f"|n·∇u|_rms={stats['nbc_rms']:.3e}  "
                     f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
-                    f"λ_bc={runtime.lam_bc:.2f}  surf=single"
+                    f"λ_bc={runtime.lam_bc:.2f}  "
+                    f"{'AL ' if runtime.al_enabled else ''}c={float(c_bc_mean):+.3e} λ_AL={runtime.al_lambda:+.3e}  "
                 )
+
+        model_to_save = model
+        if use_ema and ema_eval:
+            mf, ms = eqx.partition(model, eqx.is_inexact_array)
+            model_to_save = eqx.combine(ema_f, ms)
 
         # Optional LBFGS polish on this single surface
         if LBFGS_STEPS > 0:
-            model = _lbfgs_polish(
-                model, P_in, P_bdry, N_bdry,
+            model_to_save = _lbfgs_polish(
+                model_to_save, P_in, P_bdry, N_bdry,
                 steps=LBFGS_STEPS, tol=LBFGS_TOL,
                 print_every=LBFGS_PRINT_EVERY, label="single"
             )
 
-        save_model(model, CHECKPOINT_PATH)
+        save_model(model_to_save, CHECKPOINT_PATH)
 
         # Final diagnostics
         (Lf, (Linf, Lbcf, lapf, nf)) = eval_full(model, P_in, P_bdry, N_bdry)
@@ -342,7 +461,9 @@ def main(config_path: str = "input.toml"):
         print(f"[CHECK] interior Δu     rms={lap_rms:.3e}  max={lap_max:.3e}")
 
         # Compute final boundary grad & plot side-by-side
-        Gvec_final, Gmag_final, _ = eval_on_boundary(model, P_bdry, N_bdry, Xg, Yg, Zg)
+        mf, ms = eqx.partition(model, eqx.is_inexact_array)
+        model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
+        Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, P_bdry, N_bdry, Xg, Yg, Zg)
 
         vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
         vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
@@ -397,7 +518,6 @@ def main(config_path: str = "input.toml"):
         if len(torus_list) == 0:
             raise RuntimeError("No torus surfaces listed under [[surfaces.torus_list]] for mode='torus'.")
 
-        # Build dataset of surfaces (each provides boundary points/normals + inside mask)
         dataset = build_torus_family(torus_list, N_bdry_theta, N_bdry_phi)
         print(f"[DATA] Loaded {len(dataset)} torus surfaces for pretraining.")
 
@@ -417,38 +537,65 @@ def main(config_path: str = "input.toml"):
         # Precompute initial boundary grad for surf0
         Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
 
-        # Train: at each step pick a random surface and train on it
+        # Build fixed interior pools ONCE (deterministic) for all surfaces
+        packs_all = []
+        for surf in dataset:
+            mask = surf.inside_mask_fn(P_box)
+            ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
+            P_in_all = P_box[ids][:N_in]
+            packs_all.append((P_in_all, surf.P_bdry, surf.N_bdry))
+        packs_all = tuple(packs_all)  # static for JIT
+
+        # ---- Train: aggregate ALL surfaces every step ----
         key_train = random.PRNGKey(1234)
         log_every = LOG_EVERY
         for it in range(1, steps + 1):
             cur_lam = _lambda_bc_schedule(it, steps)
             runtime.lam_bc = float(cur_lam)
-            key_train, ks = random.split(key_train)
-            # sample surface index
-            idx = int(random.randint(ks, shape=(), minval=0, maxval=len(dataset)))
-            surf = dataset[idx]
-            # masked interior from common fixed set
-            mask = surf.inside_mask_fn(P_box)
-            ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
-            P_in = P_box[ids][:N_in]
+            key_train, subkey = random.split(key_train)
 
-            # mini-epoch K consecutive steps on the same surface
-            for _ in range(MINI_EPOCH):
-                cur_lam = _lambda_bc_schedule(it, steps)
-                runtime.lam_bc = float(cur_lam)
-                key_train, sub = random.split(key_train)
-                model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u), gnorm, grads = train_step(
-                    model, opt_state, optimizer, P_in, surf.P_bdry, surf.N_bdry, sub
-                )
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step_many(
+                model, opt_state, optimizer, packs_all, subkey
+            )
+
+            if use_ema:
+                mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                ema_f = _ema_update(ema_f, mf, ema_decay)
+            if lookahead_enabled:
+                la_step += 1
+                if (la_step % lookahead_k) == 0:
+                    mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                    slow_f = _lookahead_sync(slow_f, mf, lookahead_alpha)
+                    model = eqx.combine(slow_f, ms)
+
+            # --- Augmented Lagrangian update (outer loop) ---
+            if runtime.al_enabled and ((it % runtime.al_update_every) == 0):
+                runtime.al_lambda = float(runtime.al_lambda + runtime.al_rho * float(c_bc_mean))
+                if runtime.al_clip and (runtime.al_clip > 0.0):
+                    runtime.al_lambda = float(jnp.clip(runtime.al_lambda, -runtime.al_clip, runtime.al_clip))
+
             if (it % log_every) == 0 or it == 1:
                 stats = debug_stats(model, grads, lap_res, nres)
-                gmag = jnp.linalg.norm(grad_u_total_batch(model, surf.P_bdry), axis=-1)
-                mean_g = float(jnp.mean(gmag))
+                # evaluate |∇u| on an anchor surface (surf0) for a stable diagnostic
+                if use_ema and ema_eval:
+                    mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                    model_eval = eqx.combine(ema_f, ms)
+                else:
+                    model_eval = model
+                gmag0 = jnp.linalg.norm(grad_u_total_batch(model_eval, dataset[0].P_bdry), axis=-1)
+                mean_g0 = float(jnp.mean(gmag0))
                 print(f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
-                    f"|lap|_rms={stats['lap_rms']:.3e} (max {stats['lap_max']:.2e})  "
-                    f"|n·∇u|_rms={stats['nbc_rms']:.3e} (max {stats['nbc_max']:.2e})  "
-                    f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
-                    f"λ_bc={runtime.lam_bc:.2f}  surf={dataset[idx].name}")
+                    f"|lap|_rms={stats['lap_rms']:.3e}  "
+                    f"|n·∇u|_rms={stats['nbc_rms']:.3e}  "
+                    f"||g||={stats['grad_L2']:.3e}  mean|∇u|(surf0)={mean_g0:.3e}  mean(u)={float(mean_u):.3e}  "
+                    f"λ_bc={runtime.lam_bc:.2f}  "
+                    f"{'AL ' if runtime.al_enabled else ''}c={float(c_bc_mean):+.3e} λ_AL={runtime.al_lambda:+.3e}  "
+                    f"surf=ALL")
+
+        model_to_save = model
+        if use_ema and ema_eval:
+            mf, ms = eqx.partition(model, eqx.is_inexact_array)
+            model_to_save = eqx.combine(ema_f, ms)
 
         # Optional LBFGS polish across **all** surfaces
         if LBFGS_STEPS > 0:
@@ -468,13 +615,18 @@ def main(config_path: str = "input.toml"):
 
                 packs.append((P_in_use, P_b_use, N_b_use, surf.name))
 
-            model = _lbfgs_polish_many(
-                model, packs,
+            model_to_save = model
+            if use_ema and ema_eval:
+                mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                model_to_save = eqx.combine(ema_f, ms)
+
+            model_to_save = _lbfgs_polish_many(
+                model_to_save, packs,
                 steps=LBFGS_STEPS, tol=LBFGS_TOL,
                 print_every=LBFGS_PRINT_EVERY, label="torus:ALL"
             )
 
-        save_model(model, CHECKPOINT_PATH)
+        save_model(model_to_save, CHECKPOINT_PATH)
 
         # Final diagnostics on a couple of surfaces
         for j in range(min(2, len(dataset))):
@@ -488,7 +640,9 @@ def main(config_path: str = "input.toml"):
                   f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
 
         # Plot surf0 initial vs final
-        Gvec_final, Gmag_final, _ = eval_on_boundary(model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+        mf, ms = eqx.partition(model, eqx.is_inexact_array)
+        model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
+        Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
         vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
         vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
         fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
@@ -539,28 +693,36 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
     # Partition: optimize only floating leaves
     params_f, params_s = eqx.partition(model, eqx.is_inexact_array)
 
-    # Scalar objective over filtered params
-    def obj(params_f_opt):
-        m = eqx.combine(params_f_opt, params_s)
-        total, _ = eval_full(m, P_in, P_bdry, N_bdry)
-        return jnp.asarray(total, dtype=jnp.float64)
-
     # Initial diagnostics
     tot0, (Lin0, Lbc0, lap0, n0) = eval_full(model, P_in, P_bdry, N_bdry)
     print(f"[LBFGS:{label} INIT] f={float(tot0):.6e}  lin={float(Lin0):.3e}  lbc={float(Lbc0):.3e}  "
           f"|lap|_rms={float(jnp.sqrt(jnp.mean(lap0**2))):.3e}  "
           f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(n0**2))):.3e}")
 
-    # Build solver
+    # Tiny L2 to prevent runaway in SIREN/Fourier regimes
+    include_zm = bool(getattr(runtime, "lbfgs_include_zero_mean", True))
+    include_al = bool(getattr(runtime, "lbfgs_include_aug_lagrangian", True))
+    l2_weight  = float(getattr(runtime, "lbfgs_l2", 1e-8))
+
+    def obj(params_f_opt):
+        m = eqx.combine(params_f_opt, params_s)
+        if include_zm or include_al:
+            total = _full_objective_like_training(m, P_in, P_bdry, N_bdry)
+        else:
+            total, _ = eval_full(m, P_in, P_bdry, N_bdry)
+        l2 = sum([jnp.sum(w*w) for w in jax.tree_util.tree_leaves(params_f_opt)])
+        val = total + l2_weight * l2
+        return jnp.asarray(_finite_or_big(val), dtype=jnp.float64)
+
     solver = LBFGS(
-        fun=obj,                 # obj(params) -> scalar
-        value_and_grad=False,    # let jaxopt wrap value_and_grad internally
-        has_aux=False,           # <— important: your obj returns a scalar only
+        fun=obj,
+        value_and_grad=False,
+        has_aux=False,
         tol=tol,
-        stepsize=1.0,
-        linesearch="hager-zhang",  # or "zoom"
-        maxls=20,
-        history_size=10,
+        stepsize=1e-3,             # << smaller initial step
+        linesearch="zoom",         # more conservative than Hager–Zhang in practice here
+        maxls=50,                  # allow more backtracking
+        history_size=20,
         verbose=False,
     )
 
@@ -618,17 +780,6 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
     packs_tup = tuple((jnp.asarray(Pi), jnp.asarray(Pb), jnp.asarray(Nb), str(name))
                       for (Pi, Pb, Nb, name) in packs)
 
-    def obj(params_f_opt):
-        m = eqx.combine(params_f_opt, params_s)
-        total = 0.0
-        # Python loop is fine: length is static during tracing
-        for (Pi, Pb, Nb, _nm) in packs_tup:
-            t, _ = eval_full(m, Pi, Pb, Nb)   # uses runtime.lam_bc
-            total = total + t
-        # Equal weighting (divide by number of surfaces)
-        total = total / float(len(packs_tup))
-        return jnp.asarray(total, dtype=jnp.float64)
-
     # Initial diagnostics (aggregate)
     def _agg_stats(mod):
         vals = []
@@ -650,16 +801,33 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
     print(f"[LBFGS-many:{label} INIT] f={s0['f']:.6e} lin={s0['lin']:.3e} lbc={s0['lbc']:.3e} "
           f"|lap|_rms={s0['lap_rms']:.3e} |n·∇u|_rms={s0['nbc_rms']:.3e}")
 
-    # Build jaxopt solver (numeric stepsize! line-search controls updates)
+    include_zm = bool(getattr(runtime, "lbfgs_include_zero_mean", True))
+    include_al = bool(getattr(runtime, "lbfgs_include_aug_lagrangian", True))
+    l2_weight  = float(getattr(runtime, "lbfgs_l2", 1e-8))
+
+    def obj(params_f_opt):
+        m = eqx.combine(params_f_opt, params_s)
+        total = 0.0
+        for (Pi, Pb, Nb, _nm) in packs_tup:
+            if include_zm or include_al:
+                total = total + _full_objective_like_training(m, Pi, Pb, Nb)
+            else:
+                t, _ = eval_full(m, Pi, Pb, Nb)
+                total = total + t
+        total = total / float(len(packs_tup))
+        l2 = sum([jnp.sum(w*w) for w in jax.tree_util.tree_leaves(params_f_opt)])
+        val = total + l2_weight * l2
+        return jnp.asarray(_finite_or_big(val), dtype=jnp.float64)
+
     solver = LBFGS(
         fun=obj,
         value_and_grad=False,
         has_aux=False,
         tol=tol,
-        stepsize=1.0,             # initial guess; actual step picked by line-search
-        linesearch="hager-zhang",  # or "zoom"
-        maxls=20,
-        history_size=10,
+        stepsize=1e-3,             # << smaller initial step
+        linesearch="zoom",         # conservative; backtracks more reliably
+        maxls=50,
+        history_size=20,
         verbose=False,
     )
 
