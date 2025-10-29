@@ -253,6 +253,12 @@ def load_model_if_exists(template: eqx.Module, path: Path | str = "pinn_torus_mo
     if path.exists():
         try:
             loaded = eqx.tree_deserialise_leaves(str(path), template)
+            # Verify that each leaf has the same shape as the template
+            templ_shapes = [x.shape for x in jax.tree_util.tree_leaves(template)]
+            load_shapes  = [x.shape for x in jax.tree_util.tree_leaves(loaded)]
+            if templ_shapes != load_shapes:
+                print(f"[CKPT] Shape mismatch; ignoring checkpoint {path}.")
+                return template
             print(f"[CKPT] Loaded model from: {path}")
             return loaded
         except Exception as e:
