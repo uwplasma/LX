@@ -1,4 +1,4 @@
-[surfaces]                # use either "torus" or "single" mode for now
+[surfaces]                # use either "torus" or "single" mode
 mode = "torus"
 
 # Torus family to pretrain on:
@@ -58,14 +58,14 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 600
+steps = 500
 lr = 0.003
 lam_bc = 5.0
 log_every = 50
 mini_epoch = 5
 lam_warm = 50.0      # initial (warm-start) λ for boundary loss
 # --- LBFGS (polish) ---
-lbfgs_steps = 300        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 200        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 20
 # --- LBFGS (polish on all surfaces) ---
@@ -88,9 +88,9 @@ lookahead_sync_period = 5        # k steps between slow-weight syncs
 lookahead_slow_step = 0.5        # α (0..1), typical 0.5
 
 [optimization.lbfgs]
-l2 = 1e-8                    # was lbfgs_l2
-include_zero_mean = true
-include_aug_lagrangian = true
+l2 = 1e-7                   # was lbfgs_l2
+include_zero_mean = false
+include_aug_lagrangian = false
 
 use_ema = true
 ema_decay = 0.999                 # Polyak EMA decay

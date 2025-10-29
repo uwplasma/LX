@@ -43,6 +43,7 @@ def get_activation(name: str):
         "identity": (lambda x: x),
         "none": (lambda x: x),
         "sin": jnp.sin,
+        "sine": jnp.sin,
         "cos": jnp.cos,
     }
     return mapping.get(name, jax.nn.tanh)

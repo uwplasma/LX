@@ -237,7 +237,6 @@ def main(config_path: str = "input.toml"):
     runtime.zero_mean_weight = ZERO_MEAN_WEIGHT_CONF
     runtime.bdry_presample_mult = int(params.get("bdry_presample_mult", 16))
 
-
     # Augmented Lagrangian config
     runtime.al_enabled = bool(params.get("use_augmented_lagrangian", False))
     runtime.al_lambda = 0.0  # reset each run (or load from ckpt if you want stateful)
@@ -246,13 +245,10 @@ def main(config_path: str = "input.toml"):
     runtime.al_clip = float(params.get("al_clip", 0.0))
 
     # ---- LBFGS flags into runtime so helpers can read them safely ----
-    runtime.lbfgs_include_zero_mean = bool(
-        params.get("lbfgs_include_zero_mean", params.get("lbfgs", {}).get("include_zero_mean", True))
-    )
-    runtime.lbfgs_include_aug_lagrangian = bool(
-        params.get("lbfgs_include_aug_lagrangian", params.get("lbfgs", {}).get("include_aug_lagrangian", True))
-    )
-    runtime.lbfgs_l2 = float(params.get("lbfgs_l2", params.get("lbfgs", {}).get("l2", 1e-8)))
+    # Read the flattened keys produced by parse_config()
+    runtime.lbfgs_include_zero_mean = bool(params.get("lbfgs_include_zero_mean", True))
+    runtime.lbfgs_include_aug_lagrangian = bool(params.get("lbfgs_include_aug_lagrangian", True))
+    runtime.lbfgs_l2 = float(params.get("lbfgs_l2", 1e-8))
 
     act_name = getattr(MLP_ACT, "__name__", str(MLP_ACT))
     print("=== PINN Laplace (single or multi-surface) ===")
@@ -263,6 +259,18 @@ def main(config_path: str = "input.toml"):
     # RNG (for model init and misc)
     key = random.PRNGKey(rng_seed)
     key, k_model = random.split(key)
+
+    # --- training history (Adam/optax) ---
+    adam_loss_hist = []
+    adam_lin_hist  = []
+    adam_lbc_hist  = []
+    adam_lap_rms_hist = []
+    adam_nbc_rms_hist = []
+    lbfgs_hist = []
+    adam_eval_full_hist = []
+    adam_train_like_hist = []
+    lbfgs_eval_full_hist = []
+    lbfgs_train_like_hist = []
 
     # ---------------------- Build fixed box + candidate points -----------------
     # x,y box computed from geometry envelope; z from TOML
@@ -395,6 +403,14 @@ def main(config_path: str = "input.toml"):
             model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step(
                 model, opt_state, optimizer, P_in, P_bdry, N_bdry, subkey
             )
+            # record per-iter history (Adam)
+            adam_loss_hist.append(float(L))
+            adam_lin_hist.append(float(Lin))
+            adam_lbc_hist.append(float(Lbc))
+            adam_lap_rms_hist.append(float(jnp.sqrt(jnp.mean(lap_res**2))))
+            adam_nbc_rms_hist.append(float(jnp.sqrt(jnp.mean(nres**2))))
+            adam_eval_full_hist.append(float(Lin + runtime.lam_bc * Lbc))
+            adam_train_like_hist.append(float(_full_objective_like_training(model, P_in, P_bdry, N_bdry)))
             if use_ema:
                 mf, ms = eqx.partition(model, eqx.is_inexact_array)
                 ema_f = _ema_update(ema_f, mf, ema_decay)
@@ -438,12 +454,15 @@ def main(config_path: str = "input.toml"):
             model_to_save = eqx.combine(ema_f, ms)
 
         # Optional LBFGS polish on this single surface
+        runtime._lbfgs_eval_full_hist_sink = lbfgs_eval_full_hist
         if LBFGS_STEPS > 0:
             model_to_save = _lbfgs_polish(
                 model_to_save, P_in, P_bdry, N_bdry,
                 steps=LBFGS_STEPS, tol=LBFGS_TOL,
-                print_every=LBFGS_PRINT_EVERY, label="single"
+                print_every=LBFGS_PRINT_EVERY, label="single",
+                history=lbfgs_hist,
             )
+        runtime._lbfgs_eval_full_hist_sink = None
 
         save_model(model_to_save, CHECKPOINT_PATH)
 
@@ -459,6 +478,39 @@ def main(config_path: str = "input.toml"):
         lap_max  = float(jnp.max(jnp.abs(lapf)))
         print(f"[CHECK] boundary n·∇u  rms={nbc_rms:.3e}  max={nbc_max:.3e}")
         print(f"[CHECK] interior Δu     rms={lap_rms:.3e}  max={lap_max:.3e}")
+
+        # ===================== Loss evolution figure (Adam + LBFGS) =====================
+        try:
+            figL = plt.figure(figsize=(10, 4), constrained_layout=True)
+            axL  = figL.add_subplot(1,1,1)
+
+            x_adam = jnp.arange(1, len(adam_loss_hist)+1)
+
+            # 1) Show BOTH Adam metrics
+            axL.semilogy(x_adam, adam_train_like_hist, label="Adam (train-like)", linewidth=2)
+            axL.semilogy(x_adam, adam_eval_full_hist,  label="Adam (eval_full = Lin + λ·Lbc)", alpha=0.8)
+
+            # 2) Append LBFGS immediately after Adam on the same x-axis
+            x0 = len(adam_loss_hist)
+            if len(lbfgs_train_like_hist) == 0 and len(lbfgs_hist) > 0:
+                # keep backward-compat: lbfgs_hist is train-like history
+                lbfgs_train_like_hist = lbfgs_hist
+
+            if len(lbfgs_train_like_hist) > 0:
+                x_lb1 = jnp.arange(x0+1, x0+len(lbfgs_train_like_hist)+1)
+                axL.semilogy(x_lb1, lbfgs_train_like_hist, label="LBFGS (train-like)", linewidth=2)
+
+            if len(lbfgs_eval_full_hist) > 0:
+                x_lb2 = jnp.arange(x0+1, x0+len(lbfgs_eval_full_hist)+1)
+                axL.semilogy(x_lb2, lbfgs_eval_full_hist, label="LBFGS (eval_full)", linewidth=2, linestyle="--")
+
+            axL.set_xlabel("Iteration")
+            axL.set_ylabel("Loss (semilogy)")
+            axL.set_title("Objective evolution (Adam → LBFGS)")
+            axL.legend()
+            plt.show()
+        except Exception as _e:
+            print(f"[WARN] Could not plot loss curve: {_e}")
 
         # Compute final boundary grad & plot side-by-side
         mf, ms = eqx.partition(model, eqx.is_inexact_array)
@@ -557,7 +609,14 @@ def main(config_path: str = "input.toml"):
             model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step_many(
                 model, opt_state, optimizer, packs_all, subkey
             )
-
+            # record per-iter history (Adam) – aggregated stats
+            adam_loss_hist.append(float(L))
+            adam_lin_hist.append(float(Lin))
+            adam_lbc_hist.append(float(Lbc))
+            adam_lap_rms_hist.append(float(jnp.sqrt(jnp.mean(lap_res**2))))
+            adam_nbc_rms_hist.append(float(jnp.sqrt(jnp.mean(nres**2))))
+            adam_eval_full_hist.append(float(Lin + runtime.lam_bc * Lbc))
+            adam_train_like_hist.append(float(_full_objective_like_training(model, P_in0, surf0.P_bdry, surf0.N_bdry)))
             if use_ema:
                 mf, ms = eqx.partition(model, eqx.is_inexact_array)
                 ema_f = _ema_update(ema_f, mf, ema_decay)
@@ -598,6 +657,7 @@ def main(config_path: str = "input.toml"):
             model_to_save = eqx.combine(ema_f, ms)
 
         # Optional LBFGS polish across **all** surfaces
+        runtime._lbfgs_eval_full_hist_sink = lbfgs_eval_full_hist
         if LBFGS_STEPS > 0:
             packs = []
             for surf in dataset:
@@ -623,8 +683,10 @@ def main(config_path: str = "input.toml"):
             model_to_save = _lbfgs_polish_many(
                 model_to_save, packs,
                 steps=LBFGS_STEPS, tol=LBFGS_TOL,
-                print_every=LBFGS_PRINT_EVERY, label="torus:ALL"
+                print_every=LBFGS_PRINT_EVERY, label="torus:ALL",
+                history=lbfgs_hist,
             )
+        runtime._lbfgs_eval_full_hist_sink = None
 
         save_model(model_to_save, CHECKPOINT_PATH)
 
@@ -638,6 +700,39 @@ def main(config_path: str = "input.toml"):
             print(f"[FINAL:{surf.name}] loss={float(Lf):.6e}  lap={float(Linf):.6e}  bc={float(Lbcf):.6e}  "
                   f"|lap|_rms={float(jnp.sqrt(jnp.mean(lapf**2))):.3e}  "
                   f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
+
+        # ===================== Loss evolution figure (Adam + LBFGS) =====================
+        try:
+            figL = plt.figure(figsize=(10, 4), constrained_layout=True)
+            axL  = figL.add_subplot(1,1,1)
+
+            x_adam = jnp.arange(1, len(adam_loss_hist)+1)
+
+            # 1) Show BOTH Adam metrics
+            axL.semilogy(x_adam, adam_train_like_hist, label="Adam (train-like)", linewidth=2)
+            axL.semilogy(x_adam, adam_eval_full_hist,  label="Adam (eval_full = Lin + λ·Lbc)", alpha=0.8)
+
+            # 2) Append LBFGS immediately after Adam on the same x-axis
+            x0 = len(adam_loss_hist)
+            if len(lbfgs_train_like_hist) == 0 and len(lbfgs_hist) > 0:
+                # keep backward-compat: lbfgs_hist is train-like history
+                lbfgs_train_like_hist = lbfgs_hist
+
+            if len(lbfgs_train_like_hist) > 0:
+                x_lb1 = jnp.arange(x0+1, x0+len(lbfgs_train_like_hist)+1)
+                axL.semilogy(x_lb1, lbfgs_train_like_hist, label="LBFGS (train-like)", linewidth=2)
+
+            if len(lbfgs_eval_full_hist) > 0:
+                x_lb2 = jnp.arange(x0+1, x0+len(lbfgs_eval_full_hist)+1)
+                axL.semilogy(x_lb2, lbfgs_eval_full_hist, label="LBFGS (eval_full)", linewidth=2, linestyle="--")
+
+            axL.set_xlabel("Iteration")
+            axL.set_ylabel("Loss (semilogy)")
+            axL.set_title("Objective evolution (Adam → LBFGS)")
+            axL.legend()
+            plt.show()
+        except Exception as _e:
+            print(f"[WARN] Could not plot loss curve: {_e}")
 
         # Plot surf0 initial vs final
         mf, ms = eqx.partition(model, eqx.is_inexact_array)
@@ -678,7 +773,8 @@ def main(config_path: str = "input.toml"):
     return model
 
 def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
-                  steps: int, tol: float, print_every: int, label: str):
+                  steps: int, tol: float, print_every: int, label: str,
+                  history: list[float] | None = None):
     """
     Run jaxopt.LBFGS on the full-batch objective with a Python loop so we can
     print diagnostics every few iterations. Optimizes only inexact arrays.
@@ -719,10 +815,10 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
         value_and_grad=False,
         has_aux=False,
         tol=tol,
-        stepsize=1e-3,             # << smaller initial step
+        stepsize=5e-4,             # << smaller initial step
         linesearch="zoom",         # more conservative than Hager–Zhang in practice here
-        maxls=50,                  # allow more backtracking
-        history_size=20,
+        maxls=80,                  # allow more backtracking
+        history_size=30,
         verbose=False,
     )
 
@@ -733,7 +829,15 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
     params_curr = params_f
     for it in range(1, int(steps) + 1):
         params_curr, state = solver.update(params_curr, state)
-
+        # Record training-like objective value every iteration (no L2)
+        m_for_hist = eqx.combine(params_curr, params_s)
+        total_train_like = _full_objective_like_training(m_for_hist, P_in, P_bdry, N_bdry)
+        if history is not None:
+            history.append(float(total_train_like))
+        # record eval_full:
+        if hasattr(runtime, "_lbfgs_eval_full_hist_sink") and runtime._lbfgs_eval_full_hist_sink is not None:
+            total_eval, _ = eval_full(m_for_hist, P_in, P_bdry, N_bdry)
+            runtime._lbfgs_eval_full_hist_sink.append(float(total_eval))
         if (it % print_every) == 0 or it == 1 or it == steps:
             m = eqx.combine(params_curr, params_s)
             total, (Lin, Lbc, lap, n_dot) = eval_full(m, P_in, P_bdry, N_bdry)
@@ -759,7 +863,8 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
           f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
     return model_opt
 
-def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int, label: str):
+def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int, label: str,
+                       history: list[float] | None = None):
     """
     LBFGS polish over multiple surfaces simultaneously.
 
@@ -824,10 +929,10 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
         value_and_grad=False,
         has_aux=False,
         tol=tol,
-        stepsize=1e-3,             # << smaller initial step
-        linesearch="zoom",         # conservative; backtracks more reliably
-        maxls=50,
-        history_size=20,
+        stepsize=5e-4,             # << smaller initial step
+        linesearch="zoom",         # more conservative than Hager–Zhang in practice here
+        maxls=80,                  # allow more backtracking
+        history_size=30,
         verbose=False,
     )
 
@@ -836,6 +941,17 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
 
     for it in range(1, int(steps) + 1):
         params_curr, state = solver.update(params_curr, state)
+        m_for_hist = eqx.combine(params_curr, params_s)
+        # sum training-like objective over surfaces, mean for scale stability
+        tot_train_like = 0.0
+        for (Pi, Pb, Nb, _nm) in packs_tup:
+            tot_train_like = tot_train_like + _full_objective_like_training(m_for_hist, Pi, Pb, Nb)
+        tot_train_like = tot_train_like / float(len(packs_tup))
+        if history is not None:
+            history.append(float(tot_train_like))
+        if hasattr(runtime, "_lbfgs_eval_full_hist_sink") and runtime._lbfgs_eval_full_hist_sink is not None:
+            s_eval = _agg_stats(m_for_hist)   # uses eval_full on all packs
+            runtime._lbfgs_eval_full_hist_sink.append(float(s_eval["f"]))
         if (it % print_every) == 0 or it == 1 or it == steps:
             m = eqx.combine(params_curr, params_s)
             si = _agg_stats(m)

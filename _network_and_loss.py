@@ -5,7 +5,7 @@ import equinox as eqx
 import optax
 from pathlib import Path
 import numpy as np
-from typing import List, Tuple, Optional, Sequence
+from typing import List, Tuple, Optional, Sequence, Callable
 from jax import lax
 
 from _physics import u_total, grad_u_total_batch, lap_u_total_batch, u_total_batch
@@ -105,43 +105,43 @@ def debug_stats(params, grads, lap_res, nres, s_in=None, s_bc=None):
     return stats
 
 class PotentialMLP(eqx.Module):
-    mlp: eqx.nn.MLP
+    layers: List[eqx.nn.Linear]
+    act: Callable
     use_fourier: bool = False
     fourier_bands: Tuple[float, ...] = ()
     fourier_scale: float = 2 * jnp.pi
-    R0_for_fourier: float = 1.0  # optional: set from runtime if you like
+    R0_for_fourier: float = 1.0  # optional length scale for posenc
 
-    def __init__(self,
-                 key,
-                 hidden_sizes: Tuple[int, ...] = (32, 32),
-                 act = jax.nn.tanh,
-                 *,
-                 use_fourier: bool = False,
-                 fourier_bands: Sequence[float] = (),
-                 fourier_scale: float = 2 * jnp.pi,
-                 R0_for_fourier: float = 1.0):
+    def __init__(
+        self,
+        key,
+        hidden_sizes: Tuple[int, ...] = (32, 32),
+        act: Callable = jax.nn.tanh,
+        *,
+        use_fourier: bool = False,
+        fourier_bands: Sequence[float] = (),
+        fourier_scale: float = 2 * jnp.pi,
+        R0_for_fourier: float = 1.0,
+    ):
         self.use_fourier = bool(use_fourier)
         self.fourier_bands = tuple(float(b) for b in fourier_bands)
         self.fourier_scale = float(fourier_scale)
         self.R0_for_fourier = float(R0_for_fourier)
+        self.act = act
 
-        depth = len(hidden_sizes) if hidden_sizes else 1
-        width_val = (hidden_sizes[0] if hidden_sizes else 64)
-
+        # Compute input dimension with optional Fourier embedding
         in_dim = 3
         if self.use_fourier and len(self.fourier_bands) > 0:
             B = len(self.fourier_bands)
             in_dim = 3 + 2 * 3 * B  # xyz + (sin,cos) for each coord per band
 
-        self.mlp = eqx.nn.MLP(
-            in_size=in_dim,
-            out_size=1,
-            width_size=width_val,
-            depth=depth,
-            key=key,
-            activation=act,
-            final_activation=_identity,
-        )
+        # Build linear layers for arbitrary widths
+        sizes = [in_dim] + list(map(int, hidden_sizes)) + [1]
+        keys = jax.random.split(key, len(sizes) - 1)
+        self.layers = [
+            eqx.nn.Linear(in_features=sizes[i], out_features=sizes[i + 1], key=keys[i])
+            for i in range(len(sizes) - 1)
+        ]
 
     def __call__(self, xyz: jnp.ndarray) -> jnp.ndarray:
         # xyz: (..., 3)
@@ -149,7 +149,19 @@ class PotentialMLP(eqx.Module):
             h = _fourier_embed_xyz(xyz, self.fourier_bands, self.fourier_scale, self.R0_for_fourier)
         else:
             h = xyz
-        return self.mlp(h).squeeze(-1)
+
+        # Flatten any leading batch dims to a matrix for Linear layers
+        orig_shape = h.shape[:-1]
+        h = h.reshape(-1, h.shape[-1])
+
+        # Apply all but last with activation, last is linear (no final act)
+        for layer in self.layers[:-1]:
+            h = self.act(layer(h))
+        h = self.layers[-1](h)
+
+        # Restore shape and squeeze last dim to return (...,)
+        h = h.reshape(orig_shape + (1,))
+        return h.squeeze(-1)
 
 def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
     ni, nb = pts_interior.shape[0], pts_bdry.shape[0]
