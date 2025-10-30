@@ -1,0 +1,3 @@
+best_trial=33
+value=0.00013791860941001082
+path=.hpo_runs/trial_0033/input.trial.toml
