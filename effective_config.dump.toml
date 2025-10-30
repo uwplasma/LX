@@ -36,20 +36,20 @@ a1 = 0.15
 N_harm = 4
 
 [multi_valued]
-kappa = 0.03285827466018189
+kappa = 0.2414606099399938
 
 [sampling]
 N_in = 10000
 N_bdry_theta = 32
 N_bdry_phi = 64
-rng_seed = 6524
-bdry_presample_mult = 8
+rng_seed = 1119
+bdry_presample_mult = 32
 
 [regularization]
-zero_mean_weight = 0.5242121547901408
+zero_mean_weight = 0.8393511404911788
 
 [model]
-hidden_sizes = [48, 48, 48]
+hidden_sizes = [64, 64]
 activation = "relu"
 siren = false
 siren_omega0 = 30
@@ -60,21 +60,21 @@ R0_for_fourier = 1
 
 [optimization]
 steps = 1500
-lr = 0.0009119482702742888
-lam_bc = 2.342132732390113
-lam_warm = 12.32932035765171
+lr = 0.002813749948912457
+lam_bc = 4.107003482091686
+lam_warm = 13.22707259392116
 log_every = 50
 mini_epoch = 5
-grad_clip_norm = 2.20709942230945
-weight_decay = 0.0009607451213246961
-lr_warmup_steps = 375
-lr_min_ratio = 0.1681442091024589
+grad_clip_norm = 1.544716173213781
+weight_decay = 0.004243639234821844
+lr_warmup_steps = 0
+lr_min_ratio = 0.1093261690182556
 use_lookahead = true
-lookahead_sync_period = 9
-lookahead_slow_step = 0.797203092834142
-use_ema = false
-ema_decay = 0.999
-ema_eval = false
+lookahead_sync_period = 10
+lookahead_slow_step = 0.3510637389895154
+use_ema = true
+ema_decay = 0.9950723885514567
+ema_eval = true
 use_augmented_lagrangian = false
 al_rho = 1
 al_update_every = 10
@@ -100,7 +100,7 @@ cmap = "viridis"
 figsize = [8, 4.5]
 
 [__derived]
-runtime_lam_bc_current = 2.342132732390113
+runtime_lam_bc_current = 4.107003482091686
 runtime_al_enabled = false
 runtime_al_lambda = 0
 runtime_al_rho = 1
