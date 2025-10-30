@@ -209,3 +209,4 @@ __marimo__/
 # Manually added
 .hpo_runs/
 *.db
+pinn_torus_model.*

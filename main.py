@@ -1031,7 +1031,7 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
         value_and_grad=False,
         has_aux=False,
         tol=tol,
-        stepsize=1e-5,             # << smaller initial step
+        stepsize=1e-4,             # << smaller initial step
         linesearch="zoom",         # more conservative than Hager–Zhang in practice here
         maxls=100,                  # allow more backtracking
         history_size=50,
