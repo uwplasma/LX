@@ -137,6 +137,16 @@ def _is_finite(x: float) -> bool:
 
 # ------------------------ search space ---------------------------------------
 
+def suggest_warmup_by_fraction(trial, total_steps: int) -> int:
+    # Offer interpretable choices; tweak for your models.
+    # For SIREN you might favor shorter warmups (≤10–15%).
+    choices = [0.00, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25]
+    frac = trial.suggest_categorical("opt.lr_warmup_frac", choices)
+    # snap to a small granularity for reproducibility in logs/checkpoints
+    gran = max(1, total_steps // 200)   # ≈0.5% of run
+    steps = int(round(frac * total_steps / gran) * gran)
+    return min(max(0, steps), max(0, total_steps - 1))
+
 def suggest_params(trial: Trial, base_raw_cfg: Dict[str, Any], *, vary_steps: bool = False) -> Dict[str, Any]:
     """
     Take a *nested* TOML dict (as loaded by load_config),
@@ -157,7 +167,7 @@ def suggest_params(trial: Trial, base_raw_cfg: Dict[str, Any], *, vary_steps: bo
     _set_if_absent(hpo_tbl, "hpo_disable_lbfgs", True)
 
     # ---------------- Model space ----------------
-    act = trial.suggest_categorical("model.activation", ["tanh", "relu", "silu", "softplus", "sin"])
+    act = trial.suggest_categorical("model.activation", ["tanh", "silu", "softplus", "sin"])
     model_tbl["activation"] = act
 
     siren = trial.suggest_categorical("model.siren", [True, False])
@@ -209,14 +219,7 @@ def suggest_params(trial: Trial, base_raw_cfg: Dict[str, Any], *, vary_steps: bo
     # LR warmup & cosine floor
     local_steps = int(opt_tbl["steps"])  # 300 from your base if --vary-steps is not passed
     # LR warmup & cosine floor (use local_steps)
-    opt_tbl["lr_warmup_steps"] = int(
-        trial.suggest_int(
-            "opt.lr_warmup_steps",
-            0,
-            max(0, local_steps // 4),
-            step=max(1, local_steps // 12) or 1,
-        )
-    )
+    opt_tbl["lr_warmup_steps"] = suggest_warmup_by_fraction(trial, local_steps)
     opt_tbl["lr_min_ratio"] = float(trial.suggest_float("opt.lr_min_ratio", 0.0, 0.2))
 
     # EMA and Lookahead (often help stability)

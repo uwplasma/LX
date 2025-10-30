@@ -1,5 +1,6 @@
 ###
-### Run as python trace_fieldlines.py --ckpt pinn_torus_model.SIREN-sin_FF-1x2x4x8_W\[32x32x32x32\]_w30_R0f1.eqx --tfinal=500 --n-save 1000
+###      Run as python trace_fieldlines.py --ckpt pinn_torus_model.SIREN-sin_FF-1x2x4x8_W\[32x32x32x32\]_w30_R0f1.eqx --tfinal=500 --n-save 1000
+### clear;clear;python trace_fieldlines.py --ckpt pinn_torus_model.SIREN-sin_FF-1x2x4x8_W\[64x64x64x64\]_w30_R0f1.eqx --tfinal=1000 --n-save 1000
 ###
 #!/usr/bin/env python3
 """
