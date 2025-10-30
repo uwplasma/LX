@@ -63,7 +63,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 300
+steps = 1500
 lr = 0.003
 lam_bc = 5.0
 log_every = 50
