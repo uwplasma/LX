@@ -20,6 +20,13 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         _tomllib = None  # type: ignore
 
+import tomli_w
+
+def dump_params_to_toml(path: str | Path, params: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        tomli_w.dump(params, f)
 
 def load_config(path: str = "input.toml") -> Dict[str, Any]:
     if _tomllib is None:
@@ -95,6 +102,12 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # this is read in main() with default to R0 if missing
     p["R0_for_fourier"] = float(model_cfg.get("R0_for_fourier", p["R0"]))
 
+    # hyperparameter optimization
+    hopt = cfg.get("hyperparameter_optimization", {})
+    p["hpo_disable_plots"] = bool(hopt.get("hpo_disable_plots", False))
+    p["hpo_disable_ckpt"] = bool(hopt.get("hpo_disable_ckpt", False))
+    p["hpo_disable_lbfgs"] = bool(hopt.get("hpo_disable_lbfgs", False))
+
     # optimization
     opt = cfg.get("optimization", {})
     p["steps"] = int(opt.get("steps", 1000))
@@ -123,10 +136,6 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # LBFGS (nested table) e.g. [optimization.lbfgs]
     opt_lbfgs = opt.get("lbfgs", {})
     p["lbfgs_l2"] = float(opt.get("lbfgs_l2", opt_lbfgs.get("l2", 1e-8)))
-    p["lbfgs_include_zero_mean"] = bool(opt.get("lbfgs_include_zero_mean",
-                                                opt_lbfgs.get("include_zero_mean", True)))
-    p["lbfgs_include_aug_lagrangian"] = bool(opt.get("lbfgs_include_aug_lagrangian",
-                                                     opt_lbfgs.get("include_aug_lagrangian", True)))
 
     # Augmented Lagrangian
     p["use_augmented_lagrangian"] = bool(opt.get("use_augmented_lagrangian", False))

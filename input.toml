@@ -1,3 +1,8 @@
+[hyperparameter_optimization]
+hpo_disable_plots = true
+hpo_disable_ckpt = true
+hpo_disable_lbfgs = true
+
 [surfaces]                # use either "torus" or "single" mode
 mode = "torus"
 
@@ -48,7 +53,7 @@ bdry_presample_mult = 16     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.1      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [32, 32]   # MLP hidden layer sizes
+hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
@@ -58,7 +63,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 500
+steps = 300
 lr = 0.003
 lam_bc = 5.0
 log_every = 50
@@ -90,13 +95,10 @@ use_lookahead = true
 lookahead_sync_period = 5        # k steps between slow-weight syncs
 lookahead_slow_step = 0.5        # α (0..1), typical 0.5
 
-lbfgs_include_zero_mean = true
-lbfgs_include_aug_lagrangian = true
+lbfgs_l2 = 0.0
 
 [optimization.lbfgs]
-l2 = 1e-7                   # was lbfgs_l2
-include_zero_mean = true
-include_aug_lagrangian = true
+l2 = 0                  # was lbfgs_l2
 
 [box]
 # z-extent of the fixed sampling box (x,y are computed from geometry each run)

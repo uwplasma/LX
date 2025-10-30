@@ -67,7 +67,8 @@ from _network_and_loss import (
     save_model,
     debug_stats,
     train_step_many,
-    _full_objective_like_training
+    _full_objective_like_training,
+    eval_total,
 )
 from _physics import eval_on_boundary, grad_u_total_batch
 from _state import runtime
@@ -115,6 +116,20 @@ box_seed: int
 # surfaces config (raw dict from TOML; parsed here)
 surfaces_cfg: dict
 
+def _model_signature_tag(params_dict) -> str:
+    kind = "SIREN" if bool(params_dict.get("siren", False)) else "MLP"
+    act  = getattr(params_dict.get("mlp_activation"), "__name__", str(params_dict.get("mlp_activation")))
+    widths = "x".join(str(w) for w in params_dict["mlp_hidden_sizes"])
+    # Fourier bands
+    fb = tuple(params_dict.get("fourier_bands", ()))
+    fb_tag = ("FF-" + "x".join(f"{b:g}" for b in fb)) if fb else "noFF"
+    # SIREN omega0 if applicable
+    w0_tag = f"_w{params_dict.get('siren_omega0', 0):g}" if params_dict.get("siren", False) else ""
+    # Length scale used to nondimensionalize frequencies (optional but useful)
+    r0f = float(params_dict.get("R0_for_fourier", 1.0))
+    r0_tag = f"_R0f{r0f:g}"
+    return f"{kind}-{act}_{fb_tag}_W[{widths}]{w0_tag}{r0_tag}"
+
 def _finite_or_big(x, big=1e30):
     return jnp.nan_to_num(x, nan=big, posinf=big, neginf=big)
 
@@ -147,6 +162,23 @@ def _lookahead_sync(slow, fast, alpha):
     new_slow = jax.tree_util.tree_map(lambda s, f: s + alpha * (f - s), slow, fast)
     return new_slow
 
+def _eval_total_mean_over_packs(model_eval, packs_all):
+    # mean(eval_total) over surfaces, with CURRENT runtime.lam_bc
+    s = 0.0
+    for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+        s += float(eval_total(model_eval, Pi, Pb, Nb))
+    return s / float(len(packs_all))
+
+class _LambdaGuard:
+    def __init__(self, new_lambda):
+        self.new_lambda = float(new_lambda)
+        self.old = None
+    def __enter__(self):
+        self.old = float(runtime.lam_bc)
+        runtime.lam_bc = self.new_lambda
+    def __exit__(self, exc_type, exc, tb):
+        runtime.lam_bc = self.old
+
 def _apply_params(params: Dict[str, Any]) -> None:
     global CHECKPOINT_PATH, BATCH_IN, BATCH_BDRY, R0, a0, a1, N_harm, kappa
     global N_in, N_bdry_theta, N_bdry_phi, rng_seed
@@ -156,7 +188,11 @@ def _apply_params(params: Dict[str, Any]) -> None:
     global box_zmin, box_zmax, box_points_total, box_seed
     global surfaces_cfg
 
-    CHECKPOINT_PATH = Path(params["checkpoint_path"])          # type: ignore
+    raw_ckpt = Path(params["checkpoint_path"])
+    sig = _model_signature_tag(params)
+    # Insert the signature BEFORE the extension
+    stem = raw_ckpt.with_suffix("")  # drop .eqx if present
+    CHECKPOINT_PATH = Path(f"{stem}.{sig}.eqx")
     BATCH_IN        = int(params["batch_interior"])            # type: ignore
     BATCH_BDRY      = int(params["batch_boundary"])            # type: ignore
 
@@ -245,8 +281,6 @@ def main(config_path: str = "input.toml"):
 
     # ---- LBFGS flags into runtime so helpers can read them safely ----
     # Read the flattened keys produced by parse_config()
-    runtime.lbfgs_include_zero_mean = bool(params.get("lbfgs_include_zero_mean", True))
-    runtime.lbfgs_include_aug_lagrangian = bool(params.get("lbfgs_include_aug_lagrangian", True))
     runtime.lbfgs_l2 = float(params.get("lbfgs_l2", 1e-8))
 
     dump_effective_toml(
@@ -277,6 +311,8 @@ def main(config_path: str = "input.toml"):
     adam_train_like_hist = []
     lbfgs_eval_full_hist = []
     lbfgs_train_like_hist = []
+    lbfgs_eval_total_hist = []
+    unified_loss_hist = []
 
     # ---------------------- Build fixed box + candidate points -----------------
     # x,y box computed from geometry envelope; z from TOML
@@ -301,6 +337,11 @@ def main(config_path: str = "input.toml"):
         print(f"[OPT] Lookahead: k={int(params.get('lookahead_sync_period',5))}, alpha={float(params.get('lookahead_slow_step',0.5))}")
     if use_ema:
         print(f"[OPT] EMA: decay={ema_decay}, eval_with_ema={ema_eval}")
+        
+    # --- HPO toggles (optional, default False) ---
+    HPO_DISABLE_PLOTS = bool(params.get("hpo_disable_plots", False))
+    HPO_DISABLE_CKPT  = bool(params.get("hpo_disable_ckpt", False))
+    HPO_DISABLE_LBFGS = bool(params.get("hpo_disable_lbfgs", False))
 
     # ---------------------- Build model + optimizer ----------------------------
     use_siren     = bool(params.get("siren", False))
@@ -409,6 +450,15 @@ def main(config_path: str = "input.toml"):
             model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step(
                 model, opt_state, optimizer, P_in, P_bdry, N_bdry, subkey
             )
+            # choose model used for evaluation curve (EMA-consistent with your prints)
+            if use_ema and ema_eval:
+                mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                model_eval = eqx.combine(ema_f, ms)
+            else:
+                model_eval = model
+
+            with _LambdaGuard(lam_bc):  # pin λ to the final value for plotting
+                unified_loss_hist.append(float(eval_total(model_eval, P_in, P_bdry, N_bdry)))
             # record per-iter history (Adam)
             adam_loss_hist.append(float(L))
             adam_lin_hist.append(float(Lin))
@@ -458,19 +508,35 @@ def main(config_path: str = "input.toml"):
         if use_ema and ema_eval:
             mf, ms = eqx.partition(model, eqx.is_inexact_array)
             model_to_save = eqx.combine(ema_f, ms)
+            
+        runtime.lam_bc = float(lam_bc)  # ensure final λ
+        adam_eval_total_full = 0.0
+        if mode == "single":
+            adam_eval_total_full = float(eval_total(model_to_save, P_in, P_bdry, N_bdry))
+        else:
+            # mean across all packs for scale stability
+            s = 0.0
+            for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+                s += float(eval_total(model_to_save, Pi, Pb, Nb))
+            adam_eval_total_full = s / float(len(packs_all))
+        print(f"[ADAM-END] eval_total_full={adam_eval_total_full:.6e}")
 
         # Optional LBFGS polish on this single surface
         runtime._lbfgs_eval_full_hist_sink = lbfgs_eval_full_hist
-        if LBFGS_STEPS > 0:
+        runtime._lbfgs_eval_total_hist_sink = lbfgs_eval_total_hist
+        if (LBFGS_STEPS > 0) and (not HPO_DISABLE_LBFGS):
             model_to_save = _lbfgs_polish(
                 model_to_save, P_in, P_bdry, N_bdry,
                 steps=LBFGS_STEPS, tol=LBFGS_TOL,
                 print_every=LBFGS_PRINT_EVERY, label="single",
                 history=lbfgs_hist,
             )
+        unified_loss_hist.extend(lbfgs_eval_total_hist)
         runtime._lbfgs_eval_full_hist_sink = None
+        runtime._lbfgs_eval_total_hist_sink = None
 
-        save_model(model_to_save, CHECKPOINT_PATH)
+        model = model_to_save
+        if not HPO_DISABLE_CKPT: save_model(model_to_save, CHECKPOINT_PATH)
 
         # Final diagnostics
         (Lf, (Linf, Lbcf, lapf, nf)) = eval_full(model, P_in, P_bdry, N_bdry)
@@ -484,91 +550,77 @@ def main(config_path: str = "input.toml"):
         lap_max  = float(jnp.max(jnp.abs(lapf)))
         print(f"[CHECK] boundary n·∇u  rms={nbc_rms:.3e}  max={nbc_max:.3e}")
         print(f"[CHECK] interior Δu     rms={lap_rms:.3e}  max={lap_max:.3e}")
+        
+        if not HPO_DISABLE_PLOTS:
 
-        # ===================== Loss evolution figure (Adam + LBFGS) =====================
-        try:
-            figL = plt.figure(figsize=(10, 4), constrained_layout=True)
-            axL  = figL.add_subplot(1,1,1)
-
-            x_adam = jnp.arange(1, len(adam_loss_hist)+1)
-
-            # 1) Show BOTH Adam metrics
-            axL.semilogy(x_adam, adam_train_like_hist, label="Adam (train-like)", linewidth=2)
-            axL.semilogy(x_adam, adam_eval_full_hist,  label="Adam (eval_full = Lin + λ·Lbc)", alpha=0.8)
-
-            # 2) Append LBFGS immediately after Adam on the same x-axis
-            x0 = len(adam_loss_hist)
-            if len(lbfgs_train_like_hist) == 0 and len(lbfgs_hist) > 0:
-                # keep backward-compat: lbfgs_hist is train-like history
-                lbfgs_train_like_hist = lbfgs_hist
-
-            if len(lbfgs_train_like_hist) > 0:
-                x_lb1 = jnp.arange(x0+1, x0+len(lbfgs_train_like_hist)+1)
-                axL.semilogy(x_lb1, lbfgs_train_like_hist, label="LBFGS (train-like)", linewidth=2)
-
-            if len(lbfgs_eval_full_hist) > 0:
-                x_lb2 = jnp.arange(x0+1, x0+len(lbfgs_eval_full_hist)+1)
-                axL.semilogy(x_lb2, lbfgs_eval_full_hist, label="LBFGS (eval_full)", linewidth=2, linestyle="--")
-
-            axL.set_xlabel("Iteration")
-            axL.set_ylabel("Loss (semilogy)")
-            axL.set_title("Objective evolution (Adam → LBFGS)")
-            axL.legend()
+            # ===================== Loss evolution figure (Adam + LBFGS) =====================
+            fig = plt.figure(figsize=(10, 4), constrained_layout=True)
+            ax  = fig.add_subplot(1,1,1)
+            x   = jnp.arange(1, len(unified_loss_hist)+1)
+            ax.semilogy(x, unified_loss_hist, linewidth=2, label="eval_total (λ fixed)")
+            ax.set_xlabel("Iteration (Adam → LBFGS)")
+            ax.set_ylabel("Loss (semilogy)")
+            ax.set_title("Objective with constant λ across phases")
+            if len(adam_loss_hist) > 0:
+                ax.axvline(x=len(adam_loss_hist), color='red', linestyle='--', 
+                        linewidth=1.5, alpha=0.7, label='Adam → LBFGS')
+            ax.legend()
             plt.show()
-        except Exception as _e:
-            print(f"[WARN] Could not plot loss curve: {_e}")
 
-        # Compute final boundary grad & plot side-by-side
-        mf, ms = eqx.partition(model, eqx.is_inexact_array)
-        model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
-        Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, P_bdry, N_bdry, Xg, Yg, Zg)
+            # Compute final boundary grad & plot side-by-side
+            mf, ms = eqx.partition(model, eqx.is_inexact_array)
+            model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
+            Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, P_bdry, N_bdry, Xg, Yg, Zg)
 
-        vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
-        vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
-        fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
-        gs = fig3d.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
-        ax1 = fig3d.add_subplot(gs[0, 0], projection='3d')
-        ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
-        cax = fig3d.add_subplot(gs[0, 2])
+            vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
+            vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
+            fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
+            gs = fig3d.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
+            ax1 = fig3d.add_subplot(gs[0, 0], projection='3d')
+            ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
+            cax = fig3d.add_subplot(gs[0, 2])
 
-        offset = 0.1 * float(a0 + abs(a1))
-        m1 = plot_surface_with_vectors_ax(ax1, Xg, Yg, Zg, Gmag_init, Nhat_grid, Gvec=Gvec_init,
-                                           title="Initial |∇u| and vectors (boundary)",
-                                           cmap=PLOT_CMAP, quiver_len=0.15,
-                                           step_theta=6, step_phi=8, plot_normals=False,
-                                           vmin=vmin_shared, vmax=vmax_shared,
-                                           surf_offset=offset)
-        m2 = plot_surface_with_vectors_ax(ax2, Xg, Yg, Zg, Gmag_final, Nhat_grid, Gvec=Gvec_final,
-                                           title="Final |∇u| and vectors (boundary)",
-                                           cmap=PLOT_CMAP, quiver_len=0.15,
-                                           step_theta=6, step_phi=8, plot_normals=False,
-                                           vmin=vmin_shared, vmax=vmax_shared,
-                                           surf_offset=offset)
+            offset = 0.1 * float(a0 + abs(a1))
+            m1 = plot_surface_with_vectors_ax(ax1, Xg, Yg, Zg, Gmag_init, Nhat_grid, Gvec=Gvec_init,
+                                            title="Initial |∇u| and vectors (boundary)",
+                                            cmap=PLOT_CMAP, quiver_len=0.15,
+                                            step_theta=6, step_phi=8, plot_normals=False,
+                                            vmin=vmin_shared, vmax=vmax_shared,
+                                            surf_offset=offset)
+            m2 = plot_surface_with_vectors_ax(ax2, Xg, Yg, Zg, Gmag_final, Nhat_grid, Gvec=Gvec_final,
+                                            title="Final |∇u| and vectors (boundary)",
+                                            cmap=PLOT_CMAP, quiver_len=0.15,
+                                            step_theta=6, step_phi=8, plot_normals=False,
+                                            vmin=vmin_shared, vmax=vmax_shared,
+                                            surf_offset=offset)
 
-        # draw the fixed box on both plots
-        draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
-        draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+            # draw the fixed box on both plots
+            draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+            draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
 
-        cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
-        fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
+            cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
+            fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
 
-        # θ×φ heatmaps
-        theta = jnp.linspace(0, 2*jnp.pi, N_bdry_theta, endpoint=True)
-        phi   = jnp.linspace(0, 2*jnp.pi, N_bdry_phi,   endpoint=True)
-        TH, PH = jnp.meshgrid(theta, phi, indexing='ij')
-        GN_init  = Gmag_init
-        GN_final = Gmag_final
-        vmin_hm = float(jnp.minimum(GN_init.min(), GN_final.min()))
-        vmax_hm = float(jnp.maximum(GN_init.max(), GN_final.max()))
-        figHM = plt.figure(figsize=(12, 4.5), constrained_layout=True)
-        gs = figHM.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
-        axL = figHM.add_subplot(gs[0, 0]); axR = figHM.add_subplot(gs[0, 1]); cax = figHM.add_subplot(gs[0, 2])
-        imL = axL.pcolormesh(PH, TH, GN_init, shading="auto", cmap=PLOT_CMAP, vmin=vmin_hm, vmax=vmax_hm)
-        axL.set_title("Initial  $|\\nabla u|$ on boundary"); axL.set_xlabel(r"$\phi$"); axL.set_ylabel(r"$\theta$")
-        imR = axR.pcolormesh(PH, TH, GN_final, shading="auto", cmap=PLOT_CMAP, vmin=vmin_hm, vmax=vmax_hm)
-        axR.set_title("Final  $|\\nabla u|$ on boundary"); axR.set_xlabel(r"$\phi$")
-        cb = figHM.colorbar(imR, cax=cax); cb.set_label(r"$|\nabla u|$")
-        plt.show()
+            # θ×φ heatmaps
+            theta = jnp.linspace(0, 2*jnp.pi, N_bdry_theta, endpoint=True)
+            phi   = jnp.linspace(0, 2*jnp.pi, N_bdry_phi,   endpoint=True)
+            TH, PH = jnp.meshgrid(theta, phi, indexing='ij')
+            GN_init  = Gmag_init
+            GN_final = Gmag_final
+            vmin_hm = float(jnp.minimum(GN_init.min(), GN_final.min()))
+            vmax_hm = float(jnp.maximum(GN_init.max(), GN_final.max()))
+            figHM = plt.figure(figsize=(12, 4.5), constrained_layout=True)
+            gs = figHM.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
+            axL = figHM.add_subplot(gs[0, 0]); axR = figHM.add_subplot(gs[0, 1]); cax = figHM.add_subplot(gs[0, 2])
+            imL = axL.pcolormesh(PH, TH, GN_init, shading="auto", cmap=PLOT_CMAP, vmin=vmin_hm, vmax=vmax_hm)
+            axL.set_title("Initial  $|\\nabla u|$ on boundary"); axL.set_xlabel(r"$\phi$"); axL.set_ylabel(r"$\theta$")
+            imR = axR.pcolormesh(PH, TH, GN_final, shading="auto", cmap=PLOT_CMAP, vmin=vmin_hm, vmax=vmax_hm)
+            axR.set_title("Final  $|\\nabla u|$ on boundary"); axR.set_xlabel(r"$\phi$")
+            cb = figHM.colorbar(imR, cax=cax); cb.set_label(r"$|\nabla u|$")
+            plt.show()
+            
+        final_score = float(eval_total(model, P_in, P_bdry, N_bdry))
+        return model, final_score
 
     elif mode == "torus":
         # ===== MULTI-SURFACE PRETRAINING =====
@@ -615,6 +667,14 @@ def main(config_path: str = "input.toml"):
             model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step_many(
                 model, opt_state, optimizer, packs_all, subkey
             )
+            if use_ema and ema_eval:
+                mf, ms = eqx.partition(model, eqx.is_inexact_array)
+                model_eval = eqx.combine(ema_f, ms)
+            else:
+                model_eval = model
+
+            with _LambdaGuard(lam_bc):  # pin λ for plotting
+                unified_loss_hist.append(_eval_total_mean_over_packs(model_eval, packs_all))
             # record per-iter history (Adam) – aggregated stats
             adam_loss_hist.append(float(L))
             adam_lin_hist.append(float(Lin))
@@ -661,10 +721,23 @@ def main(config_path: str = "input.toml"):
         if use_ema and ema_eval:
             mf, ms = eqx.partition(model, eqx.is_inexact_array)
             model_to_save = eqx.combine(ema_f, ms)
+            
+        runtime.lam_bc = float(lam_bc)  # ensure final λ
+        adam_eval_total_full = 0.0
+        if mode == "single":
+            adam_eval_total_full = float(eval_total(model_to_save, P_in, P_bdry, N_bdry))
+        else:
+            # mean across all packs for scale stability
+            s = 0.0
+            for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+                s += float(eval_total(model_to_save, Pi, Pb, Nb))
+            adam_eval_total_full = s / float(len(packs_all))
+        print(f"[ADAM-END] eval_total_full={adam_eval_total_full:.6e}")
 
         # Optional LBFGS polish across **all** surfaces
         runtime._lbfgs_eval_full_hist_sink = lbfgs_eval_full_hist
-        if LBFGS_STEPS > 0:
+        runtime._lbfgs_eval_total_hist_sink = lbfgs_eval_total_hist
+        if (LBFGS_STEPS > 0) and (not HPO_DISABLE_LBFGS):
             packs = []
             for surf in dataset:
                 # interior from common box (deterministic)
@@ -692,12 +765,15 @@ def main(config_path: str = "input.toml"):
                 print_every=LBFGS_PRINT_EVERY, label="torus:ALL",
                 history=lbfgs_hist,
             )
+        unified_loss_hist.extend(lbfgs_eval_total_hist)
         runtime._lbfgs_eval_full_hist_sink = None
+        runtime._lbfgs_eval_total_hist_sink = None
 
-        save_model(model_to_save, CHECKPOINT_PATH)
+        model = model_to_save
+        if not HPO_DISABLE_CKPT: save_model(model_to_save, CHECKPOINT_PATH)
 
         # Final diagnostics on a couple of surfaces
-        for j in range(min(2, len(dataset))):
+        for j in range(min(3, len(dataset))):
             surf = dataset[j]
             mask = surf.inside_mask_fn(P_box)
             ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
@@ -707,76 +783,65 @@ def main(config_path: str = "input.toml"):
                   f"|lap|_rms={float(jnp.sqrt(jnp.mean(lapf**2))):.3e}  "
                   f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
 
-        # ===================== Loss evolution figure (Adam + LBFGS) =====================
-        try:
-            figL = plt.figure(figsize=(10, 4), constrained_layout=True)
-            axL  = figL.add_subplot(1,1,1)
-
-            x_adam = jnp.arange(1, len(adam_loss_hist)+1)
-
-            # 1) Show BOTH Adam metrics
-            axL.semilogy(x_adam, adam_train_like_hist, label="Adam (train-like)", linewidth=2)
-            axL.semilogy(x_adam, adam_eval_full_hist,  label="Adam (eval_full = Lin + λ·Lbc)", alpha=0.8)
-
-            # 2) Append LBFGS immediately after Adam on the same x-axis
-            x0 = len(adam_loss_hist)
-            if len(lbfgs_train_like_hist) == 0 and len(lbfgs_hist) > 0:
-                # keep backward-compat: lbfgs_hist is train-like history
-                lbfgs_train_like_hist = lbfgs_hist
-
-            if len(lbfgs_train_like_hist) > 0:
-                x_lb1 = jnp.arange(x0+1, x0+len(lbfgs_train_like_hist)+1)
-                axL.semilogy(x_lb1, lbfgs_train_like_hist, label="LBFGS (train-like)", linewidth=2)
-
-            if len(lbfgs_eval_full_hist) > 0:
-                x_lb2 = jnp.arange(x0+1, x0+len(lbfgs_eval_full_hist)+1)
-                axL.semilogy(x_lb2, lbfgs_eval_full_hist, label="LBFGS (eval_full)", linewidth=2, linestyle="--")
-
-            axL.set_xlabel("Iteration")
-            axL.set_ylabel("Loss (semilogy)")
-            axL.set_title("Objective evolution (Adam → LBFGS)")
-            axL.legend()
+        if not HPO_DISABLE_PLOTS:
+            
+            # ===================== Loss evolution figure (Adam + LBFGS) =====================
+            fig = plt.figure(figsize=(10, 4), constrained_layout=True)
+            ax  = fig.add_subplot(1,1,1)
+            x   = jnp.arange(1, len(unified_loss_hist)+1)
+            ax.semilogy(x, unified_loss_hist, linewidth=2, label="eval_total (λ fixed)")
+            ax.set_xlabel("Iteration (Adam → LBFGS)")
+            ax.set_ylabel("Loss (semilogy)")
+            ax.set_title("Objective with constant λ across phases")
+            # Add vertical line at transition from Adam to LBFGS
+            if len(adam_loss_hist) > 0:
+                ax.axvline(x=len(adam_loss_hist), color='red', linestyle='--', 
+                        linewidth=1.5, alpha=0.7, label='Adam → LBFGS')
+            ax.legend()
             plt.show()
-        except Exception as _e:
-            print(f"[WARN] Could not plot loss curve: {_e}")
 
-        # Plot surf0 initial vs final
-        mf, ms = eqx.partition(model, eqx.is_inexact_array)
-        model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
-        Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
-        vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
-        vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
-        fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
-        gs = fig3d.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
-        ax1 = fig3d.add_subplot(gs[0, 0], projection='3d')
-        ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
-        cax = fig3d.add_subplot(gs[0, 2])
+            # Plot surf0 initial vs final
+            mf, ms = eqx.partition(model, eqx.is_inexact_array)
+            model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
+            Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+            vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
+            vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
+            fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
+            gs = fig3d.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
+            ax1 = fig3d.add_subplot(gs[0, 0], projection='3d')
+            ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
+            cax = fig3d.add_subplot(gs[0, 2])
 
-        offset = 0.1 * float(a0 + abs(a1))
-        m1 = plot_surface_with_vectors_ax(ax1, Xg0, Yg0, Zg0, Gmag_init, Nhat_grid0, Gvec=Gvec_init,
-                                           title=f"Initial |∇u| ({surf0.name})",
-                                           cmap=PLOT_CMAP, quiver_len=0.15,
-                                           step_theta=6, step_phi=8, plot_normals=False,
-                                           vmin=vmin_shared, vmax=vmax_shared,
-                                           surf_offset=offset)
-        m2 = plot_surface_with_vectors_ax(ax2, Xg0, Yg0, Zg0, Gmag_final, Nhat_grid0, Gvec=Gvec_final,
-                                           title=f"Final |∇u| ({surf0.name})",
-                                           cmap=PLOT_CMAP, quiver_len=0.15,
-                                           step_theta=6, step_phi=8, plot_normals=False,
-                                           vmin=vmin_shared, vmax=vmax_shared,
-                                           surf_offset=offset)
+            offset = 0.1 * float(a0 + abs(a1))
+            m1 = plot_surface_with_vectors_ax(ax1, Xg0, Yg0, Zg0, Gmag_init, Nhat_grid0, Gvec=Gvec_init,
+                                            title=f"Initial |∇u| ({surf0.name})",
+                                            cmap=PLOT_CMAP, quiver_len=0.15,
+                                            step_theta=6, step_phi=8, plot_normals=False,
+                                            vmin=vmin_shared, vmax=vmax_shared,
+                                            surf_offset=offset)
+            m2 = plot_surface_with_vectors_ax(ax2, Xg0, Yg0, Zg0, Gmag_final, Nhat_grid0, Gvec=Gvec_final,
+                                            title=f"Final |∇u| ({surf0.name})",
+                                            cmap=PLOT_CMAP, quiver_len=0.15,
+                                            step_theta=6, step_phi=8, plot_normals=False,
+                                            vmin=vmin_shared, vmax=vmax_shared,
+                                            surf_offset=offset)
 
-        draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
-        draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+            draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+            draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
 
-        cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
-        fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
-        plt.show()
+            cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
+            fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
+            plt.show()
+            
+        # mean across all packs for a stable metric
+        final_score = 0.0
+        for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+            final_score += float(eval_total(model, Pi, Pb, Nb))
+        final_score /= float(len(packs_all))
+        return model, final_score
 
     else:
         raise NotImplementedError(f"Unknown [surfaces].mode={mode!r}. Use 'single' or 'torus'.")
-
-    return model
 
 def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
                   steps: int, tol: float, print_every: int, label: str,
@@ -797,21 +862,22 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
 
     # Initial diagnostics
     tot0, (Lin0, Lbc0, lap0, n0) = eval_full(model, P_in, P_bdry, N_bdry)
-    print(f"[LBFGS:{label} INIT] f={float(tot0):.6e}  lin={float(Lin0):.3e}  lbc={float(Lbc0):.3e}  "
-          f"|lap|_rms={float(jnp.sqrt(jnp.mean(lap0**2))):.3e}  "
-          f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(n0**2))):.3e}")
+    tl0 = _full_objective_like_training(model, P_in, P_bdry, N_bdry)
+    et0 = eval_total(model, P_in, P_bdry, N_bdry)
+    print(
+        f"[LBFGS:{label} INIT] "
+        f"loss_train_like={float(tl0):.6e}  eval_total={float(et0):.6e}  eval_full={float(tot0):.6e}  "
+        f"lin={float(Lin0):.3e}  lbc={float(Lbc0):.3e}  "
+        f"|lap|_rms={float(jnp.sqrt(jnp.mean(lap0**2))):.3e}  "
+        f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(n0**2))):.3e}"
+    )
 
     # Tiny L2 to prevent runaway in SIREN/Fourier regimes
-    include_zm = bool(getattr(runtime, "lbfgs_include_zero_mean", True))
-    include_al = bool(getattr(runtime, "lbfgs_include_aug_lagrangian", True))
     l2_weight  = float(getattr(runtime, "lbfgs_l2", 1e-8))
 
     def obj(params_f_opt):
         m = eqx.combine(params_f_opt, params_s)
-        if include_zm or include_al:
-            total = _full_objective_like_training(m, P_in, P_bdry, N_bdry)
-        else:
-            total, _ = eval_full(m, P_in, P_bdry, N_bdry)
+        total = eval_total(m, P_in, P_bdry, N_bdry)   # single source of truth
         l2 = sum([jnp.sum(w*w) for w in jax.tree_util.tree_leaves(params_f_opt)])
         val = total + l2_weight * l2
         return jnp.asarray(_finite_or_big(val), dtype=jnp.float64)
@@ -821,10 +887,10 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
         value_and_grad=False,
         has_aux=False,
         tol=tol,
-        stepsize=5e-4,             # << smaller initial step
+        stepsize=1e-4,             # << smaller initial step
         linesearch="zoom",         # more conservative than Hager–Zhang in practice here
-        maxls=80,                  # allow more backtracking
-        history_size=30,
+        maxls=100,                  # allow more backtracking
+        history_size=50,
         verbose=False,
     )
 
@@ -844,16 +910,28 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
         if hasattr(runtime, "_lbfgs_eval_full_hist_sink") and runtime._lbfgs_eval_full_hist_sink is not None:
             total_eval, _ = eval_full(m_for_hist, P_in, P_bdry, N_bdry)
             runtime._lbfgs_eval_full_hist_sink.append(float(total_eval))
+        if hasattr(runtime, "_lbfgs_eval_total_hist_sink") and runtime._lbfgs_eval_total_hist_sink is not None:
+            et_iter = eval_total(m_for_hist, P_in, P_bdry, N_bdry)
+            runtime._lbfgs_eval_total_hist_sink.append(float(et_iter))
         if (it % print_every) == 0 or it == 1 or it == steps:
             m = eqx.combine(params_curr, params_s)
-            total, (Lin, Lbc, lap, n_dot) = eval_full(m, P_in, P_bdry, N_bdry)
+            total_full, (Lin, Lbc, lap, n_dot) = eval_full(m, P_in, P_bdry, N_bdry)
+            total_train_like = _full_objective_like_training(m, P_in, P_bdry, N_bdry)
+            total_eval_total = eval_total(m, P_in, P_bdry, N_bdry)
+
             lap_rms = float(jnp.sqrt(jnp.mean(lap**2)))
             nbc_rms = float(jnp.sqrt(jnp.mean(n_dot**2)))
             grad_norm = getattr(state, "grad_norm", None)
             gtxt = (f"  grad_norm={float(grad_norm):.3e}" if grad_norm is not None else "")
-            print(f"[LBFGS:{label} {it:4d}/{steps}] f={float(total):.6e}  "
-                  f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
-                  f"|lap|_rms={lap_rms:.3e}  |n·∇u|_rms={nbc_rms:.3e}{gtxt}")
+
+            print(
+                f"[LBFGS:{label} {it:4d}/{steps}] "
+                f"loss_train_like={float(total_train_like):.6e}  "
+                f"eval_total={float(total_eval_total):.6e}  "
+                f"eval_full={float(total_full):.6e}  "
+                f"lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                f"|lap|_rms={lap_rms:.3e}  |n·∇u|_rms={nbc_rms:.3e}{gtxt}"
+            )
 
         # Early stop if solver exposes an error metric and we’re below tol
         err = getattr(state, "error", None)
@@ -864,9 +942,15 @@ def _lbfgs_polish(model, P_in, P_bdry, N_bdry, *,
 
     # Final diagnostics
     totf, (Linf, Lbcf, lapf, nf) = eval_full(model_opt, P_in, P_bdry, N_bdry)
-    print(f"[LBFGS:{label} DONE] f={float(totf):.6e}  lin={float(Linf):.3e}  lbc={float(Lbcf):.3e}  "
-          f"|lap|_rms={float(jnp.sqrt(jnp.mean(lapf**2))):.3e}  "
-          f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}")
+    tlf = _full_objective_like_training(model_opt, P_in, P_bdry, N_bdry)
+    etf = eval_total(model_opt, P_in, P_bdry, N_bdry)
+    print(
+        f"[LBFGS:{label} DONE] "
+        f"loss_train_like={float(tlf):.6e}  eval_total={float(etf):.6e}  eval_full={float(totf):.6e}  "
+        f"lin={float(Linf):.3e}  lbc={float(Lbcf):.3e}  "
+        f"|lap|_rms={float(jnp.sqrt(jnp.mean(lapf**2))):.3e}  "
+        f"|n·∇u|_rms={float(jnp.sqrt(jnp.mean(nf**2))):.3e}"
+    )
     return model_opt
 
 def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int, label: str,
@@ -892,6 +976,18 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
                       for (Pi, Pb, Nb, name) in packs)
 
     # Initial diagnostics (aggregate)
+    def _agg_train_like(mod):
+        # mean over surfaces for scale stability
+        s = 0.0
+        for (Pi, Pb, Nb, _nm) in packs_tup:
+            s = s + _full_objective_like_training(mod, Pi, Pb, Nb)
+        return float(s / float(len(packs_tup)))
+
+    def _agg_eval_total(mod):
+        s = 0.0
+        for (Pi, Pb, Nb, _nm) in packs_tup:
+            s = s + float(eval_total(mod, Pi, Pb, Nb))
+        return float(s / float(len(packs_tup)))
     def _agg_stats(mod):
         vals = []
         for (Pi, Pb, Nb, _nm) in packs_tup:
@@ -909,23 +1005,23 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
         }
 
     s0 = _agg_stats(model)
-    print(f"[LBFGS-many:{label} INIT] f={s0['f']:.6e} lin={s0['lin']:.3e} lbc={s0['lbc']:.3e} "
-          f"|lap|_rms={s0['lap_rms']:.3e} |n·∇u|_rms={s0['nbc_rms']:.3e}")
+    t0 = _agg_train_like(model)
+    e0 = _agg_eval_total(model)
+    print(
+        f"[LBFGS-many:{label} INIT] "
+        f"loss_train_like={t0:.6e}  eval_total={e0:.6e}  eval_full={s0['f']:.6e}  "
+        f"lin={s0['lin']:.3e}  lbc={s0['lbc']:.3e}  "
+        f"|lap|_rms={s0['lap_rms']:.3e}  |n·∇u|_rms={s0['nbc_rms']:.3e}"
+    )
 
-    include_zm = bool(getattr(runtime, "lbfgs_include_zero_mean", True))
-    include_al = bool(getattr(runtime, "lbfgs_include_aug_lagrangian", True))
     l2_weight  = float(getattr(runtime, "lbfgs_l2", 1e-8))
 
     def obj(params_f_opt):
         m = eqx.combine(params_f_opt, params_s)
         total = 0.0
         for (Pi, Pb, Nb, _nm) in packs_tup:
-            if include_zm or include_al:
-                total = total + _full_objective_like_training(m, Pi, Pb, Nb)
-            else:
-                t, _ = eval_full(m, Pi, Pb, Nb)
-                total = total + t
-        total = total / float(len(packs_tup))
+            total = total + eval_total(m, Pi, Pb, Nb)
+        total = total / float(len(packs_tup))         # mean for scale stability
         l2 = sum([jnp.sum(w*w) for w in jax.tree_util.tree_leaves(params_f_opt)])
         val = total + l2_weight * l2
         return jnp.asarray(_finite_or_big(val), dtype=jnp.float64)
@@ -935,10 +1031,10 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
         value_and_grad=False,
         has_aux=False,
         tol=tol,
-        stepsize=5e-4,             # << smaller initial step
+        stepsize=1e-5,             # << smaller initial step
         linesearch="zoom",         # more conservative than Hager–Zhang in practice here
-        maxls=80,                  # allow more backtracking
-        history_size=30,
+        maxls=100,                  # allow more backtracking
+        history_size=50,
         verbose=False,
     )
 
@@ -958,21 +1054,36 @@ def _lbfgs_polish_many(model, packs, *, steps: int, tol: float, print_every: int
         if hasattr(runtime, "_lbfgs_eval_full_hist_sink") and runtime._lbfgs_eval_full_hist_sink is not None:
             s_eval = _agg_stats(m_for_hist)   # uses eval_full on all packs
             runtime._lbfgs_eval_full_hist_sink.append(float(s_eval["f"]))
+        if hasattr(runtime, "_lbfgs_eval_total_hist_sink") and runtime._lbfgs_eval_total_hist_sink is not None:
+            et_iter = _agg_eval_total(m_for_hist)
+            runtime._lbfgs_eval_total_hist_sink.append(float(et_iter))
         if (it % print_every) == 0 or it == 1 or it == steps:
             m = eqx.combine(params_curr, params_s)
             si = _agg_stats(m)
+            tl = _agg_train_like(m)
+            et = _agg_eval_total(m)
             gn = getattr(state, "grad_norm", None)
             gtxt = (f"  grad_norm={float(gn):.3e}" if gn is not None else "")
-            print(f"[LBFGS-many:{label} {it:4d}/{steps}] f={si['f']:.6e} lin={si['lin']:.3e} "
-                  f"lbc={si['lbc']:.3e} |lap|_rms={si['lap_rms']:.3e} |n·∇u|_rms={si['nbc_rms']:.3e}{gtxt}")
+            print(
+                f"[LBFGS-many:{label} {it:4d}/{steps}] "
+                f"loss_train_like={tl:.6e}  eval_total={et:.6e}  eval_full={si['f']:.6e}  "
+                f"lin={si['lin']:.3e}  lbc={si['lbc']:.3e}  "
+                f"|lap|_rms={si['lap_rms']:.3e}  |n·∇u|_rms={si['nbc_rms']:.3e}{gtxt}"
+            )
         err = getattr(state, "error", None)
         if (err is not None) and (float(err) <= tol):
             break
 
     model_opt = eqx.combine(params_curr, params_s)
     sf = _agg_stats(model_opt)
-    print(f"[LBFGS-many:{label} DONE] f={sf['f']:.6e} lin={sf['lin']:.3e} lbc={sf['lbc']:.3e} "
-          f"|lap|_rms={sf['lap_rms']:.3e} |n·∇u|_rms={sf['nbc_rms']:.3e}")
+    tlf = _agg_train_like(model_opt)
+    etf = _agg_eval_total(model_opt)
+    print(
+        f"[LBFGS-many:{label} DONE] "
+        f"loss_train_like={tlf:.6e}  eval_total={etf:.6e}  eval_full={sf['f']:.6e}  "
+        f"lin={sf['lin']:.3e}  lbc={sf['lbc']:.3e}  "
+        f"|lap|_rms={sf['lap_rms']:.3e}  |n·∇u|_rms={sf['nbc_rms']:.3e}"
+    )
     return model_opt
 
 if __name__ == "__main__":
@@ -981,4 +1092,5 @@ if __name__ == "__main__":
     parser.add_argument("--config", "-c", type=str, default="input.toml",
                         help="Path to TOML configuration file")
     args = parser.parse_args()
-    _ = main(config_path=args.config)
+    _model, _score = main(config_path=args.config)
+    print(f"[DONE] Final score: {_score:.6e}")

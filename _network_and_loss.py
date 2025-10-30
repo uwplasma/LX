@@ -33,6 +33,30 @@ def _full_objective_like_training(params, Pi, Pb, Nb):
 
     return total
 
+@eqx.filter_jit
+def eval_total(params, pts_interior, pts_bdry, normals_bdry):
+    """Full objective you actually train: physics + zero-mean + AL."""
+    # reuse the exact same calc as in _full_objective_like_training
+    lap = lap_u_total_batch(params, pts_interior)
+    g_b = grad_u_total_batch(params, pts_bdry)
+    n_dot = jnp.sum(normals_bdry * g_b, axis=-1)
+
+    loss_in_raw = jnp.mean(lap * lap)
+    loss_bc_raw = jnp.mean(n_dot * n_dot)
+    total = loss_in_raw + runtime.lam_bc * loss_bc_raw
+
+    # zero-mean reg
+    u_vals = u_total_batch(params, pts_interior)
+    mean_u = jnp.mean(u_vals)
+    total = total + float(getattr(runtime, "zero_mean_weight", 0.1)) * (mean_u * mean_u)
+
+    # AL term (mean constraint)
+    if runtime.al_enabled:
+        c_bc_mean = jnp.mean(n_dot)
+        total = total + runtime.al_lambda * c_bc_mean + 0.5 * runtime.al_rho * (c_bc_mean * c_bc_mean)
+
+    return total
+
 def _bdry_presample_mult() -> int:
     return int(getattr(runtime, "bdry_presample_mult", 16))
 
@@ -150,18 +174,25 @@ class PotentialMLP(eqx.Module):
         else:
             h = xyz
 
-        # Flatten any leading batch dims to a matrix for Linear layers
-        orig_shape = h.shape[:-1]
-        h = h.reshape(-1, h.shape[-1])
+        # Keep original leading batch shape (could be scalar point or batched)
+        orig_shape = h.shape[:-1]          # e.g., () or (N,)
+        h = h.reshape(-1, h.shape[-1])     # (N, Din) row-major
 
-        # Apply all but last with activation, last is linear (no final act)
+        # Hidden layers: h = act(h @ W^T + b)
         for layer in self.layers[:-1]:
-            h = self.act(layer(h))
-        h = self.layers[-1](h)
+            W, b = layer.weight, layer.bias            # W: (Dout, Din), b: (Dout,)
+            h = h @ W.T + b                            # (N, Dout)
+            h = self.act(h)
 
-        # Restore shape and squeeze last dim to return (...,)
+        # Final linear to scalar: (N, 1)
+        Wf, bf = self.layers[-1].weight, self.layers[-1].bias   # (1, Din_last), (1,)
+        # Optional sanity check during development:
+        # assert Wf.shape[0] == 1, "Final layer must output a scalar."
+        h = h @ Wf.T + bf                                       # (N, 1)
+
+        # Restore original batch shape and squeeze scalar
         h = h.reshape(orig_shape + (1,))
-        return h.squeeze(-1)
+        return h.squeeze(-1)            # (...,)
 
 def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
     ni, nb = pts_interior.shape[0], pts_bdry.shape[0]
@@ -250,22 +281,27 @@ def save_model(model, path: Path | str = "pinn_torus_model.eqx"):
 
 def load_model_if_exists(template: eqx.Module, path: Path | str = "pinn_torus_model.eqx") -> eqx.Module:
     path = Path(path)
-    if path.exists():
-        try:
-            loaded = eqx.tree_deserialise_leaves(str(path), template)
-            # Verify that each leaf has the same shape as the template
-            templ_shapes = [x.shape for x in jax.tree_util.tree_leaves(template)]
-            load_shapes  = [x.shape for x in jax.tree_util.tree_leaves(loaded)]
-            if templ_shapes != load_shapes:
-                print(f"[CKPT] Shape mismatch; ignoring checkpoint {path}.")
-                return template
-            print(f"[CKPT] Loaded model from: {path}")
-            return loaded
-        except Exception as e:
-            print(f"[CKPT] Failed to load checkpoint ({path}). Using fresh model. Reason: {e}")
-    else:
+    if not path.exists():
         print(f"[CKPT] No checkpoint found at {path}. Starting fresh.")
-    return template
+        return template
+    try:
+        loaded = eqx.tree_deserialise_leaves(str(path), template)
+
+        # Compare only array (inexact) leaves to avoid floats like omega0
+        t_arr, _ = eqx.partition(template, eqx.is_inexact_array)
+        l_arr, _ = eqx.partition(loaded,   eqx.is_inexact_array)
+        t_shapes = [x.shape for x in jax.tree_util.tree_leaves(t_arr)]
+        l_shapes = [x.shape for x in jax.tree_util.tree_leaves(l_arr)]
+
+        if (type(loaded) is not type(template)) or (t_shapes != l_shapes):
+            print(f"[CKPT] Structure/shape mismatch; ignoring checkpoint {path}.")
+            return template
+
+        print(f"[CKPT] Loaded model from: {path}")
+        return loaded
+    except Exception as e:
+        print(f"[CKPT] Failed to load checkpoint ({path}). Using fresh model. Reason: {e}")
+        return template
 
 # --- SIREN (minimal) ---------------------------------------------------------
 class SirenMLP(eqx.Module):

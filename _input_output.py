@@ -192,10 +192,6 @@ def dump_effective_toml(
     out.append("[optimization.lbfgs]")
     # Prefer runtime flags (these are what the polish code actually consults)
     out.append(_emit_kv("l2", getattr(runtime, "lbfgs_l2", params.get("lbfgs_l2", 1e-8))))
-    out.append(_emit_kv("include_zero_mean", getattr(runtime, "lbfgs_include_zero_mean",
-                                                     params.get("lbfgs_include_zero_mean", True))))
-    out.append(_emit_kv("include_aug_lagrangian", getattr(runtime, "lbfgs_include_aug_lagrangian",
-                                                          params.get("lbfgs_include_aug_lagrangian", True))))
     out.append("")
 
     # [box]
