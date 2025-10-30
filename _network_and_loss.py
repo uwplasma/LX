@@ -11,6 +11,27 @@ from jax import lax
 from _physics import u_total, grad_u_total_batch, lap_u_total_batch, u_total_batch
 from _state import runtime 
 
+def _fourier_embed_xyz(
+    xyz: jnp.ndarray,
+    bands: Sequence[float],
+    scale: float,
+    R0: float = 1.0,
+    *,
+    add_raw: bool = True,
+) -> jnp.ndarray:
+    """Positional encoding of xyz with optional raw coords."""
+    if bands is None or len(bands) == 0:
+        return xyz if add_raw else jnp.zeros((*xyz.shape[:-1], 0), dtype=xyz.dtype)
+    freqs = jnp.asarray(bands, dtype=xyz.dtype) / (R0 + 1e-12)      # (B,)
+    ang = xyz[..., None, :] * (scale * freqs[None, :, None])        # (..., B, 3)
+    s, c = jnp.sin(ang), jnp.cos(ang)                               # (..., B, 3)
+    parts = []
+    if add_raw:
+        parts.append(xyz)
+    parts += [s.reshape(*xyz.shape[:-1], -1), c.reshape(*xyz.shape[:-1], -1)]
+    return jnp.concatenate(parts, axis=-1)
+
+
 def _full_objective_like_training(params, Pi, Pb, Nb):
     # physics terms
     lap = lap_u_total_batch(params, Pi)
@@ -65,28 +86,6 @@ def _zero_mean_w():
     return float(getattr(runtime, "zero_mean_weight", 0.1))
 
 def _identity(x): return x
-
-def _fourier_embed_xyz(xyz: jnp.ndarray,
-                       bands: Sequence[float],
-                       scale: float,
-                       R0: float = 1.0) -> jnp.ndarray:
-    """Positional encoding of xyz with sin/cos features.
-    Args:
-      xyz:  (..., 3)
-      bands: e.g. (1,2,4,8) in units of 1/R0
-      scale: typically 2π
-      R0: length scale for nondimensionalizing frequencies
-    Returns:
-      (..., 3 + 2*3*len(bands))
-    """
-    if (bands is None) or (len(bands) == 0):
-        return xyz
-    freqs = jnp.asarray(bands, dtype=xyz.dtype) / (R0 + 1e-12)    # (B,)
-    ang = xyz[..., None, :] * (scale * freqs[None, :, None])      # (..., B, 3)
-    s, c = jnp.sin(ang), jnp.cos(ang)                             # (..., B, 3)
-    feat = jnp.concatenate([xyz, s.reshape(*xyz.shape[:-1], -1), c.reshape(*xyz.shape[:-1], -1)], axis=-1)
-    return feat
-
 
 def debug_stats(params, grads, lap_res, nres, s_in=None, s_bc=None):
     """Return small dict of scalars for printing/logging."""
@@ -170,7 +169,7 @@ class PotentialMLP(eqx.Module):
     def __call__(self, xyz: jnp.ndarray) -> jnp.ndarray:
         # xyz: (..., 3)
         if self.use_fourier and len(self.fourier_bands) > 0:
-            h = _fourier_embed_xyz(xyz, self.fourier_bands, self.fourier_scale, self.R0_for_fourier)
+            h = _fourier_embed_xyz(xyz, self.fourier_bands, self.fourier_scale, self.R0_for_fourier, add_raw=True)
         else:
             h = xyz
 
@@ -311,6 +310,7 @@ class SirenMLP(eqx.Module):
     fourier_bands: Tuple[float, ...] = ()
     fourier_scale: float = 2 * jnp.pi
     R0_for_fourier: float = 1.0
+    add_raw_xyz: bool = True
 
     def __init__(self,
                  key,
@@ -322,19 +322,19 @@ class SirenMLP(eqx.Module):
                  use_fourier: bool = False,
                  fourier_bands: Sequence[float] = (),
                  fourier_scale: float = 2 * jnp.pi,
-                 R0_for_fourier: float = 1.0):
+                 R0_for_fourier: float = 1.0,
+                 add_raw_xyz=True):
         keys = jax.random.split(key, len(widths) + 1)
         self.omega0 = float(omega0)
         self.use_fourier = bool(use_fourier)
         self.fourier_bands = tuple(float(b) for b in fourier_bands)
         self.fourier_scale = float(fourier_scale)
         self.R0_for_fourier = float(R0_for_fourier)
-
-        # Adjust input dim for Fourier features
-        in_dim = int(in_size)
+        self.add_raw_xyz = bool(add_raw_xyz)
+        in_dim = in_size
         if self.use_fourier and len(self.fourier_bands) > 0:
             B = len(self.fourier_bands)
-            in_dim = 3 + 2 * 3 * B
+            in_dim = (3 if self.add_raw_xyz else 0) + 2 * 3 * B
 
         self.layers = []
 
@@ -361,7 +361,7 @@ class SirenMLP(eqx.Module):
         # x: (..., 3)
         orig_shape = x.shape[:-1]  # batch dims
         if self.use_fourier and len(self.fourier_bands) > 0:
-            x = _fourier_embed_xyz(x, self.fourier_bands, self.fourier_scale, self.R0_for_fourier)
+            x = _fourier_embed_xyz(x, self.fourier_bands, self.fourier_scale, self.R0_for_fourier, add_raw=self.add_raw_xyz)
 
         x = x.reshape(-1, x.shape[-1])  # (N, Din)
 

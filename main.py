@@ -283,12 +283,12 @@ def main(config_path: str = "input.toml"):
     # Read the flattened keys produced by parse_config()
     runtime.lbfgs_l2 = float(params.get("lbfgs_l2", 1e-8))
 
-    dump_effective_toml(
-        path="effective_config.dump.toml",
-        params=params,
-        runtime=runtime,
-        extra={"note": "Snapshot taken before training and LBFGS polish."}
-    )
+    # dump_effective_toml(
+    #     path="effective_config.dump.toml",
+    #     params=params,
+    #     runtime=runtime,
+    #     extra={"note": "Snapshot taken before training and LBFGS polish."}
+    # )
 
     act_name = getattr(MLP_ACT, "__name__", str(MLP_ACT))
     print("=== PINN Laplace (single or multi-surface) ===")

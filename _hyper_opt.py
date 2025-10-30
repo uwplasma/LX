@@ -157,7 +157,7 @@ def suggest_params(trial: Trial, base_raw_cfg: Dict[str, Any], *, vary_steps: bo
     _set_if_absent(hpo_tbl, "hpo_disable_lbfgs", True)
 
     # ---------------- Model space ----------------
-    act = trial.suggest_categorical("model.activation", ["tanh", "relu", "gelu", "silu", "softplus", "sin"])
+    act = trial.suggest_categorical("model.activation", ["tanh", "relu", "silu", "softplus", "sin"])
     model_tbl["activation"] = act
 
     siren = trial.suggest_categorical("model.siren", [True, False])

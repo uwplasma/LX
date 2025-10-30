@@ -21,6 +21,44 @@ except Exception:  # pragma: no cover
         _tomllib = None  # type: ignore
 
 import tomli_w
+import os
+
+_BAD_FOR_LAPLACIAN = {
+    "relu", "leaky_relu", "prelu", "rrelu",
+    "hard_tanh", "hardtanh", "relu6", "hard_swish", "hardswish"
+}
+
+def normalize_activation_for_laplacian(cfg: dict) -> dict:
+    """
+    If the activation is piecewise-linear and we're training with a Laplacian term,
+    auto-switch to a smooth activation unless explicitly allowed via env.
+    """
+    m = cfg.setdefault("model", {})
+    act = str(m.get("activation", "tanh")).lower()
+    allow_relu = os.getenv("LX_ALLOW_RELU_LAPLACIAN", "0") == "1"
+
+    if act in _BAD_FOR_LAPLACIAN and not allow_relu:
+        # Choose fallback (can be overridden in TOML with model.activation_fallback)
+        fallback = str(m.get("activation_fallback", "silu")).lower()
+        m["activation"] = fallback
+
+        # If the fallback is SIREN, ensure flags are consistent.
+        if fallback in ("sin", "sine", "siren"):
+            m["activation"] = "sin"
+            m["siren"] = True
+            m.setdefault("siren_omega0", 30.0)
+
+        print(f"[WARN] activation='{act}' is piecewise-linear; Δu term vanishes."
+              f" Switching to activation='{m['activation']}'."
+              f" Set LX_ALLOW_RELU_LAPLACIAN=1 to keep it.")
+
+    # Keep SIREN consistent if user already requested it
+    if str(m.get("activation", "")).lower() in ("sin", "sine"):
+        m["activation"] = "sin"
+        # m["siren"] = True
+        # m.setdefault("siren_omega0", 30.0)
+
+    return cfg
 
 def dump_params_to_toml(path: str | Path, params: Dict[str, Any]) -> None:
     path = Path(path)
@@ -172,4 +210,4 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_params_from_path(path: str = "input.toml") -> Dict[str, Any]:
-    return parse_config(load_config(path))
+    return parse_config(normalize_activation_for_laplacian(load_config(path)))

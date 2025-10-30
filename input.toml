@@ -1,30 +1,16 @@
 [hyperparameter_optimization]
-hpo_disable_plots = true
-hpo_disable_ckpt = true
-hpo_disable_lbfgs = true
+hpo_disable_plots = false
+hpo_disable_ckpt = false
+hpo_disable_lbfgs = false
 
 [surfaces]                # use either "torus" or "single" mode
-mode = "torus"
+mode = "single"
 
-# Torus family to pretrain on:
-# (You can list dozens; keep R0 fixed at 1.0 if you want.)
-[[surfaces.torus_list]]
-name = "T1"
-a0 = 0.35
-a1 = 0.20
-N_harm = 3
-
-[[surfaces.torus_list]]
-name = "T2"
-a0 = 0.30
-a1 = 0.10
-N_harm = 2
-
-[[surfaces.torus_list]]
-name = "T3"
-a0 = 0.40
-a1 = 0.25
-N_harm = 4
+torus_list = [
+    { name = "T1", a0 = 0.35, a1 = 0.2, N_harm = 3 },
+    { name = "T2", a0 = 0.3, a1 = 0.1, N_harm = 2 },
+    { name = "T3", a0 = 0.4, a1 = 0.25, N_harm = 4 },
+]
 
 [checkpoint]
 path = "pinn_torus_model.eqx"  # model checkpoint file path
@@ -54,10 +40,10 @@ zero_mean_weight = 0.1      # was hard-coded default via runtime
 
 [model]
 hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
-activation = "sin" # one of: tanh, relu, gelu, sigmoid, silu, softplus, identity, sin
+activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
-use_fourier = true            # turn positional encoding on/off
+use_fourier = false            # turn positional encoding on/off
 fourier_bands = [1.0, 2.0, 4.0, 8.0]   # frequency multipliers (in 1/R0 units)
 fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0)
 R0_for_fourier = 1.0
@@ -69,29 +55,31 @@ lam_bc = 5.0
 log_every = 50
 mini_epoch = 5
 lam_warm = 50.0      # initial (warm-start) λ for boundary loss
+
 # --- LBFGS (polish) ---
 lbfgs_steps = 200        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 20
-# --- LBFGS (polish on all surfaces) ---
+
 # (optional caps; 0 = use all)
 lbfgs_interior = 0     # per surface interior points used by LBFGS
 lbfgs_boundary = 0     # per surface boundary points used by LBFGS
 lbfgs_weighting = "equal" # reserved for future weighting policies
+
 use_augmented_lagrangian = true   # false keeps old behavior
 al_rho = 1.0                      # penalty (ρ) for the AL quadratic term
 al_update_every = 10              # how often to update λ_AL (in steps)
 al_clip = 0.0                     # optional: clip |λ_AL| to this value; 0 disables
-#
+
 grad_clip_norm = 1.0
 weight_decay = 0.0           # decoupled WD in AdamW (set >0 to use)
 lr_warmup_steps = 0          # e.g., 200
 lr_min_ratio = 0.05          # cosine floor: lr_min = lr * lr_min_ratio
-use_ema = true
+use_ema = false
 ema_decay = 0.999                 # Polyak EMA decay
 ema_eval = true                   # use EMA params for eval & LBFGS init
 
-use_lookahead = true
+use_lookahead = false
 lookahead_sync_period = 5        # k steps between slow-weight syncs
 lookahead_slow_step = 0.5        # α (0..1), typical 0.5
 
