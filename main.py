@@ -51,6 +51,7 @@ import equinox as eqx
 import matplotlib.pyplot as plt
 from jaxopt import LBFGS
 import numpy as np
+import dataclasses
 
 # ---------------- local imports ----------------
 from _initialization import build_params_from_path
@@ -120,6 +121,24 @@ box_seed: int
 
 # surfaces config (raw dict from TOML; parsed here)
 surfaces_cfg: dict
+
+def _set_opt_state_count(opt_state, step: int):
+    """Set .count in any Optax state leaves that have it, preserving structure."""
+    step_arr = jnp.asarray(int(step))
+    def _bump(leaf):
+        c = getattr(leaf, "count", None)
+        if c is None:
+            return leaf
+        try:
+            return dataclasses.replace(leaf, count=step_arr.astype(c.dtype))
+        except Exception:
+            # Some optax states are tuples/namedtuples; fallback: try attribute set
+            try:
+                object.__setattr__(leaf, "count", step_arr.astype(getattr(leaf, "count").dtype))
+            except Exception:
+                pass
+            return leaf
+    return jax.tree_util.tree_map(_bump, opt_state)
 
 def _grid_shape_from_len(Nb: int, ntheta_hint: int, nphi_hint: int):
     """Pick (nθ, nφ) so that nθ*nφ == Nb, preferring hints. Returns (nθ, nφ) or (None, None)."""
@@ -472,9 +491,13 @@ def main(config_path: str = "input.toml"):
     print(f"Training steps: {steps}, λ_bc={lam_bc}")
     sys.stdout.flush()
 
+    print(f"[CKPT] Model path:   {CHECKPOINT_PATH}")
+    print(f"[CKPT] State  path:   {STATE_PATH}")
+
     # RNG (for model init and misc)
     key = random.PRNGKey(rng_seed)
     key, k_model = random.split(key)
+    key_train = random.PRNGKey(1234)
 
     # --- training history (Adam/optax) ---
     adam_loss_hist = []
@@ -551,47 +574,78 @@ def main(config_path: str = "input.toml"):
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
+    like_state = TrainState(
+        opt_state=opt_state,
+        ema_f=(ema_f if bool(params.get("use_ema", False)) else None),
+        slow_f=(slow_f if bool(params.get("use_lookahead", False)) else None),
+        step=jnp.asarray(0, dtype=jnp.int64),
+        al_lambda=jnp.asarray(0.0, dtype=jnp.float64),
+        params_fp=None,
+        version=2,
+        key_train=None,
+    )
+
+    ts = load_train_state(STATE_PATH, like=like_state)
+
     # --- Try to resume optimizer/AL/RNG state ---
     resume = False
-    ts = load_train_state(STATE_PATH)
     if ts is not None:
-        resume = True  # <-- set early so schedule pins λ even if compare fails
+        resume = True
 
-        # restore state first
-        opt_state = ts.opt_state
-        restored_step = int(getattr(ts, "step", 0))
+        # Make absolutely sure we coerce leaf types to python scalars for runtime/use
+        try:
+            restored_step = int(ts.step if isinstance(ts.step, (int, np.integer)) else int(jnp.asarray(ts.step)))
+        except Exception:
+            restored_step = int(getattr(ts, "step", 0))
+        try:
+            _al_val = float(ts.al_lambda if isinstance(ts.al_lambda, (float, np.floating))
+                            else float(jnp.asarray(ts.al_lambda)))
+        except Exception:
+            _al_val = float(getattr(ts, "al_lambda", 0.0))
+
         runtime.restored_step = restored_step
-        runtime.al_lambda = float(ts.al_lambda)
-        key_train = ts.key_train
+        runtime.al_lambda = _al_val
+
+        # core state trees/keys
+        opt_state = ts.opt_state
+
+        print(f"[RESUME] Loaded state: step={restored_step}, λ_AL={_al_val:.6g}")
+        if hasattr(ts, "version"):
+            print(f"[RESUME] TrainState version (static) = {getattr(ts, 'version')}")
 
         if bool(params.get("use_ema", False)) and (getattr(ts, "ema_f", None) is not None):
             ema_f = ts.ema_f
         if bool(params.get("use_lookahead", False)) and (getattr(ts, "slow_f", None) is not None):
             slow_f = ts.slow_f
 
-        # fingerprint compare (best-effort; never block resume flag)
+        # Check whether we need to reset moments
         try:
-            params_f_curr, _ = eqx.partition(model, eqx.is_inexact_array)  # model already loaded
+            params_f_curr, _ = eqx.partition(model, eqx.is_inexact_array)
             fp_curr = leaves_fingerprint(params_f_curr)
             saved_fp = getattr(ts, "params_fp", None)
             if (saved_fp is None) or (abs(fp_curr - float(saved_fp)) > 1e-6):
+                # reset moments but KEEP the step by writing it back into the new state
                 opt_state = optimizer.init(params_f_curr)
-                print("[RESUME] Params changed since last opt_state; resetting Adam moments.")
+                opt_state = _set_opt_state_count(opt_state, restored_step)
+                print(f"[RESUME] Params changed. Reset Adam moments, restored step={restored_step}.")
             else:
-                print("[RESUME] Continuing Adam with matching moments.")
+                # opt_state from disk already has the correct count; still record it
+                opt_state = _set_opt_state_count(opt_state, restored_step)  # idempotent
+                print(f"[RESUME] Continuing Adam with matching moments (step={restored_step}).")
         except Exception as e:
-            # Fall back safely
             params_f_curr, _ = eqx.partition(model, eqx.is_inexact_array)
             opt_state = optimizer.init(params_f_curr)
-            print(f"[RESUME] Compare failed ({e}); resetting Adam moments as a safe default.")
+            opt_state = _set_opt_state_count(opt_state, restored_step)
+            print(f"[RESUME] Compare failed ({e}); reset moments, restored step={restored_step}.")
     else:
         key_train = random.PRNGKey(1234)
-
 
     print(f"[LR] base={base_lr:.3g} warmup_steps={warmup_steps} "
         f"min_ratio={min_ratio:.3g} total_steps={total_steps} "
         f"clip={grad_clip:.3g} wd={wd_decay:.3g}")
 
+    if resume:
+        print(f"[RESUME] Restored step = {getattr(runtime, 'restored_step', 0)}")
 
     lookahead_enabled   = bool(params.get("use_lookahead", False))
     lookahead_k         = int(params.get("lookahead_sync_period", 5))
@@ -746,6 +800,8 @@ def main(config_path: str = "input.toml"):
         model = model_to_save
         if not HPO_DISABLE_CKPT:
             save_model(model_to_save, CHECKPOINT_PATH)
+            print(f"[STATE][PRE-SAVE] infer_step_from_opt_state={infer_step_from_opt_state(opt_state)}  "
+                f"λ_AL={runtime.al_lambda:.6g}")
             # Persist optimizer state, EMA/Lookahead, AL λ, and the RNG to continue exactly
             save_train_state(
                 STATE_PATH,
@@ -755,7 +811,6 @@ def main(config_path: str = "input.toml"):
                 # step=int(getattr(opt_state, "count", 0)) if hasattr(opt_state, "count") else 0,
                 step = infer_step_from_opt_state(opt_state),
                 al_lambda=float(runtime.al_lambda),
-                key_train=key_train,
                 params_fp=fp,
             )
 
@@ -1052,6 +1107,8 @@ def main(config_path: str = "input.toml"):
         model = model_to_save
         if not HPO_DISABLE_CKPT:
             save_model(model_to_save, CHECKPOINT_PATH)
+            print(f"[STATE][PRE-SAVE] infer_step_from_opt_state={infer_step_from_opt_state(opt_state)}  "
+                f"λ_AL={runtime.al_lambda:.6g}")
             # Persist optimizer state, EMA/Lookahead, AL λ, and the RNG to continue exactly
             save_train_state(
                 STATE_PATH,
@@ -1061,7 +1118,6 @@ def main(config_path: str = "input.toml"):
                 # step=int(getattr(opt_state, "count", 0)) if hasattr(opt_state, "count") else 0,
                 step = infer_step_from_opt_state(opt_state),
                 al_lambda=float(runtime.al_lambda),
-                key_train=key_train,
                 params_fp=fp,
             )
 

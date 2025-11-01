@@ -1,35 +1,50 @@
 # _train_state.py
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Optional, Tuple
-import jax
+from typing import Any, Optional
 import equinox as eqx
 import jax.numpy as jnp
 
-# What we persist
-# - opt_state:       Optax optimizer state (pytree)
-# - ema_f:           EMA of trainable params (or None)
-# - slow_f:          Lookahead slow weights (or None)
-# - step:            Global Adam step count (int inferred from opt_state if missing)
-# - al_lambda:       Augmented Lagrange multiplier λ_AL
-# - key_train:       PRNGKey to continue exact sampling sequence
-
-def leaves_fingerprint(params_f) -> float:
-    # Simple, stable scalar summary of trainable leaves
-    return float(sum([jnp.sum(x * x) for x in jax.tree_util.tree_leaves(params_f)]))
-
 class TrainState(eqx.Module):
+    # Big trees (leaves)
     opt_state: Any
     ema_f: Any
     slow_f: Any
-    step: int
-    al_lambda: float
-    key_train: Any
-    params_fp: Optional[float] = None
 
-def _default_none():
-    return None
+    # Small leaves (scalars)
+    step: jnp.ndarray
+    al_lambda: jnp.ndarray
 
+    # Static (not serialized)
+    params_fp: Optional[float] = eqx.field(static=True, default=None)
+    version: int = eqx.field(static=True, default=2)
+    key_train: Any = eqx.field(static=True, default=None)
+
+def _template(dtype_int, dtype_float, like: Optional[TrainState] = None) -> TrainState:
+    """Template matching dtypes and (if given) the **structure** of `like`."""
+    if like is not None:
+        # Keep the big-tree structures from `like`
+        return TrainState(
+            opt_state=like.opt_state,
+            ema_f=like.ema_f,
+            slow_f=like.slow_f,
+            step=jnp.asarray(0, dtype=dtype_int),
+            al_lambda=jnp.asarray(0.0, dtype=dtype_float),
+            params_fp=None,
+            version=2,
+            key_train=None,  # static
+        )
+    # Fallback minimal template (rarely used; only works if file also used Nones)
+    return TrainState(
+        opt_state=None,
+        ema_f=None,
+        slow_f=None,
+        step=jnp.asarray(0, dtype=dtype_int),
+        al_lambda=jnp.asarray(0.0, dtype=dtype_float),
+        params_fp=None,
+        version=2,
+        key_train=None,
+    )
 
 def save_train_state(path: str | Path,
                      opt_state,
@@ -37,41 +52,46 @@ def save_train_state(path: str | Path,
                      slow_f,
                      step: int,
                      al_lambda: float,
-                     key_train,
-                     params_fp: float | None = None) -> None:   # <-- NEW ARG (optional)
+                     params_fp: float | None = None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = TrainState(opt_state=opt_state,
-                         ema_f=ema_f,
-                         slow_f=slow_f,
-                         step=int(step),
-                         al_lambda=float(al_lambda),
-                         key_train=key_train,
-                         params_fp=params_fp)                     # <-- SAVE IT
+    payload = TrainState(
+        opt_state=opt_state,
+        ema_f=ema_f,
+        slow_f=slow_f,
+        step=jnp.asarray(int(step), dtype=jnp.int64),
+        al_lambda=jnp.asarray(float(al_lambda), dtype=jnp.float64),
+        params_fp=params_fp,
+        version=2,
+        key_train=None,
+    )
+    print(f"[STATE][SAVE] step={int(payload.step)} (dtype={payload.step.dtype}), "
+          f"al_lambda={float(payload.al_lambda):.6g} (dtype={payload.al_lambda.dtype}), "
+          f"params_fp={params_fp} [static], version=2 [static], path={path}")
     eqx.tree_serialise_leaves(str(path), payload)
     print(f"[STATE] Saved training state to: {path}")
 
-def _empty_train_state_template() -> TrainState:
-    # Minimal placeholders of correct dtypes/shapes
-    return TrainState(
-        opt_state=None,
-        ema_f=None,
-        slow_f=None,
-        step=0,
-        al_lambda=0.0,
-        key_train=jax.random.PRNGKey(0),
-        params_fp=None,
-    )
-
-def load_train_state(path: str | Path) -> Optional[TrainState]:
+def load_train_state(path: str | Path, like: Optional[TrainState] = None) -> Optional[TrainState]:
     path = Path(path)
     if not path.exists():
         return None
-    try:
-        template = _empty_train_state_template()
-        payload = eqx.tree_deserialise_leaves(str(path), template)
-        print(f"[STATE] Loaded training state from: {path}")
-        return payload
-    except Exception as e:
-        print(f"[STATE] Failed to load training state ({path}). Starting fresh. Reason: {e}")
-        return None
+
+    last_err = None
+    for d_int, d_float, tag in [(jnp.int64, jnp.float64, "64bit"),
+                                (jnp.int32, jnp.float32, "32bit-FALLBACK")]:
+        try:
+            tmpl = _template(d_int, d_float, like=like)
+            payload = eqx.tree_deserialise_leaves(str(path), tmpl)
+            print(f"[STATE][LOAD] OK ({tag}) from: {path}  "
+                  f"(step={int(payload.step)}, al_lambda={float(payload.al_lambda):.6g}, "
+                  f"version={getattr(payload, 'version', None)})")
+            if getattr(payload, "version", 0) != 2:
+                print(f"[STATE][LOAD][WARN] version={getattr(payload,'version',None)} != 2 (continuing).")
+            return payload
+        except Exception as e:
+            last_err = e
+            continue
+
+    print(f"[STATE] Failed to load training state ({path}). Starting fresh. Reason: {last_err!r}")
+    print("[STATE][HINT] If this persists, delete the .trainstate.eqx file so we can regenerate it.")
+    return None

@@ -24,8 +24,9 @@ mode = "files"
 #  { name = "S2", path = "coil_shell.npy",      format = "points", normals_path = "" },
 #  { name = "S3", path = "freeform.csv",        format = "points" }
 #]
-files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
+#files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
 #files = ["qsc_surfaces_from_api.npz"]
+files = [{ name = "preciseQA", path = "wout_surface.csv", format = "points", normals_path = ""}]
 
 torus_list = [
     { name = "T1", a0 = 0.35, a1 = 0.20, N_harm = 3 },

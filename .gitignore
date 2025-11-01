@@ -212,3 +212,5 @@ __marimo__/
 pinn_torus_model.*
 qsc_surfaces_from_api.npz
 pyqsc_surface.csv
+wout.nc
+wout_surface.csv
