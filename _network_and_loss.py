@@ -9,7 +9,8 @@ from typing import List, Tuple, Optional, Sequence, Callable
 from jax import lax
 
 from _physics import u_total, grad_u_total_batch, lap_u_total_batch, u_total_batch
-from _state import runtime 
+from _state import runtime
+from _pyqsc_min import grad_u_forward_batch
 
 def _fourier_embed_xyz(
     xyz: jnp.ndarray,
@@ -77,6 +78,98 @@ def eval_total(params, pts_interior, pts_bdry, normals_bdry):
         total = total + runtime.al_lambda * c_bc_mean + 0.5 * runtime.al_rho * (c_bc_mean * c_bc_mean)
 
     return total
+
+
+def make_lr_schedule(
+    base_lr: float,
+    total_steps: int,
+    warmup_steps: int = 0,
+    min_ratio: float = 0.0,
+):
+    """
+    Linear warmup to base_lr, then cosine decay to base_lr*min_ratio.
+    All args are Python numbers (not JAX arrays).
+    Returns an Optax schedule function: step -> lr (float).
+    """
+    warmup_steps = int(max(0, warmup_steps))
+    total_steps  = int(max(1, total_steps))
+    min_ratio    = float(max(0.0, min(1.0, min_ratio)))
+
+    # Piecewise schedule: warmup then cosine
+    warm = optax.linear_schedule(
+        init_value=0.0,
+        end_value=base_lr,
+        transition_steps=max(1, warmup_steps),
+    )
+    # Protect against warmup >= total
+    decay_steps = max(1, total_steps - warmup_steps)
+    decay = optax.cosine_decay_schedule(
+        init_value=base_lr,
+        decay_steps=decay_steps,
+        alpha=min_ratio,  # final fraction of init_value
+    )
+
+    def schedule(step):
+        # step is an integer jnp.array; route to warmup or decay
+        return jax.lax.cond(
+            step < warmup_steps,
+            lambda _: warm(step),
+            lambda _: decay(step - warmup_steps),
+            operand=None,
+        )
+    return schedule
+
+def build_optimizer(
+    *,
+    base_lr: float,
+    total_steps: int,
+    warmup_steps: int = 0,
+    min_ratio: float = 0.0,
+    weight_decay: float = 0.0,
+    grad_clip_norm: float = 1.0,
+):
+    # --- DTYPE harmonization -------------------------------------------------
+    # Use the lr's dtype as the authority and cast everything else to it.
+    lr_dtype = jnp.asarray(base_lr).dtype
+    base_lr_a   = jnp.asarray(base_lr,   dtype=lr_dtype)
+    min_ratio_a = jnp.asarray(min_ratio, dtype=lr_dtype)
+    one_a       = jnp.asarray(1.0,       dtype=lr_dtype)
+    half_a      = jnp.asarray(0.5,       dtype=lr_dtype)
+    ten_pct_a   = jnp.asarray(0.1,       dtype=lr_dtype)
+    pi_a        = jnp.asarray(jnp.pi,    dtype=lr_dtype)
+
+    total_steps_i = jnp.asarray(total_steps, dtype=jnp.int32)
+    warmup_steps_i = jnp.asarray(max(0, int(warmup_steps)), dtype=jnp.int32)
+
+    def schedule(count):
+        # count is int32 (Optax); build scalar time as lr_dtype
+        count_i = jnp.asarray(count, dtype=jnp.int32)
+        t = jnp.asarray(count_i, dtype=lr_dtype)
+        T = jnp.asarray(jnp.maximum(total_steps_i, 1), dtype=lr_dtype)
+        W = jnp.asarray(jnp.maximum(warmup_steps_i, 1), dtype=lr_dtype)
+
+        # Cosine decay part (with floor alpha = min_ratio)
+        phase  = jnp.clip(t / T, 0, 1)
+        cosdec = half_a * (one_a + jnp.cos(pi_a * phase))
+        lr_cos = base_lr_a * (min_ratio_a + (one_a - min_ratio_a) * cosdec)
+
+        # Linear warmup from 0.1*lr -> 1.0*lr over W steps
+        warm_phase = jnp.clip(t / W, 0, 1)
+        lr_warm = (ten_pct_a * base_lr_a) + (base_lr_a - ten_pct_a * base_lr_a) * warm_phase
+
+        # Branch-free selection (dtype-safe)
+        use_warm = (count_i < warmup_steps_i)
+        return jnp.where(use_warm, lr_warm, lr_cos)
+
+    # Clip → AdamW chain
+    tx = optax.chain(
+        optax.clip_by_global_norm(float(grad_clip_norm)),
+        optax.adamw(
+            learning_rate=schedule,
+            weight_decay=float(weight_decay),
+        ),
+    )
+    return tx, schedule
 
 def _bdry_presample_mult() -> int:
     return int(getattr(runtime, "bdry_presample_mult", 16))
@@ -202,20 +295,39 @@ def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
     idx_i = random.choice(key_i, ni, (n_in_take,), replace=False)
     Pi = pts_interior[idx_i]
 
+    # ---- Forward gradient matching (interior) ----
+    if runtime.lam_grad > 0.0:
+        # choose what to match:
+        g_model = grad_u_total_batch(params, Pi)         # total model grad
+        # If matching NN-only: g_model = grad_u_nn_batch(params, Pi)
+
+        g_target = grad_u_forward_batch(Pi, surf_id=0)   # <= choose how to pass ID; 0 for single-surface
+        if not runtime.grad_target_backprop:
+            g_target = jax.lax.stop_gradient(g_target)
+        loss_grad = jnp.mean(jnp.sum((g_model - g_target)**2, axis=-1))
+    else:
+        loss_grad = 0.0
+
     # ---- Boundary: importance sampling with Python ints only ----
     # pre-sample size m and final size K must be Python ints (not JAX arrays)
-    m = int(min(_bdry_presample_mult() * runtime.BATCH_BDRY, nb))
-    m = max(m, 1)  # avoid zero-size
+    # m = int(min(_bdry_presample_mult() * runtime.BATCH_BDRY, nb))
+    # m = max(m, 1)  # avoid zero-size
+    M = int(_bdry_presample_mult() * runtime.BATCH_BDRY)  # fixed upper bound
+    M = max(M, 1)
     key_b_pre, key_b_top = random.split(key_b)
 
-    pre_idx = random.choice(key_b_pre, nb, (m,), replace=False)
+    # pre_idx = random.choice(key_b_pre, nb, (m,), replace=False)
+    # Pb_pre, Nb_pre = pts_bdry[pre_idx], normals_bdry[pre_idx]
+    replace_flag = (nb < M)
+    pre_idx = random.choice(key_b_pre, nb, (M,), replace=replace_flag)
     Pb_pre, Nb_pre = pts_bdry[pre_idx], normals_bdry[pre_idx]
 
     # estimate residuals on the pre-sample
     gb_pre = grad_u_total_batch(params, Pb_pre)
     r_pre = jnp.sum(Nb_pre * gb_pre, axis=-1) ** 2
 
-    K = int(min(runtime.BATCH_BDRY, m))
+    # K = int(min(runtime.BATCH_BDRY, m))
+    K = int(min(runtime.BATCH_BDRY, M))
     K = max(K, 1)
     _, topk_idx = lax.top_k(r_pre, K)
     # topk_idx = jnp.argsort(-r_pre)[:K]
@@ -228,7 +340,7 @@ def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
 
     # ---- Physics residuals ----
     lap = lap_u_total_batch(params, Pi)
-    g_b = grad_u_total_batch(params, Pb)
+    g_b = gb_pre[topk_idx]
     n_dot = jnp.sum(Nb_hat * g_b, axis=-1)
 
     loss_in_raw = jnp.mean(lap * lap)
@@ -244,14 +356,16 @@ def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
         # L_AL = λ * c + 0.5 * ρ * c^2  (added to total loss)
         total = total + runtime.al_lambda * c_bc_mean + 0.5 * runtime.al_rho * (c_bc_mean * c_bc_mean)
 
+    total = total + float(runtime.lam_grad) * loss_grad
+
     # Return c_bc_mean in aux so the outer loop can update λ
-    return total, (loss_in_raw, loss_bc_raw, lap, n_dot, mean_u, c_bc_mean)
+    return total, (loss_in_raw, loss_bc_raw, lap, n_dot, mean_u, c_bc_mean, loss_grad)
 
 
 # Filtered versions keep non-JAX parts (if any) out of JIT
 loss_value_and_grad = eqx.filter_value_and_grad(loss_fn_batch, has_aux=True)
 
-@eqx.filter_jit
+@eqx.filter_jit(donate="all")
 def train_step(params, opt_state, optimizer, pts_interior, pts_bdry, normals_bdry, key):
     (loss_val, aux), grads = loss_value_and_grad(params, pts_interior, pts_bdry, normals_bdry, key)
     params_f, params_s = eqx.partition(params, eqx.is_inexact_array)
@@ -406,26 +520,44 @@ def _loss_many_single_surface(params,
                               Pi_all: jnp.ndarray,
                               Pb_all: jnp.ndarray,
                               Nb_all: jnp.ndarray,
+                              surf_id: int,
                               key: jax.Array) -> tuple[jnp.ndarray, tuple]:
     """One-surface contribution (sampling + residuals)."""
     ki, kb = random.split(key)
     # --- interior
     Pi = _pick_interior_batch(Pi_all, runtime.BATCH_IN, ki)
+
+    if runtime.lam_grad > 0.0:
+        g_model = grad_u_total_batch(params, Pi)             # or grad_u_nn_batch
+        g_target = grad_u_forward_batch(Pi, surf_id=surf_id)
+        if not runtime.grad_target_backprop:
+            g_target = jax.lax.stop_gradient(g_target)
+        loss_grad = jnp.mean(jnp.sum((g_model - g_target)**2, axis=-1))
+    else:
+        loss_grad = 0.0
+
     # --- boundary (importance)
     nb = int(Pb_all.shape[0])
     if nb > 0:
-        m = int(min(_bdry_presample_mult() * runtime.BATCH_BDRY, nb))
-        m = max(m, 1)
         k_pre, k_top = random.split(kb)
-        pre_idx = random.choice(k_pre, nb, (m,), replace=False)
+        M = int(_bdry_presample_mult() * runtime.BATCH_BDRY)  # fixed upper bound
+        M = max(M, 1)
+        replace_flag = (nb < M)  # keeps shape static if nb<M
+        pre_idx = random.choice(k_pre, nb, (M,), replace=replace_flag)
         Pb_pre, Nb_pre = Pb_all[pre_idx], Nb_all[pre_idx]
+
         gb_pre = grad_u_total_batch(params, Pb_pre)
         r_pre = jnp.sum(Nb_pre * gb_pre, axis=-1) ** 2
-        K = int(min(runtime.BATCH_BDRY, m)); K = max(K, 1)
+        K = int(min(runtime.BATCH_BDRY, M))
+        K = max(K, 1)
         _, topk_idx = lax.top_k(r_pre, K)
+
         Pb, Nb_hat = Pb_pre[topk_idx], Nb_pre[topk_idx]
+        g_b = gb_pre[topk_idx]  # <— reuse, NO extra grad pass
     else:
+        # No boundary points: fall back (array may be empty; this is fine)
         Pb, Nb_hat = Pb_all, Nb_all
+        g_b = grad_u_total_batch(params, Pb)  # harmless if size 0
 
     # --- zero-mean reg on interior
     u_vals = u_total_batch(params, Pi)
@@ -434,7 +566,6 @@ def _loss_many_single_surface(params,
 
     # --- physics residuals
     lap = lap_u_total_batch(params, Pi)
-    g_b = grad_u_total_batch(params, Pb)
     n_dot = jnp.sum(Nb_hat * g_b, axis=-1)
 
     loss_in_raw = jnp.mean(lap * lap)
@@ -442,62 +573,52 @@ def _loss_many_single_surface(params,
     c_bc_mean = jnp.mean(n_dot)
 
     total = loss_in_raw + runtime.lam_bc * loss_bc_raw + _zero_mean_w() * loss_zero
+    
     if runtime.al_enabled:
         total = total + runtime.al_lambda * c_bc_mean + 0.5 * runtime.al_rho * (c_bc_mean * c_bc_mean)
 
-    return total, (loss_in_raw, loss_bc_raw, lap, n_dot, mean_u, c_bc_mean)
+    total = total + float(runtime.lam_grad) * loss_grad
+
+    return total, (loss_in_raw, loss_bc_raw, lap, n_dot, mean_u, c_bc_mean, loss_grad)
 
 def loss_many(params,
-              packs: tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], ...],
+              packs: tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, int], ...],
               key: jax.Array):
     """
     packs: tuple of (P_in_all, P_b_all, N_b_all) for each surface (fixed arrays).
     Returns mean over surfaces to keep scale stable, with aux aggregated (means).
     """
     keys = random.split(key, len(packs))
-    totals = []
-    auxes = []
-    for (Pi_all, Pb_all, Nb_all), k in zip(packs, keys):
-        t, aux = _loss_many_single_surface(params, Pi_all, Pb_all, Nb_all, k)
-        totals.append(t)
-        auxes.append(aux)
+    totals, auxes = [], []
+    for (Pi_all, Pb_all, Nb_all, surf_id), k in zip(packs, keys):
+        t, aux = _loss_many_single_surface(params, Pi_all, Pb_all, Nb_all, int(surf_id), k)
+        totals.append(t); auxes.append(aux)
 
     total = sum(totals) / float(len(packs))
-    # aggregate aux as means (each aux = (Lin, Lbc, lap_vec, n_vec, mean_u, c))
-    # We only keep scalar summaries in the returned aux for logging
-    Lin_mean  = sum(a[0] for a in auxes) / float(len(auxes))
-    Lbc_mean  = sum(a[1] for a in auxes) / float(len(auxes))
-    # # For lap/n_dot vectors we compute aggregate RMS on concatenated vectors
-    # lap_cat   = jnp.concatenate([a[2] for a in auxes]) if len(auxes) > 0 else jnp.zeros((1,))
-    # n_cat     = jnp.concatenate([a[3] for a in auxes]) if len(auxes) > 0 else jnp.zeros((1,))
-    # mean_u    = sum(a[4] for a in auxes) / float(len(auxes))
-    # c_bc_mean = sum(a[5] for a in auxes) / float(len(auxes))
-    # return total, (Lin_mean, Lbc_mean, lap_cat, n_cat, mean_u, c_bc_mean)
 
-    # Instead of concatenating, aggregate RMS numerically stable:
     def _rms_from_chunks(chunks):
-        # chunks is list of 1D arrays; handle empty gracefully
         if len(chunks) == 0:
             return jnp.array(0.0)
         ss = sum(jnp.sum(x*x) for x in chunks)
         n  = sum(x.size for x in chunks)
         return jnp.sqrt(ss / jnp.maximum(1, n))
 
-    lap_rms = _rms_from_chunks([a[2] for a in auxes])
-    nbc_rms = _rms_from_chunks([a[3] for a in auxes])
-
+    Lin_mean  = sum(a[0] for a in auxes) / float(len(auxes))
+    Lbc_mean  = sum(a[1] for a in auxes) / float(len(auxes))
+    lap_rms   = _rms_from_chunks([a[2] for a in auxes])
+    nbc_rms   = _rms_from_chunks([a[3] for a in auxes])
     mean_u    = sum(a[4] for a in auxes) / float(len(auxes))
     c_bc_mean = sum(a[5] for a in auxes) / float(len(auxes))
-    # Keep a lightweight aux; skip returning giant vectors:
-    return total, (Lin_mean, Lbc_mean, lap_rms, nbc_rms, mean_u, c_bc_mean)
+    Lg_mean   = sum(a[6] for a in auxes) / float(len(auxes))  # now valid
+    return total, (Lin_mean, Lbc_mean, lap_rms, nbc_rms, mean_u, c_bc_mean, Lg_mean)
 
 loss_many_value_and_grad = eqx.filter_value_and_grad(loss_many, has_aux=True)
 
-@eqx.filter_jit
+@eqx.filter_jit(donate="all")
 def train_step_many(params,
                     opt_state,
                     optimizer,
-                    packs: tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], ...],
+                    packs: tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, int], ...],
                     key: jax.Array):
     (loss_val, aux), grads = loss_many_value_and_grad(params, packs, key)
     params_f, params_s = eqx.partition(params, eqx.is_inexact_array)

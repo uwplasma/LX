@@ -21,5 +21,7 @@ class Runtime:
     al_rho: float = 1.0
     al_update_every: int = 10
     al_clip: float = 0.0      # 0 => no clipping
+    lam_grad: float = 0.0
+    grad_target_backprop: bool = False
 
 runtime = Runtime()

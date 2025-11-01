@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 from copy import deepcopy
 from typing import Any, Dict, Tuple
+import optax
+import jax
 
 import numpy as np
 import optuna

@@ -70,17 +70,20 @@ from _network_and_loss import (
     train_step_many,
     _full_objective_like_training,
     eval_total,
+    build_optimizer,
 )
 from _physics import eval_on_boundary, grad_u_total_batch
 from _state import runtime
 from _multisurface import build_torus_family
 from _input_output import dump_effective_toml
 from _geometry_files import build_surfaces_from_files, build_surfaces_from_files_or_npz
+from _train_state import save_train_state, load_train_state, TrainState
 
 # =============================================================================
 # ========================== GLOBAL / PARAM BINDING ===========================
 # =============================================================================
 CHECKPOINT_PATH: Path
+STATE_PATH: Path
 BATCH_IN: int
 BATCH_BDRY: int
 R0: float
@@ -150,12 +153,12 @@ def _model_signature_tag(params_dict) -> str:
     kind = "SIREN" if bool(params_dict.get("siren", False)) else "MLP"
     act  = getattr(params_dict.get("mlp_activation"), "__name__", str(params_dict.get("mlp_activation")))
     widths = "x".join(str(w) for w in params_dict["mlp_hidden_sizes"])
-    # Fourier bands
-    fb = tuple(params_dict.get("fourier_bands", ()))
-    fb_tag = ("FF-" + "x".join(f"{b:g}" for b in fb)) if fb else "noFF"
-    # SIREN omega0 if applicable
+
+    use_ff = bool(params_dict.get("use_fourier", False))
+    fb     = tuple(params_dict.get("fourier_bands", ()))
+    fb_tag = ("FF-" + "x".join(f"{b:g}" for b in fb)) if (use_ff and fb) else "noFF"
+
     w0_tag = f"_w{params_dict.get('siren_omega0', 0):g}" if params_dict.get("siren", False) else ""
-    # Length scale used to nondimensionalize frequencies (optional but useful)
     r0f = float(params_dict.get("R0_for_fourier", 1.0))
     r0_tag = f"_R0f{r0f:g}"
     return f"{kind}-{act}_{fb_tag}_W[{widths}]{w0_tag}{r0_tag}"
@@ -168,6 +171,15 @@ def _take_first_n(x: jnp.ndarray, n: int) -> jnp.ndarray:
     if n <= 0 or n >= int(x.shape[0]):
         return x
     return x[:int(n)]
+
+def _build_packs(dataset, P_box, N_in):
+    out = []
+    for i, surf in enumerate(dataset):  # enumerate to get an id
+        mask = surf.inside_mask_fn(P_box)
+        ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
+        P_in_all = P_box[ids][:N_in]
+        out.append((P_in_all, surf.P_bdry, surf.N_bdry, int(i)))  # add surf_id
+    return tuple(out)
 
 def _stride_take(x: jnp.ndarray, k: int) -> jnp.ndarray:
     """Deterministic approx-uniform sub-sampling without randomness."""
@@ -184,6 +196,26 @@ def _lambda_bc_schedule(it, T):
     cosfac = 0.5 * (1 + jnp.cos(jnp.pi * jnp.clip(it / T, 0., 1.)))
     return float(end + (warm - end) * cosfac)
 
+def _compute_warmup_steps(params: dict, total_steps: int) -> int:
+    """
+    Accept either absolute warmup steps or a fractional warmup.
+    If both are present, absolute takes precedence.
+    Keys checked:
+      - 'lr_warmup_steps' (absolute)
+      - 'lr_warmup_frac'  (fraction of total_steps, e.g., 0.05)
+    """
+    # Prefer absolute steps only if > 0; otherwise fall back to fractional warmup.
+    if "lr_warmup_steps" in params:
+        try:
+            v = int(params["lr_warmup_steps"])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    frac = float(params.get("lr_warmup_frac", 0.0))
+    frac = max(0.0, min(1.0, frac))
+    return int(round(frac * max(1, int(total_steps))))
+
 def _ema_update(old, new, decay):
     return jax.tree_util.tree_map(lambda o, n: decay * o + (1.0 - decay) * n, old, new)
 
@@ -195,9 +227,52 @@ def _lookahead_sync(slow, fast, alpha):
 def _eval_total_mean_over_packs(model_eval, packs_all):
     # mean(eval_total) over surfaces, with CURRENT runtime.lam_bc
     s = 0.0
-    for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+    for (Pi, Pb, Nb, _sid) in packs_all:
         s += float(eval_total(model_eval, Pi, Pb, Nb))
     return s / float(len(packs_all))
+
+def infer_step_from_opt_state(opt_state) -> int:
+    """Best-effort extraction of a scalar optimizer step."""
+    # 1) Direct attr
+    c = getattr(opt_state, "count", None)
+    if c is not None:
+        if callable(c):
+            try:
+                c = c()
+            except TypeError:
+                pass
+        try:
+            if hasattr(c, "item"):
+                return int(c.item())
+            return int(c)
+        except Exception:
+            pass
+
+    # 2) Scan PyTree leaves for a field called 'count'
+    try:
+        leaves, treedef = jax.tree_util.tree_flatten(opt_state)
+        for leaf in leaves:
+            # Heuristic: structures with a 'count' attribute or key
+            lc = getattr(leaf, "count", None)
+            if lc is not None:
+                if callable(lc):
+                    try:
+                        lc = lc()
+                    except TypeError:
+                        pass
+                try:
+                    return int(lc.item() if hasattr(lc, "item") else lc)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3) Give up
+    return 0
+
+def leaves_fingerprint(params_f) -> float:
+    # sum of squares is simple, fast, and stable across trees with identical values
+    return float(sum([jnp.sum(x*x) for x in jax.tree_util.tree_leaves(params_f)]))
 
 class _LambdaGuard:
     def __init__(self, new_lambda):
@@ -272,7 +347,7 @@ def _quick_scatter(P, title="Boundary scatter (no grid)"):
     plt.show()
 
 def _apply_params(params: Dict[str, Any]) -> None:
-    global CHECKPOINT_PATH, BATCH_IN, BATCH_BDRY, R0, a0, a1, N_harm, kappa
+    global CHECKPOINT_PATH, STATE_PATH, BATCH_IN, BATCH_BDRY, R0, a0, a1, N_harm, kappa
     global N_in, N_bdry_theta, N_bdry_phi, rng_seed
     global MLP_HIDDEN_SIZES, MLP_ACT
     global steps, lr, lam_bc
@@ -285,6 +360,7 @@ def _apply_params(params: Dict[str, Any]) -> None:
     # Insert the signature BEFORE the extension
     stem = raw_ckpt.with_suffix("")  # drop .eqx if present
     CHECKPOINT_PATH = Path(f"{stem}.{sig}.eqx")
+    STATE_PATH = CHECKPOINT_PATH.with_suffix(".trainstate.eqx")
     BATCH_IN        = int(params["batch_interior"])            # type: ignore
     BATCH_BDRY      = int(params["batch_boundary"])            # type: ignore
 
@@ -337,11 +413,9 @@ def _apply_params(params: Dict[str, Any]) -> None:
     LBFGS_WEIGHTING = str(params.get("lbfgs_weighting", "equal"))
 
     # zero-mean weight & boundary presample multiplier & optimizer knobs
-    global ZERO_MEAN_WEIGHT_CONF, BDRY_PRESAMPLE_MULT, GRAD_CLIP_NORM, WEIGHT_DECAY
+    global ZERO_MEAN_WEIGHT_CONF, BDRY_PRESAMPLE_MULT
     ZERO_MEAN_WEIGHT_CONF = float(params.get("zero_mean_weight", 0.1))
     BDRY_PRESAMPLE_MULT   = int(params.get("bdry_presample_mult", 16))
-    GRAD_CLIP_NORM        = float(params.get("grad_clip_norm", 1.0))
-    WEIGHT_DECAY          = float(params.get("weight_decay", 0.0))
 
 # =============================================================================
 # ================================== MAIN =====================================
@@ -363,6 +437,16 @@ def main(config_path: str = "input.toml"):
     runtime.lam_bc = lam_bc
     runtime.zero_mean_weight = ZERO_MEAN_WEIGHT_CONF
     runtime.bdry_presample_mult = int(params.get("bdry_presample_mult", 16))
+
+    runtime.lam_grad = float(params.get("lam_grad", 0.0))
+    runtime.grad_target_backprop = bool(params.get("grad_target_backprop", False))
+
+    total_steps  = int(params.get("steps", 1000))
+    base_lr      = float(params.get("lr", 3e-3))
+    warmup_steps = _compute_warmup_steps(params, total_steps)
+    min_ratio    = float(params.get("lr_min_ratio", 0.0))
+    grad_clip    = float(params.get("grad_clip_norm", 1.0))
+    wd_decay     = float(params.get("weight_decay", 0.0))
 
     # Augmented Lagrangian config
     runtime.al_enabled = bool(params.get("use_augmented_lagrangian", False))
@@ -457,30 +541,57 @@ def main(config_path: str = "input.toml"):
     model = load_model_if_exists(model, CHECKPOINT_PATH)
 
     # --- LR schedule with optional warmup + cosine decay floor ---
-    warmup = int(params.get("lr_warmup_steps", 0))
-    min_ratio = float(params.get("lr_min_ratio", 0.0))  # e.g., 0.05
-    sched_main = optax.cosine_decay_schedule(
-        init_value=lr, decay_steps=steps, alpha=min_ratio
+    optimizer, lr_schedule = build_optimizer(
+        base_lr=base_lr,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        min_ratio=min_ratio,
+        weight_decay=wd_decay,
+        grad_clip_norm=grad_clip,
     )
-    if warmup > 0:
-        sched = optax.join_schedules(
-            schedules=[optax.linear_schedule(init_value=lr*0.1, end_value=lr, transition_steps=warmup),
-                       sched_main],
-            boundaries=[warmup]
-        )
-    else:
-        sched = sched_main
-
-    clip_norm = float(params.get("grad_clip_norm", 1.0))
-    wd = float(params.get("weight_decay", 0.0))
-
-    base_opt = optax.chain(
-        optax.clip_by_global_norm(clip_norm),
-        optax.adamw(learning_rate=sched, weight_decay=wd),
-    )
-
-    optimizer = base_opt
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    # --- Try to resume optimizer/AL/RNG state ---
+    resume = False
+    ts = load_train_state(STATE_PATH)
+    if ts is not None:
+        resume = True  # <-- set early so schedule pins λ even if compare fails
+
+        # restore state first
+        opt_state = ts.opt_state
+        restored_step = int(getattr(ts, "step", 0))
+        runtime.restored_step = restored_step
+        runtime.al_lambda = float(ts.al_lambda)
+        key_train = ts.key_train
+
+        if bool(params.get("use_ema", False)) and (getattr(ts, "ema_f", None) is not None):
+            ema_f = ts.ema_f
+        if bool(params.get("use_lookahead", False)) and (getattr(ts, "slow_f", None) is not None):
+            slow_f = ts.slow_f
+
+        # fingerprint compare (best-effort; never block resume flag)
+        try:
+            params_f_curr, _ = eqx.partition(model, eqx.is_inexact_array)  # model already loaded
+            fp_curr = leaves_fingerprint(params_f_curr)
+            saved_fp = getattr(ts, "params_fp", None)
+            if (saved_fp is None) or (abs(fp_curr - float(saved_fp)) > 1e-6):
+                opt_state = optimizer.init(params_f_curr)
+                print("[RESUME] Params changed since last opt_state; resetting Adam moments.")
+            else:
+                print("[RESUME] Continuing Adam with matching moments.")
+        except Exception as e:
+            # Fall back safely
+            params_f_curr, _ = eqx.partition(model, eqx.is_inexact_array)
+            opt_state = optimizer.init(params_f_curr)
+            print(f"[RESUME] Compare failed ({e}); resetting Adam moments as a safe default.")
+    else:
+        key_train = random.PRNGKey(1234)
+
+
+    print(f"[LR] base={base_lr:.3g} warmup_steps={warmup_steps} "
+        f"min_ratio={min_ratio:.3g} total_steps={total_steps} "
+        f"clip={grad_clip:.3g} wd={wd_decay:.3g}")
+
 
     lookahead_enabled   = bool(params.get("use_lookahead", False))
     lookahead_k         = int(params.get("lookahead_sync_period", 5))
@@ -533,13 +644,14 @@ def main(config_path: str = "input.toml"):
         Gvec_init, Gmag_init, Nhat_grid = eval_on_boundary(model, P_bdry, N_bdry, Xg, Yg, Zg)
 
         # Train
-        key_train = random.PRNGKey(1234)
         log_every = LOG_EVERY
         for it in range(1, steps + 1):
-            cur_lam = _lambda_bc_schedule(it, steps)
-            runtime.lam_bc = float(cur_lam)   # update runtime so loss sees it
+            if resume:
+                runtime.lam_bc = float(lam_bc)   # keep fixed if resuming
+            else:
+                runtime.lam_bc = float(_lambda_bc_schedule(it, steps))
             key_train, subkey = random.split(key_train)
-            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step(
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean, loss_grad), gnorm, grads = train_step(
                 model, opt_state, optimizer, P_in, P_bdry, N_bdry, subkey
             )
             # choose model used for evaluation curve (EMA-consistent with your prints)
@@ -589,6 +701,7 @@ def main(config_path: str = "input.toml"):
                 mean_g = float(jnp.mean(gmag))
                 print(
                     f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
+                    f"loss_grad={float(loss_grad):.3e}  "
                     f"|lap|_rms={stats['lap_rms']:.3e}  "
                     f"|n·∇u|_rms={stats['nbc_rms']:.3e}  "
                     f"||g||={stats['grad_L2']:.3e}  mean|∇u|={mean_g:.3e}  mean(u)={float(mean_u):.3e}  "
@@ -608,7 +721,7 @@ def main(config_path: str = "input.toml"):
         else:
             # mean across all packs for scale stability
             s = 0.0
-            for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+            for (Pi, Pb, Nb, _sid) in packs_all:
                 s += float(eval_total(model_to_save, Pi, Pb, Nb))
             adam_eval_total_full = s / float(len(packs_all))
         print(f"[ADAM-END] eval_total_full={adam_eval_total_full:.6e}")
@@ -623,12 +736,28 @@ def main(config_path: str = "input.toml"):
                 print_every=LBFGS_PRINT_EVERY, label="single",
                 history=lbfgs_hist,
             )
+        params_f_post, _ = eqx.partition(model_to_save, eqx.is_inexact_array)
+        opt_state = optimizer.init(params_f_post)
+        fp = leaves_fingerprint(params_f_post)
         unified_loss_hist.extend(lbfgs_eval_total_hist)
         runtime._lbfgs_eval_full_hist_sink = None
         runtime._lbfgs_eval_total_hist_sink = None
 
         model = model_to_save
-        if not HPO_DISABLE_CKPT: save_model(model_to_save, CHECKPOINT_PATH)
+        if not HPO_DISABLE_CKPT:
+            save_model(model_to_save, CHECKPOINT_PATH)
+            # Persist optimizer state, EMA/Lookahead, AL λ, and the RNG to continue exactly
+            save_train_state(
+                STATE_PATH,
+                opt_state=opt_state,
+                ema_f=(ema_f if bool(params.get("use_ema", False)) else None),
+                slow_f=(slow_f if bool(params.get("use_lookahead", False)) else None),
+                # step=int(getattr(opt_state, "count", 0)) if hasattr(opt_state, "count") else 0,
+                step = infer_step_from_opt_state(opt_state),
+                al_lambda=float(runtime.al_lambda),
+                key_train=key_train,
+                params_fp=fp,
+            )
 
         # Final diagnostics
         (Lf, (Linf, Lbcf, lapf, nf)) = eval_full(model, P_in, P_bdry, N_bdry)
@@ -730,6 +859,7 @@ def main(config_path: str = "input.toml"):
             Pgrid0 = surf0.P_bdry.reshape(N_bdry_theta, N_bdry_phi, 3)
             Xg0, Yg0, Zg0 = Pgrid0[..., 0], Pgrid0[..., 1], Pgrid0[..., 2]
             has_param_grid0 = True
+            nθ0, nφ0 = int(Xg0.shape[0]), int(Xg0.shape[1])
 
             # Initial eval on surf0 (use masked interior from the common fixed box)
             mask0 = surf0.inside_mask_fn(P_box)
@@ -740,6 +870,10 @@ def main(config_path: str = "input.toml"):
 
             # Precompute initial boundary grad for surf0
             Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+
+            # -------- Build fixed interior pools for ALL torus surfaces (packs_all) --------
+            packs_all = _build_packs(dataset, P_box, N_in)
+            P_in0 = packs_all[0][0]
             
         elif mode == "files":
             files_list = surfaces_cfg.get("files", [])
@@ -794,24 +928,19 @@ def main(config_path: str = "input.toml"):
                     f"z[{surf0.P_bdry[:,2].min():+.3f},{surf0.P_bdry[:,2].max():+.3f}]")
 
             # -------- Build fixed interior pools (works for both grid & points) --------
-            packs_all = []
-            for surf in dataset:
-                mask = surf.inside_mask_fn(P_box)
-                ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
-                P_in_all = P_box[ids][:N_in]
-                packs_all.append((P_in_all, surf.P_bdry, surf.N_bdry))
-            packs_all = tuple(packs_all)
+            packs_all = _build_packs(dataset, P_box, N_in)
             P_in0 = packs_all[0][0]
 
         # ---- Train: aggregate ALL surfaces every step ----
-        key_train = random.PRNGKey(1234)
         log_every = LOG_EVERY
         for it in range(1, steps + 1):
-            cur_lam = _lambda_bc_schedule(it, steps)
-            runtime.lam_bc = float(cur_lam)
+            if resume:
+                runtime.lam_bc = float(lam_bc)   # keep fixed if resuming
+            else:
+                runtime.lam_bc = float(_lambda_bc_schedule(it, steps))
             key_train, subkey = random.split(key_train)
 
-            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean), gnorm, grads = train_step_many(
+            model, opt_state, L, (Lin, Lbc, lap_res, nres, mean_u, c_bc_mean, Lg_mean), gnorm, grads = train_step_many(
                 model, opt_state, optimizer, packs_all, subkey
             )
             if use_ema and ema_eval:
@@ -858,6 +987,7 @@ def main(config_path: str = "input.toml"):
                 mean_g0 = float(jnp.mean(gmag0))
                 print(f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
                     f"|lap|_rms={stats['lap_rms']:.3e}  "
+                    f"Lg_mean={float(Lg_mean):.3e}  "
                     f"|n·∇u|_rms={stats['nbc_rms']:.3e}  "
                     f"||g||={stats['grad_L2']:.3e}  mean|∇u|(surf0)={mean_g0:.3e}  mean(u)={float(mean_u):.3e}  "
                     f"λ_bc={runtime.lam_bc:.2f}  "
@@ -876,7 +1006,7 @@ def main(config_path: str = "input.toml"):
         else:
             # mean across all packs for scale stability
             s = 0.0
-            for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+            for (Pi, Pb, Nb, _sid) in packs_all:
                 s += float(eval_total(model_to_save, Pi, Pb, Nb))
             adam_eval_total_full = s / float(len(packs_all))
         print(f"[ADAM-END] eval_total_full={adam_eval_total_full:.6e}")
@@ -912,12 +1042,28 @@ def main(config_path: str = "input.toml"):
                 print_every=LBFGS_PRINT_EVERY, label="torus:ALL",
                 history=lbfgs_hist,
             )
+        params_f_post, _ = eqx.partition(model_to_save, eqx.is_inexact_array)
+        opt_state = optimizer.init(params_f_post)
+        fp = leaves_fingerprint(params_f_post)
+
         unified_loss_hist.extend(lbfgs_eval_total_hist)
         runtime._lbfgs_eval_full_hist_sink = None
         runtime._lbfgs_eval_total_hist_sink = None
-
         model = model_to_save
-        if not HPO_DISABLE_CKPT: save_model(model_to_save, CHECKPOINT_PATH)
+        if not HPO_DISABLE_CKPT:
+            save_model(model_to_save, CHECKPOINT_PATH)
+            # Persist optimizer state, EMA/Lookahead, AL λ, and the RNG to continue exactly
+            save_train_state(
+                STATE_PATH,
+                opt_state=opt_state,
+                ema_f=(ema_f if bool(params.get("use_ema", False)) else None),
+                slow_f=(slow_f if bool(params.get("use_lookahead", False)) else None),
+                # step=int(getattr(opt_state, "count", 0)) if hasattr(opt_state, "count") else 0,
+                step = infer_step_from_opt_state(opt_state),
+                al_lambda=float(runtime.al_lambda),
+                key_train=key_train,
+                params_fp=fp,
+            )
 
         # Final diagnostics on a couple of surfaces
         for j in range(min(3, len(dataset))):
@@ -988,6 +1134,7 @@ def main(config_path: str = "input.toml"):
                 plt.show()
 
                 # Imshow with the very same grid shape
+                nθ0, nφ0 = int(Xg0.shape[0]), int(Xg0.shape[1])  # robust even in 'files' grid case
                 G_init_grid  = np.asarray(Gmag_init).reshape(nθ0, nφ0, order="C")
                 G_final_grid = np.asarray(Gmag_final).reshape(nθ0, nφ0, order="C")
                 _imshow_pair(G_init_grid, G_final_grid,
@@ -1052,7 +1199,7 @@ def main(config_path: str = "input.toml"):
             
         # mean across all packs for a stable metric
         final_score = 0.0
-        for (Pi, Pb, Nb) in [(p[0], p[1], p[2]) for p in packs_all]:
+        for (Pi, Pb, Nb, _sid) in packs_all:
             final_score += float(eval_total(model, Pi, Pb, Nb))
         final_score /= float(len(packs_all))
         return model, final_score

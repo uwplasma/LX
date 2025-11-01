@@ -154,12 +154,19 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     p["lam_warm"] = float(opt.get("lam_warm", 200.0))
     p["log_every"] = int(opt.get("log_every", max(1, p["steps"] // 20)))
     p["mini_epoch"] = int(opt.get("mini_epoch", 5))
+    p["lr_warmup_frac"] = float(opt.get("lr_warmup_frac", 0.0))
 
     # optimizer extras used in main()
     p["grad_clip_norm"] = float(opt.get("grad_clip_norm", 1.0))
     p["weight_decay"]   = float(opt.get("weight_decay", 0.0))
-    p["lr_warmup_steps"] = int(opt.get("lr_warmup_steps", 0))
-    p["lr_min_ratio"]    = float(opt.get("lr_min_ratio", 0.0))
+    if "lr_warmup_steps" in opt:
+        try:
+            val = int(opt.get("lr_warmup_steps", 0))
+            if val > 0:
+                p["lr_warmup_steps"] = val
+        except Exception:
+            pass
+    p["lr_min_ratio"] = float(opt.get("lr_min_ratio", 0.0))
 
     # LBFGS (top-level toggles)
     p["lbfgs_steps"] = int(opt.get("lbfgs_steps", 0))       # 0 disables polish
@@ -205,6 +212,9 @@ def parse_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- surfaces list (raw dict; parsed in main) ---
     p["surfaces_cfg"] = cfg.get("surfaces", {})
+
+    p["lam_grad"] = float(opt.get("lam_grad", 0.0))
+    p["grad_target_backprop"] = bool(opt.get("grad_target_backprop", False))
 
     return p
 
