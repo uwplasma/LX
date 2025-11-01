@@ -63,7 +63,7 @@ bdry_presample_mult = 16     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.1      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [64, 64, 64, 64]   # MLP hidden layer sizes
+hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
