@@ -24,8 +24,8 @@ mode = "files"
 #  { name = "S2", path = "coil_shell.npy",      format = "points", normals_path = "" },
 #  { name = "S3", path = "freeform.csv",        format = "points" }
 #]
-#files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
-files = ["qsc_surfaces_from_api.npz"]
+files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
+#files = ["qsc_surfaces_from_api.npz"]
 
 torus_list = [
     { name = "T1", a0 = 0.35, a1 = 0.20, N_harm = 3 },
@@ -73,15 +73,15 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 5000
+steps = 10
 lr = 0.003
 lam_bc = 5.0
 log_every = 50
-mini_epoch = 5
+mini_epoch = 25
 lam_warm = 50.0      # initial (warm-start) λ for boundary loss
 
 # --- LBFGS (polish) ---
-lbfgs_steps = 500        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 5        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 20
 

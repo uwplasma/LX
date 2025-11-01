@@ -208,6 +208,68 @@ class _LambdaGuard:
         runtime.lam_bc = self.new_lambda
     def __exit__(self, exc_type, exc, tb):
         runtime.lam_bc = self.old
+        
+def _preview_surface_grid(surf):
+    P = np.asarray(surf.P_bdry)  # (Nb,3)
+    N = np.asarray(surf.N_bdry)
+    Nb = P.shape[0]
+    shp = getattr(surf, "shape_thetaphi", None)
+
+    print(f"[DATA] {surf.name}: Nb={Nb}, shape_thetaphi={shp}")
+    print("[DATA] bbox: "
+          f"x[{P[:,0].min():+.3f},{P[:,0].max():+.3f}] "
+          f"y[{P[:,1].min():+.3f},{P[:,1].max():+.3f}] "
+          f"z[{P[:,2].min():+.3f},{P[:,2].max():+.3f}] "
+          f"|N| mean={np.linalg.norm(N,axis=1).mean():.3f}")
+
+    if shp is None:
+        print("[WARN] No (nθ,nφ) stored; cannot plot as surface—showing scatter.")
+        _quick_scatter(P)
+        return
+
+    nT, nP = map(int, shp)
+    assert nT * nP == Nb, f"Shape {shp} incompatible with Nb={Nb}"
+
+    # EXACT reshape used in the fetch script: row-major (C) with θ-major, φ-minor
+    Pgrid = P.reshape(nT, nP, 3, order="C")  # ← IMPORTANT
+    X, Y, Z = Pgrid[..., 0], Pgrid[..., 1], Pgrid[..., 2]
+
+    # Round-trip check agrees with flattened buffer?
+    assert np.shares_memory(Pgrid, P), "[DEBUG] reshape uses the same buffer (order='C')"
+    assert np.allclose(P, Pgrid.reshape(Nb, 3, order="C")), "[DEBUG] round-trip reshape mismatch!"
+
+    # Optional sanity: compare to saved bbox after reshape
+    print("[CHECK] grid bbox: "
+          f"x[{X.min():+.3f},{X.max():+.3f}] "
+          f"y[{Y.min():+.3f},{Y.max():+.3f}] "
+          f"z[{Z.min():+.3f},{Z.max():+.3f}]")
+
+    _plot_surface(X, Y, Z)
+
+
+def _plot_surface(X, Y, Z, title="Preview of surface"):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    fig = plt.figure(figsize=(6.5, 4.8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(X, Y, Z, linewidth=0, antialiased=False, alpha=0.9)
+    ax.set_box_aspect([np.ptp(X), np.ptp(Y), np.ptp(Z)])
+    ax.set_title(title)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    plt.tight_layout()
+    plt.show()
+
+
+def _quick_scatter(P, title="Boundary scatter (no grid)"):
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(6.0, 4.5))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(P[:,0], P[:,1], P[:,2], s=1)
+    ax.set_box_aspect([P[:,0].ptp(), P[:,1].ptp(), P[:,2].ptp()])
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
 
 def _apply_params(params: Dict[str, Any]) -> None:
     global CHECKPOINT_PATH, BATCH_IN, BATCH_BDRY, R0, a0, a1, N_harm, kappa
@@ -678,54 +740,68 @@ def main(config_path: str = "input.toml"):
 
             # Precompute initial boundary grad for surf0
             Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
-
+            
         elif mode == "files":
             files_list = surfaces_cfg.get("files", [])
             if len(files_list) == 0:
                 raise RuntimeError("No entries under [surfaces].files for mode='files'.")
-            # NEW: will expand .npz bundle into many per-surface packs transparently
             dataset = build_surfaces_from_files_or_npz(files_list)
             print(f"[DATA] Loaded {len(dataset)} file-based surfaces.")
 
             surf0 = dataset[0]
-            Pgrid0 = surf0.P_bdry
 
-            # Hints (use the same Nθ,Nφ you trained with)
-            ntheta_hint = int(N_bdry_theta)
-            nphi_hint   = int(N_bdry_phi)
+            # Detect whether this surface came from a parametric grid (NPZ) or is a point cloud
+            shp = getattr(surf0, "shape_thetaphi", None)
+            has_param_grid0 = shp is not None
 
-            Nb = int(Pgrid0.shape[0])
-            nθ0, nφ0 = _grid_shape_from_len(Nb, ntheta_hint, nphi_hint)
-
-            has_param_grid0 = (nθ0 is not None) and (nφ0 is not None)
             if has_param_grid0:
-                # reshape coordinates
-                Xg0 = surf0.P_bdry[:, 0].reshape(nθ0, nφ0)
-                Yg0 = surf0.P_bdry[:, 1].reshape(nθ0, nφ0)
-                Zg0 = surf0.P_bdry[:, 2].reshape(nθ0, nφ0)
+                # ----- GRID (NPZ) PATH -----
+                nθ0, nφ0 = int(shp[0]), int(shp[1])
 
-                # IMPORTANT: build normals grid + boundary grads consistently
-                # This gives you Gvec_init/Gmag_init on the same (nθ×nφ) grid and Nhat_grid0
+                # optional preview that's safe for grids
+                # if not HPO_DISABLE_PLOTS:
+                #     _preview_surface_grid(surf0)
+
+                P0 = np.asarray(surf0.P_bdry)  # (Nb,3), packed row-major θ-major, φ-minor
+                assert P0.shape[0] == nθ0 * nφ0, f"Nb={P0.shape[0]} != nθ*nφ={nθ0*nφ0}"
+
+                # Build grids ONCE (order='C' to match fetch script)
+                Xg0 = P0[:, 0].reshape(nθ0, nφ0, order="C")
+                Yg0 = P0[:, 1].reshape(nθ0, nφ0, order="C")
+                Zg0 = P0[:, 2].reshape(nθ0, nφ0, order="C")
+
+                # Initial boundary eval on that exact grid
                 Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(
                     model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0
                 )
-            else:
-                # fallback: flat arrays (scatter/quiver path)
-                Xg0 = Yg0 = Zg0 = None
-                Nhat_grid0 = None
-                Gvec_init  = grad_u_total_batch(model, surf0.P_bdry)  # (Nb,3)
-                Gmag_init  = jnp.linalg.norm(Gvec_init, axis=-1)      # (Nb,)
 
-        # Build fixed interior pools ONCE (deterministic) for all surfaces
-        packs_all = []
-        for surf in dataset:
-            mask = surf.inside_mask_fn(P_box)
-            ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
-            P_in_all = P_box[ids][:N_in]
-            packs_all.append((P_in_all, surf.P_bdry, surf.N_bdry))
-        packs_all = tuple(packs_all)  # static for JIT
-        # Anchor interior set used for the training-like eval metric (works for both modes)
-        P_in0 = packs_all[0][0]   # (N_in, 3) for surf0
+                print(f"[DATA] surf0={surf0.name} grid (nθ,nφ)=({nθ0},{nφ0}) "
+                    f"bbox: x[{Xg0.min():+.3f},{Xg0.max():+.3f}] "
+                    f"y[{Yg0.min():+.3f},{Yg0.max():+.3f}] "
+                    f"z[{Zg0.min():+.3f},{Zg0.max():+.3f}]")
+
+            else:
+                # ----- POINTS (XYZ) PATH -----
+                # Do NOT attempt to reshape; stay in scatter/quiver mode
+                Xg0 = Yg0 = Zg0 = Nhat_grid0 = None
+                Gvec_init = grad_u_total_batch(model, surf0.P_bdry)  # (Nb,3)
+                Gmag_init = jnp.linalg.norm(Gvec_init, axis=-1)      # (Nb,)
+
+                # If you want a preview for points, make a scatter helper instead of _preview_surface_grid
+                print(f"[DATA] surf0={surf0.name} is point-cloud: Nb={surf0.P_bdry.shape[0]} "
+                    f"bbox: x[{surf0.P_bdry[:,0].min():+.3f},{surf0.P_bdry[:,0].max():+.3f}] "
+                    f"y[{surf0.P_bdry[:,1].min():+.3f},{surf0.P_bdry[:,1].max():+.3f}] "
+                    f"z[{surf0.P_bdry[:,2].min():+.3f},{surf0.P_bdry[:,2].max():+.3f}]")
+
+            # -------- Build fixed interior pools (works for both grid & points) --------
+            packs_all = []
+            for surf in dataset:
+                mask = surf.inside_mask_fn(P_box)
+                ids  = jnp.nonzero(mask, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
+                P_in_all = P_box[ids][:N_in]
+                packs_all.append((P_in_all, surf.P_bdry, surf.N_bdry))
+            packs_all = tuple(packs_all)
+            P_in0 = packs_all[0][0]
 
         # ---- Train: aggregate ALL surfaces every step ----
         key_train = random.PRNGKey(1234)
@@ -876,8 +952,8 @@ def main(config_path: str = "input.toml"):
             model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
 
             if has_param_grid0:
-                # ---- TORUS (has param grid) ----
                 Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+
                 vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
                 vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
 
@@ -887,8 +963,6 @@ def main(config_path: str = "input.toml"):
                 ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
                 cax = fig3d.add_subplot(gs[0, 2])
 
-                # Use a bbox-based offset instead of a0/a1 so it also works in files mode
-                # (safe here too)
                 mins = jnp.min(surf0.P_bdry, axis=0)
                 maxs = jnp.max(surf0.P_bdry, axis=0)
                 diag = float(jnp.linalg.norm(maxs - mins))
@@ -909,18 +983,17 @@ def main(config_path: str = "input.toml"):
 
                 draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
                 draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
-
                 cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
                 fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
                 plt.show()
 
-                if (nθ0 is not None) and (nφ0 is not None):
-                    G_init_grid  = np.asarray(Gmag_init).reshape(Xg0.shape)
-                    G_final_grid = np.asarray(Gmag_final).reshape(Xg0.shape)
-                    _imshow_pair(G_init_grid, G_final_grid,
-                                title_left=f"Initial |∇u| ({surf0.name})",
-                                title_right=f"Final |∇u| ({surf0.name})",
-                                cmap=PLOT_CMAP)
+                # Imshow with the very same grid shape
+                G_init_grid  = np.asarray(Gmag_init).reshape(nθ0, nφ0, order="C")
+                G_final_grid = np.asarray(Gmag_final).reshape(nθ0, nφ0, order="C")
+                _imshow_pair(G_init_grid, G_final_grid,
+                            title_left=f"Initial |∇u| ({surf0.name})",
+                            title_right=f"Final |∇u| ({surf0.name})",
+                            cmap=PLOT_CMAP)
 
             else:
                 # ---- FILES (scattered boundary points) ----

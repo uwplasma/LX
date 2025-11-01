@@ -23,6 +23,7 @@ class SurfaceItem:
     P_bdry: jnp.ndarray        # [Nb,3]
     N_bdry: jnp.ndarray        # [Nb,3]
     inside_mask_fn: Callable[[jnp.ndarray], jnp.ndarray]  # takes [M,3] -> [M] bool
+    shape_thetaphi: Optional[Tuple[int, int]] = None
 
 class SurfacesDataset:
     def __init__(self, items: List[SurfaceItem]):

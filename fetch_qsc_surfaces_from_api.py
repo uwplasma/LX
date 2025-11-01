@@ -95,6 +95,13 @@ def main():
     ap.add_argument("--id-range", default="1:15", help="Inclusive range a:b, e.g. 1:50")
     ap.add_argument("--stride", type=int, default=1, help="Stride for --id-range (default 10)")
     ap.add_argument("--out", default="qsc_surfaces_from_api.npz", help="Output .npz path")
+    ap.add_argument(
+        "--debug-plot",
+        dest="debug_plot",
+        action=argparse.BooleanOptionalAction,  # gives --debug-plot / --no-debug-plot
+        default=True,                            # default ON
+        help="Preview surfaces before saving (default: on). Use --no-debug-plot to disable."
+    )
     args = ap.parse_args()
 
     ids = parse_ids(args.ids, args.id_range, args.stride)
@@ -108,13 +115,79 @@ def main():
     for sid in ids:
         print(f"[fetch] id={sid} ...", flush=True)
         X, Y, Z = _fetch_surface(args.api, sid)
+        print(f"[fetch] id={sid}: X.shape={X.shape}, Y.shape={Y.shape}, Z.shape={Z.shape}, "
+            f"X.ndim={X.ndim}, Y.ndim={Y.ndim}, Z.ndim={Z.ndim}")
+        print(f"[fetch] id={sid}: X[min,max]=({X.min():+.3e},{X.max():+.3e}), "
+            f"Y[min,max]=({Y.min():+.3e},{Y.max():+.3e}), Z[min,max]=({Z.min():+.3e},{Z.max():+.3e})")
         Nhat = _compute_normals_from_grid(X, Y, Z)
-        P, N = _grid_to_flat(X, Y, Z, Nhat)
+        P, N  = _grid_to_flat(X, Y, Z, Nhat)
+        print(f"[pack ] id={sid}: P.shape={P.shape}, N.shape={N.shape}, "
+            f"mean|N|={np.linalg.norm(N,axis=1).mean():.3f}")
         # store per-surface payload
         bundle[f"P_bdry_{sid}"] = P
         bundle[f"N_bdry_{sid}"] = N
         bundle[f"shape_{sid}"]  = np.array(X.shape, dtype=int)  # (nθ, nφ)
         meta.append((sid, X.shape[0], X.shape[1]))
+        
+    # after computing X,Y,Z and Nhat:
+    if args.debug_plot:
+        try:
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            # small triangulation identical to your loader:
+            nθ, nφ = X.shape
+            V = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+            def idx(i,j): return (i % nθ) * nφ + (j % nφ)
+            faces = []
+            for i in range(nθ):
+                for j in range(nφ):
+                    i2, j2 = i+1, j
+                    i3, j3 = i, j+1
+                    i4, j4 = i+1, j+1
+                    faces.append([idx(i,j), idx(i2,j2), idx(i3,j3)])
+                    faces.append([idx(i2,j2), idx(i4,j4), idx(i3,j3)])
+            F = np.asarray(faces, dtype=int)
+
+            fig = plt.figure(figsize=(6,5))
+            ax = fig.add_subplot(111, projection="3d")
+            tris = Poly3DCollection(V[F], alpha=0.6)
+            ax.add_collection3d(tris)
+            ax.auto_scale_xyz(V[:,0], V[:,1], V[:,2])
+            ax.set_title(f"pyQSC id={sid} (from API X/Y/Z)")
+            plt.show()
+        except Exception as e:
+            print(f"[debug-plot] Failed: {e}")
+            
+    if args.debug_plot:
+        try:
+            Pr = P.reshape(nθ, nφ, 3)
+            Vr = Pr.reshape(-1, 3)
+            fig = plt.figure(figsize=(6,5))
+            ax = fig.add_subplot(111, projection="3d")
+            tris = Poly3DCollection(Vr[F], alpha=0.6)
+            ax.add_collection3d(tris)
+            ax.auto_scale_xyz(Vr[:,0], Vr[:,1], Vr[:,2])
+            ax.set_title(f"pyQSC id={sid} (flattened P reshaped → grid)")
+            plt.show()
+        except Exception as e:
+            print(f"[debug-plot] (reshape) Failed: {e}")
+            
+    if args.debug_plot:
+        try:
+            # Preview the LAST surface we just packed (same code-path as main)
+            nT, nP = meta[-1][1], meta[-1][2]
+            P = bundle[f"P_bdry_{meta[-1][0]}"]      # (Nb,3) row-major (θ-major, φ-minor)
+            Pgrid = P.reshape(nT, nP, 3, order="C")  # ← SAME reshape as main
+            X, Y, Z = Pgrid[...,0], Pgrid[...,1], Pgrid[...,2]
+            fig = plt.figure(figsize=(6.5, 4.8))
+            ax = fig.add_subplot(111, projection="3d")
+            ax.plot_surface(X, Y, Z, linewidth=0, antialiased=False, alpha=0.9)
+            # ax.set_box_aspect([X.ptp(), Y.ptp(), Z.ptp()])
+            ax.set_title(f"Preview id={meta[-1][0]} (nθ={nT}, nφ={nP})")
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"[WARN] debug plot failed: {e}")
 
     np.savez(args.out, **bundle)
     print(f"[done] Saved {len(ids)} surfaces to {args.out}")

@@ -48,20 +48,36 @@ def build_surfaces_from_npz(npz_path: str) -> List[_SurfacePack]:
     for sid in ids:
         P = jnp.asarray(data[f"P_bdry_{sid}"])  # (Nb,3)
         N = jnp.asarray(data[f"N_bdry_{sid}"])  # (Nb,3)
+        shp = tuple(map(int, np.asarray(data.get(f"shape_{sid}", [0, 0]))))  # (nθ,nφ) if present
         inside = _bbox_inside_fn(np.asarray(P))
-        out.append(_SurfacePack(name=f"pyQSC#{sid}", P_bdry=P, N_bdry=N, inside_mask_fn=inside))
+        pack = _SurfacePack(
+            name=f"pyQSC#{sid}",
+            P_bdry=P,
+            N_bdry=N,
+            inside_mask_fn=inside,
+        )
+        # Attach shape onto the pack so we can transfer it later:
+        pack.shape_thetaphi = shp if all(shp) else None
+        out.append(pack)
     return out
 
 def build_surfaces_from_files_or_npz(files_list):
-    # If a single .npz path is given, expand into many surfaces.
     outs = []
     for item in files_list:
         if str(item).lower().endswith(".npz"):
-            outs.extend(build_surfaces_from_npz(item))
+            packs = build_surfaces_from_npz(item)
+            for p in packs:
+                outs.append(SurfaceItem(
+                    name=p.name,
+                    P_bdry=p.P_bdry,
+                    N_bdry=p.N_bdry,
+                    inside_mask_fn=p.inside_mask_fn,
+                    shape_thetaphi=getattr(p, "shape_thetaphi", None),  # NEW
+                ))
         else:
-            # fall back to your existing CSV/PLY/etc. loader:
             outs.extend(build_surfaces_from_files([item]))
     return outs
+
 
 # =============================== LOADERS =======================================
 
