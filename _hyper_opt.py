@@ -34,6 +34,7 @@ from optuna.trial import TrialState
 import warnings
 from optuna.exceptions import ExperimentalWarning
 warnings.filterwarnings("ignore", category=ExperimentalWarning)
+from urllib.parse import urlparse
 
 # ---- local modules ----
 from _initialization import load_config, dump_params_to_toml
@@ -304,6 +305,33 @@ def objective(trial: Trial, base_raw_cfg: Dict[str, Any], vary_steps: bool = Fal
     # Optuna minimizes by default if we set direction='minimize'
     return float(score)
 
+def _sqlite_db_path_abs(storage_uri: str) -> Path:
+    """
+    Normalize SQLite URIs so locks go to a writable dir.
+
+    Rules (matching SQLAlchemy):
+      - 'sqlite:///file.db'      => ./file.db   (relative to CWD)
+      - 'sqlite:////abs/x.db'    => /abs/x.db   (absolute)
+      - 'sqlite:////Users/me/x'  => /Users/me/x
+    """
+    u = urlparse(storage_uri)
+    if u.scheme != "sqlite":
+        # Not sqlite; best effort: use cwd for relative-like paths
+        p = Path(u.path)
+        return p if p.is_absolute() else (Path.cwd() / p.name)
+
+    # SQLite: distinguish relative vs absolute by number of slashes.
+    # urlparse('sqlite:///foo.db').path == '/foo.db'  (RELATIVE in SQLAlchemy)
+    # urlparse('sqlite:////abs/foo.db').path == '//abs/foo.db' (ABSOLUTE)
+    path = u.path or ""
+    if path.startswith("//"):
+        # Absolute: strip one leading slash, keep the rest -> '/abs/foo.db'
+        p = Path("/" + path.lstrip("/"))
+    else:
+        # Relative: drop the single leading slash and resolve in CWD
+        p = Path.cwd() / path.lstrip("/")
+    return p
+
 # ------------------------ runner ---------------------------------------------
 
 def run_study(
@@ -332,7 +360,7 @@ def run_study(
         sampler = optuna.samplers.QMCSampler(seed=42)
     else:
         sampler = optuna.samplers.TPESampler(seed=42)
-
+        
     # Pruner
     if pruner_name.lower() == "median":
         pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
@@ -340,21 +368,30 @@ def run_study(
         pruner = optuna.pruners.NopPruner()
     else:
         pruner = optuna.pruners.MedianPruner()
-
     hpo_root = Path(".hpo_runs")
     hpo_root.mkdir(exist_ok=True)
-    
+
     def _objective(tr):
         return objective(tr, base_raw_cfg, vary_steps=vary_steps)
 
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=storage,
-        direction=direction,
-        load_if_exists=True,
-        sampler=sampler,
-        pruner=pruner,
-    )
+    # --------- LOCK *before* touching Optuna/SQLAlchemy storage ----------
+    if storage is not None:
+        db_file = _sqlite_db_path_abs(storage)
+        lock_path = db_file.parent / (db_file.name + ".schema.lock")
+    else:
+        lock_path = Path(".inmemory.schema.lock")
+
+    with _file_lock(lock_path, timeout_sec=120):
+        storage_obj = optuna.storages.RDBStorage(storage) if storage else None
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage_obj or storage,
+            direction=direction,
+            load_if_exists=True,
+            sampler=sampler,
+            pruner=pruner,
+        )
+    # ---------------------------------------------------------------------
 
     study.optimize(
         lambda t: _objective(t),
@@ -362,7 +399,7 @@ def run_study(
         timeout=timeout,
         gc_after_trial=True,
         catch=(Exception,),
-        n_jobs=n_jobs,  # parallelization
+        n_jobs=n_jobs,
         callbacks=[_save_best_callback(hpo_root, keep_mode=keep_trials)],
     )
     return study

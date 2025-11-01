@@ -6,6 +6,6 @@ for i in 1 2; do
   python _hyper_opt.py -c input.toml -n 500 \
     --storage sqlite:///lx_optuna.db \
     --study-name LX-PINN-HPO \
-    --n-jobs 4 --keep-trials best &
+    --n-jobs 2 --keep-trials best &
 done
 wait
