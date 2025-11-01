@@ -13,6 +13,7 @@ from _geometry import (
     fixed_box_points,
     select_interior_from_fixed,
 )
+
 # If/when you support arbitrary meshes:
 # from _geometry_arbitrary import load_surface_xyz, estimate_normals_pca, winding_number_inside
 

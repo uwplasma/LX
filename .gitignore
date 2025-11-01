@@ -210,3 +210,5 @@ __marimo__/
 .hpo_runs/
 *.db
 pinn_torus_model.*
+qsc_surfaces_from_api.npz
+pyqsc_surface.csv

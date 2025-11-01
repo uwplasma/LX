@@ -3,8 +3,29 @@ hpo_disable_plots = false
 hpo_disable_ckpt = false
 hpo_disable_lbfgs = false
 
-[surfaces]                # use either "torus" or "single" mode
-mode = "torus"
+[surfaces]       # "single" | "torus" | "files"
+mode = "files"   
+
+# Each file item chooses one of:
+#   format = "grid"   → expects X,Y,Z arrays (nθ×nφ) in .npz/.npy (keys: X,Y,Z)
+#   format = "points" → expects P (N×3) in .npy/.npz/.csv/.txt
+# Optionally provide normals_path pointing to Nb×3 normals; if absent, we estimate them.
+#files = [
+#  # Minimal: STL reads as a watertight triangulated mesh; normals+inside available.
+#  { name = "W7X_like", path = "data/w7x_panel.stl", kind = "mesh", every = 2 },
+#  { name = "HSX_like", path = "data/hsx_shell.stl", kind = "mesh", sample = 50000 },
+#]
+#files = [
+#  { name = "ImportedCloud", path = "data/cloud_with_normals.csv", kind = "xyz",
+#    xcol = 0, ycol = 1, zcol = 2, nxcol = 3, nycol = 4, nzcol = 5, units = 1.0 }
+#]
+#files = [
+#  { name = "S1", path = "surf_grid_w7x.npz",   format = "grid",  periodic_theta=true, periodic_phi=true },
+#  { name = "S2", path = "coil_shell.npy",      format = "points", normals_path = "" },
+#  { name = "S3", path = "freeform.csv",        format = "points" }
+#]
+#files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
+files = ["qsc_surfaces_from_api.npz"]
 
 torus_list = [
     { name = "T1", a0 = 0.35, a1 = 0.20, N_harm = 3 },
@@ -42,7 +63,7 @@ bdry_presample_mult = 16     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.1      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [32, 32, 32]   # MLP hidden layer sizes
+hidden_sizes = [64, 64, 64, 64]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
@@ -52,7 +73,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 2000
+steps = 5000
 lr = 0.003
 lam_bc = 5.0
 log_every = 50
@@ -60,7 +81,7 @@ mini_epoch = 5
 lam_warm = 50.0      # initial (warm-start) λ for boundary loss
 
 # --- LBFGS (polish) ---
-lbfgs_steps = 300        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 500        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 20
 

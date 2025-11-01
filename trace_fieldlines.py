@@ -34,6 +34,67 @@ from _network_and_loss import PotentialMLP, SirenMLP
 from _geometry import a_of_phi, inside_torus_mask
 from _state import runtime
 from _geometry import build_surface_torus
+from _geometry_files import build_surfaces_from_files   # files mode
+from _multisurface import SurfaceItem                    # dataclass with P_bdry, N_bdry, inside_mask_fn
+
+# Files helpers
+
+def load_training_surface_from_config(cfg: dict) -> Tuple[str, Optional[SurfaceItem]]:
+    """
+    Returns (mode, surface_item_or_None).
+    - mode == "torus": returns ( "torus", None )
+    - mode == "files": returns ( "files", SurfaceItem ) using the FIRST entry
+    """
+    surfaces_cfg = cfg.get("surfaces", {})
+    mode = str(surfaces_cfg.get("mode", "single")).lower()
+    if mode == "files":
+        files_list = surfaces_cfg.get("files", [])
+        if not files_list:
+            raise RuntimeError("surfaces.mode='files' but [surfaces].files is empty.")
+        dataset = build_surfaces_from_files(files_list)
+        if not dataset:
+            raise RuntimeError("build_surfaces_from_files returned an empty dataset.")
+        surf0 = dataset[0]
+        return "files", surf0
+    return "torus", None
+
+
+def seeds_for_files_surface(surf: SurfaceItem, nseed: int = 25, eps: float = 1e-3) -> np.ndarray:
+    """
+    Build seed points *inside* by moving boundary points along -N by eps.
+    Uniform downsample to ~nseed.
+    """
+    Pb = np.asarray(surf.P_bdry)
+    Nb = np.asarray(surf.N_bdry)
+    Nb = Nb / (np.linalg.norm(Nb, axis=1, keepdims=True) + 1e-12)
+    Pi = Pb - eps * Nb       # nudge inward
+    # Downsample uniformly if too many:
+    if Pi.shape[0] > nseed:
+        stride = max(1, Pi.shape[0] // nseed)
+        Pi = Pi[::stride][:nseed]
+    return Pi.astype(np.float64)
+
+
+def add_colored_surface_points(ax, surf: SurfaceItem, u_fn, *, cmap="viridis", alpha=0.9):
+    """
+    Scatter the *file-based* boundary points colored by |∇u|.
+    Returns a ScalarMappable to attach a colorbar.
+    """
+    P = np.asarray(surf.P_bdry)
+    # Evaluate |∇u| at boundary points
+    Pj = jnp.asarray(P, dtype=jnp.float64)
+    G  = grad_on_points(u_fn, Pj)                  # (Nb,3)
+    Gm = jnp.linalg.norm(G, axis=-1)               # (Nb,)
+
+    Gm_np = np.asarray(Gm)
+    vmin, vmax = float(np.nanmin(Gm_np)), float(np.nanmax(Gm_np))
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    m = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+    colors = m.to_rgba(Gm_np)
+    ax.scatter(P[:,0], P[:,1], P[:,2], c=colors, s=4, depthshade=False, alpha=float(alpha))
+    return m, vmin, vmax
+
 
 # -----------------------------
 # Robust arrays-only checkpoint I/O
@@ -339,6 +400,9 @@ def main(config_path="input.toml",
     cfg = load_config(config_path)
     apply_runtime_from_config(cfg)   # <<< make geometry use the same runtime as main.py
 
+    mode, file_surface = load_training_surface_from_config(cfg)
+    print(f"[SURFACE] mode={mode}{' (files)' if mode=='files' else ''}")
+
     # Build model template
     key = jax.random.PRNGKey(0)
     model = build_model(cfg, key)
@@ -373,30 +437,31 @@ def main(config_path="input.toml",
     z_max = float(box_cfg.get("zmax",  0.8))
     box = (x_min, x_max, y_min, y_max, z_min, z_max)
 
-    # Default seeds: on midplane line z=0, y=0, spanning from left to right surface
+    # Default seeds depend on mode:
     if seeds is None:
-        R0 = float(cfg.get("geometry", {}).get("R0", 1.0))
-        a0p = float(a_of_phi(jnp.array([0.0], dtype=jnp.float64))[0])       # φ=0 (x>0 midplane)
-        api = float(a_of_phi(jnp.array([jnp.pi], dtype=jnp.float64))[0])    # φ=π (x<0 midplane)
-
-        x_right_surf = +(R0 + a0p)
-        x_left_surf  = -(R0 + api)
-
-        # inset toward the axis so seeds are inside
-        x_right = x_right_surf - eps
-        x_left  = x_left_surf  + eps
-
-        xs = np.linspace(x_left, x_right, int(nseed), dtype=float)
-        ys = np.zeros_like(xs)
-        zs = np.zeros_like(xs)
-        seeds = [(float(x), 0.0, 0.0) for x in xs]  # y=z=0
-
-        # safety filter in case extreme shaping puts some seeds out of bounds
-        mask = np.array(inside_torus_mask(jnp.asarray(xs), jnp.asarray(ys), jnp.asarray(zs)), dtype=bool)
-        seeds = [s for s, m in zip(seeds, mask) if m]
-        if not seeds:
-            raise RuntimeError("No valid seeds found on z=0, y=0 line. Increase --eps or check geometry.")
-
+        if mode == "torus":
+            # --- Same as your current logic (x-line at y=z=0) ---
+            R0 = float(cfg.get("geometry", {}).get("R0", 1.0))
+            a0p = float(a_of_phi(jnp.array([0.0], dtype=jnp.float64))[0])       # φ=0
+            api = float(a_of_phi(jnp.array([jnp.pi], dtype=jnp.float64))[0])    # φ=π
+            x_right_surf = +(R0 + a0p)
+            x_left_surf  = -(R0 + api)
+            x_right = x_right_surf - eps
+            x_left  = x_left_surf  + eps
+            xs = np.linspace(x_left, x_right, int(nseed), dtype=float)
+            ys = np.zeros_like(xs)
+            zs = np.zeros_like(xs)
+            seeds = [(float(x), 0.0, 0.0) for x in xs]
+            # safety filter
+            mask = np.array(inside_torus_mask(jnp.asarray(xs), jnp.asarray(ys), jnp.asarray(zs)), dtype=bool)
+            seeds = [s for s, m in zip(seeds, mask) if m]
+            if not seeds:
+                raise RuntimeError("No valid seeds found. Increase --eps or check geometry.")
+        else:
+            # mode == "files": nudge boundary points inward along -N, downsample to nseed
+            seeds_arr = seeds_for_files_surface(file_surface, nseed=nseed, eps=eps)
+            seeds = [tuple(x) for x in seeds_arr]
+            
     # Integrate forward and backward for each seed
     # seeds: List[tuple] → array (S,3)
     seeds_arr = np.asarray(seeds, dtype=np.float64)
@@ -417,16 +482,28 @@ def main(config_path="input.toml",
     # Plot
     fig = plt.figure(figsize=(8,6))
     ax = fig.add_subplot(111, projection="3d")
-    # colored |∇u| surface (with colorbar)
-    mappable, vmin, vmax = add_colored_surface(ax, cfg, u_fn, cmap="viridis", alpha=0.4, stride_theta=1, stride_phi=1)
-    cb = plt.colorbar(mappable, ax=ax, pad=0.05)
-    cb.set_label(r"$|\nabla u|$")
+    if mode == "torus":
+        # colored |∇u| surface with a colorbar on param grid
+        mappable, vmin, vmax = add_colored_surface(ax, cfg, u_fn, cmap="viridis", alpha=0.40,
+                                                stride_theta=1, stride_phi=1)
+    else:
+        # files mode: color the boundary points
+        mappable, vmin, vmax = add_colored_surface_points(ax, file_surface, u_fn, cmap="viridis", alpha=0.90)
+    cb = plt.colorbar(mappable, ax=ax, pad=0.05); cb.set_label(r"$|\nabla u|$")
     for line in Y:  # line: (2*n_save, 3)
         ax.plot(line[:, 0], line[:, 1], line[:, 2], lw=1.2)
     ax.scatter([s[0] for s in seeds], [s[1] for s in seeds], [s[2] for s in seeds], s=20, depthshade=True)
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.set_title("Field lines of ∇u")
     # Box limits
+    if mode == "files":
+        Pb = np.asarray(file_surface.P_bdry)
+        mins = Pb.min(axis=0); maxs = Pb.max(axis=0)
+        pad = 0.10 * float(np.linalg.norm(maxs - mins))
+        x_min, x_max = float(mins[0]-pad), float(maxs[0]+pad)
+        y_min, y_max = float(mins[1]-pad), float(maxs[1]+pad)
+        z_min, z_max = float(mins[2]-pad), float(maxs[2]+pad)
+        box = (x_min, x_max, y_min, y_max, z_min, z_max)
     ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max); ax.set_zlim(z_min, z_max)
     plt.tight_layout()
     plt.show()

@@ -50,6 +50,7 @@ import optax
 import equinox as eqx
 import matplotlib.pyplot as plt
 from jaxopt import LBFGS
+import numpy as np
 
 # ---------------- local imports ----------------
 from _initialization import build_params_from_path
@@ -74,6 +75,7 @@ from _physics import eval_on_boundary, grad_u_total_batch
 from _state import runtime
 from _multisurface import build_torus_family
 from _input_output import dump_effective_toml
+from _geometry_files import build_surfaces_from_files, build_surfaces_from_files_or_npz
 
 # =============================================================================
 # ========================== GLOBAL / PARAM BINDING ===========================
@@ -115,6 +117,34 @@ box_seed: int
 
 # surfaces config (raw dict from TOML; parsed here)
 surfaces_cfg: dict
+
+def _grid_shape_from_len(Nb: int, ntheta_hint: int, nphi_hint: int):
+    """Pick (nθ, nφ) so that nθ*nφ == Nb, preferring hints. Returns (nθ, nφ) or (None, None)."""
+    if ntheta_hint * nphi_hint == Nb:
+        return ntheta_hint, nphi_hint
+    best = (None, None, 10**9)
+    # Search factor pairs close to hints
+    for ntheta in range(2, int(np.sqrt(Nb)) + 2):
+        if Nb % ntheta == 0:
+            nphi = Nb // ntheta
+            score = (ntheta - ntheta_hint)**2 + (nphi - nphi_hint)**2
+            if score < best[2]:
+                best = (ntheta, nphi, score)
+    return (best[0], best[1]) if best[0] is not None else (None, None)
+
+def _imshow_pair(G_init, G_final, title_left="Initial |∇u|", title_right="Final |∇u|", cmap="viridis"):
+    """Small side-by-side imshow for (nθ×nφ) arrays."""
+    import matplotlib.pyplot as plt
+    vmin = float(np.nanmin([G_init.min(), G_final.min()]))
+    vmax = float(np.nanmax([G_init.max(), G_final.max()]))
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    im0 = ax[0].imshow(np.asarray(G_init), origin="lower", aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax[0].set_title(title_left); ax[0].set_xlabel("φ-index"); ax[0].set_ylabel("θ-index")
+    im1 = ax[1].imshow(np.asarray(G_final), origin="lower", aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax[1].set_title(title_right); ax[1].set_xlabel("φ-index")
+    cbar = fig.colorbar(im1, ax=ax.ravel().tolist(), shrink=0.9)
+    cbar.set_label(r"$|\nabla u|$")
+    plt.show()
 
 def _model_signature_tag(params_dict) -> str:
     kind = "SIREN" if bool(params_dict.get("siren", False)) else "MLP"
@@ -622,30 +652,69 @@ def main(config_path: str = "input.toml"):
         final_score = float(eval_total(model, P_in, P_bdry, N_bdry))
         return model, final_score
 
-    elif mode == "torus":
-        # ===== MULTI-SURFACE PRETRAINING =====
-        torus_list = surfaces_cfg.get("torus_list", [])
-        if len(torus_list) == 0:
-            raise RuntimeError("No torus surfaces listed under [[surfaces.torus_list]] for mode='torus'.")
+    elif mode == "torus" or mode == "files":
+        if mode == "torus":
+            # ===== MULTI-SURFACE PRETRAINING =====
+            torus_list = surfaces_cfg.get("torus_list", [])
+            if len(torus_list) == 0:
+                raise RuntimeError("No torus surfaces listed under [[surfaces.torus_list]] for mode='torus'.")
 
-        dataset = build_torus_family(torus_list, N_bdry_theta, N_bdry_phi)
-        print(f"[DATA] Loaded {len(dataset)} torus surfaces for pretraining.")
+            dataset = build_torus_family(torus_list, N_bdry_theta, N_bdry_phi)
+            print(f"[DATA] Loaded {len(dataset)} torus surfaces for pretraining.")
 
-        # Optional: pick first surface for initial plotting/grids (for visualization later)
-        surf0 = dataset[0]
-        # Reconstruct Xg,Yg,Zg grids from flattened boundary points (shape nθ×nφ×3)
-        Pgrid0 = surf0.P_bdry.reshape(N_bdry_theta, N_bdry_phi, 3)
-        Xg0, Yg0, Zg0 = Pgrid0[..., 0], Pgrid0[..., 1], Pgrid0[..., 2]
+            # Optional: pick first surface for initial plotting/grids (for visualization later)
+            surf0 = dataset[0]
+            # Reconstruct Xg,Yg,Zg grids from flattened boundary points (shape nθ×nφ×3)
+            Pgrid0 = surf0.P_bdry.reshape(N_bdry_theta, N_bdry_phi, 3)
+            Xg0, Yg0, Zg0 = Pgrid0[..., 0], Pgrid0[..., 1], Pgrid0[..., 2]
+            has_param_grid0 = True
 
-        # Initial eval on surf0 (use masked interior from the common fixed box)
-        mask0 = surf0.inside_mask_fn(P_box)
-        ids0  = jnp.nonzero(mask0, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
-        P_in0 = P_box[ids0][:N_in]
-        (L0, (Lin0, Lbc0, lap0, n0)) = eval_full(model, P_in0, surf0.P_bdry, surf0.N_bdry)
-        print(f"[INIT:{surf0.name}] loss={float(L0):.6e}  lap={float(Lin0):.6e}  bc={float(Lbc0):.6e}")
+            # Initial eval on surf0 (use masked interior from the common fixed box)
+            mask0 = surf0.inside_mask_fn(P_box)
+            ids0  = jnp.nonzero(mask0, size=min(N_in, P_box.shape[0]), fill_value=0)[0]
+            P_in0 = P_box[ids0][:N_in]
+            (L0, (Lin0, Lbc0, lap0, n0)) = eval_full(model, P_in0, surf0.P_bdry, surf0.N_bdry)
+            print(f"[INIT:{surf0.name}] loss={float(L0):.6e}  lap={float(Lin0):.6e}  bc={float(Lbc0):.6e}")
 
-        # Precompute initial boundary grad for surf0
-        Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+            # Precompute initial boundary grad for surf0
+            Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+
+        elif mode == "files":
+            files_list = surfaces_cfg.get("files", [])
+            if len(files_list) == 0:
+                raise RuntimeError("No entries under [surfaces].files for mode='files'.")
+            # NEW: will expand .npz bundle into many per-surface packs transparently
+            dataset = build_surfaces_from_files_or_npz(files_list)
+            print(f"[DATA] Loaded {len(dataset)} file-based surfaces.")
+
+            surf0 = dataset[0]
+            Pgrid0 = surf0.P_bdry
+
+            # Hints (use the same Nθ,Nφ you trained with)
+            ntheta_hint = int(N_bdry_theta)
+            nphi_hint   = int(N_bdry_phi)
+
+            Nb = int(Pgrid0.shape[0])
+            nθ0, nφ0 = _grid_shape_from_len(Nb, ntheta_hint, nphi_hint)
+
+            has_param_grid0 = (nθ0 is not None) and (nφ0 is not None)
+            if has_param_grid0:
+                # reshape coordinates
+                Xg0 = surf0.P_bdry[:, 0].reshape(nθ0, nφ0)
+                Yg0 = surf0.P_bdry[:, 1].reshape(nθ0, nφ0)
+                Zg0 = surf0.P_bdry[:, 2].reshape(nθ0, nφ0)
+
+                # IMPORTANT: build normals grid + boundary grads consistently
+                # This gives you Gvec_init/Gmag_init on the same (nθ×nφ) grid and Nhat_grid0
+                Gvec_init, Gmag_init, Nhat_grid0 = eval_on_boundary(
+                    model, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0
+                )
+            else:
+                # fallback: flat arrays (scatter/quiver path)
+                Xg0 = Yg0 = Zg0 = None
+                Nhat_grid0 = None
+                Gvec_init  = grad_u_total_batch(model, surf0.P_bdry)  # (Nb,3)
+                Gmag_init  = jnp.linalg.norm(Gvec_init, axis=-1)      # (Nb,)
 
         # Build fixed interior pools ONCE (deterministic) for all surfaces
         packs_all = []
@@ -655,6 +724,8 @@ def main(config_path: str = "input.toml"):
             P_in_all = P_box[ids][:N_in]
             packs_all.append((P_in_all, surf.P_bdry, surf.N_bdry))
         packs_all = tuple(packs_all)  # static for JIT
+        # Anchor interior set used for the training-like eval metric (works for both modes)
+        P_in0 = packs_all[0][0]   # (N_in, 3) for surf0
 
         # ---- Train: aggregate ALL surfaces every step ----
         key_train = random.PRNGKey(1234)
@@ -799,39 +870,112 @@ def main(config_path: str = "input.toml"):
                         linewidth=1.5, alpha=0.7, label='Adam → LBFGS')
             ax.legend()
             plt.show()
-
+            
             # Plot surf0 initial vs final
             mf, ms = eqx.partition(model, eqx.is_inexact_array)
             model_eval = eqx.combine(ema_f, ms) if (use_ema and ema_eval) else model
-            Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
-            vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
-            vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
-            fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
-            gs = fig3d.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
-            ax1 = fig3d.add_subplot(gs[0, 0], projection='3d')
-            ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
-            cax = fig3d.add_subplot(gs[0, 2])
 
-            offset = 0.1 * float(a0 + abs(a1))
-            m1 = plot_surface_with_vectors_ax(ax1, Xg0, Yg0, Zg0, Gmag_init, Nhat_grid0, Gvec=Gvec_init,
-                                            title=f"Initial |∇u| ({surf0.name})",
-                                            cmap=PLOT_CMAP, quiver_len=0.15,
-                                            step_theta=6, step_phi=8, plot_normals=False,
-                                            vmin=vmin_shared, vmax=vmax_shared,
-                                            surf_offset=offset)
-            m2 = plot_surface_with_vectors_ax(ax2, Xg0, Yg0, Zg0, Gmag_final, Nhat_grid0, Gvec=Gvec_final,
-                                            title=f"Final |∇u| ({surf0.name})",
-                                            cmap=PLOT_CMAP, quiver_len=0.15,
-                                            step_theta=6, step_phi=8, plot_normals=False,
-                                            vmin=vmin_shared, vmax=vmax_shared,
-                                            surf_offset=offset)
+            if has_param_grid0:
+                # ---- TORUS (has param grid) ----
+                Gvec_final, Gmag_final, _ = eval_on_boundary(model_eval, surf0.P_bdry, surf0.N_bdry, Xg0, Yg0, Zg0)
+                vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
+                vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
 
-            draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
-            draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+                fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
+                gs = fig3d.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
+                ax1 = fig3d.add_subplot(gs[0, 0], projection='3d')
+                ax2 = fig3d.add_subplot(gs[0, 1], projection='3d')
+                cax = fig3d.add_subplot(gs[0, 2])
 
-            cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
-            fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
-            plt.show()
+                # Use a bbox-based offset instead of a0/a1 so it also works in files mode
+                # (safe here too)
+                mins = jnp.min(surf0.P_bdry, axis=0)
+                maxs = jnp.max(surf0.P_bdry, axis=0)
+                diag = float(jnp.linalg.norm(maxs - mins))
+                offset = 0.05 * diag
+
+                m1 = plot_surface_with_vectors_ax(ax1, Xg0, Yg0, Zg0, Gmag_init, Nhat_grid0, Gvec=Gvec_init,
+                                                title=f"Initial |∇u| ({surf0.name})",
+                                                cmap=PLOT_CMAP, quiver_len=0.15,
+                                                step_theta=6, step_phi=8, plot_normals=False,
+                                                vmin=vmin_shared, vmax=vmax_shared,
+                                                surf_offset=offset)
+                m2 = plot_surface_with_vectors_ax(ax2, Xg0, Yg0, Zg0, Gmag_final, Nhat_grid0, Gvec=Gvec_final,
+                                                title=f"Final |∇u| ({surf0.name})",
+                                                cmap=PLOT_CMAP, quiver_len=0.15,
+                                                step_theta=6, step_phi=8, plot_normals=False,
+                                                vmin=vmin_shared, vmax=vmax_shared,
+                                                surf_offset=offset)
+
+                draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+                draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+
+                cb = fig3d.colorbar(m2, cax=cax); cb.set_label(r"$|\nabla u|$")
+                fix_matplotlib_3d(ax1); fix_matplotlib_3d(ax2)
+                plt.show()
+
+                if (nθ0 is not None) and (nφ0 is not None):
+                    G_init_grid  = np.asarray(Gmag_init).reshape(Xg0.shape)
+                    G_final_grid = np.asarray(Gmag_final).reshape(Xg0.shape)
+                    _imshow_pair(G_init_grid, G_final_grid,
+                                title_left=f"Initial |∇u| ({surf0.name})",
+                                title_right=f"Final |∇u| ({surf0.name})",
+                                cmap=PLOT_CMAP)
+
+            else:
+                # ---- FILES (scattered boundary points) ----
+                Pb = surf0.P_bdry
+
+                # Initial values were computed earlier as Gvec_init, Gmag_init on Pb
+                # Compute final values now on the same Pb:
+                Nb = int(surf0.P_bdry.shape[0])
+                ntheta_hint = int(N_bdry_theta)
+                nphi_hint   = int(N_bdry_phi)
+                nθ0, nφ0 = _grid_shape_from_len(Nb, ntheta_hint, nphi_hint)
+
+                # Compute final grads (flat)
+                Gvec_final = grad_u_total_batch(model_eval, surf0.P_bdry)     # (Nb,3)
+                Gmag_final = jnp.linalg.norm(Gvec_final, axis=-1)             # (Nb,)
+
+                vmin_shared = float(jnp.minimum(Gmag_init.min(), Gmag_final.min()))
+                vmax_shared = float(jnp.maximum(Gmag_init.max(), Gmag_final.max()))
+
+                fig3d = plt.figure(figsize=(12, 6), constrained_layout=True)
+                ax1 = fig3d.add_subplot(1, 2, 1, projection='3d')
+                ax2 = fig3d.add_subplot(1, 2, 2, projection='3d')
+
+                # Initial scatter/quiver
+                sc1 = ax1.scatter(Pb[:,0], Pb[:,1], Pb[:,2],
+                                c=np.asarray(Gmag_init).reshape(-1),
+                                vmin=vmin_shared, vmax=vmax_shared, cmap=PLOT_CMAP, s=1)
+                step = max(1, Pb.shape[0] // 1500)
+                Qids = jnp.arange(0, Pb.shape[0], step)
+                V1 = Gvec_init.reshape(-1, 3)[Qids]
+                P1 = Pb[Qids]
+                ax1.quiver(P1[:,0], P1[:,1], P1[:,2], V1[:,0], V1[:,1], V1[:,2], length=0.05, normalize=True)
+                ax1.set_title(f"Initial |∇u| ({surf0.name})"); fix_matplotlib_3d(ax1)
+                draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+
+                # Final scatter/quiver
+                sc2 = ax2.scatter(Pb[:,0], Pb[:,1], Pb[:,2],
+                                c=np.asarray(Gmag_final).reshape(-1),
+                                vmin=vmin_shared, vmax=vmax_shared, cmap=PLOT_CMAP, s=1)
+                V2 = Gvec_final.reshape(-1, 3)[Qids]
+                P2 = Pb[Qids]
+                ax2.quiver(P2[:,0], P2[:,1], P2[:,2], V2[:,0], V2[:,1], V2[:,2], length=0.05, normalize=True)
+                ax2.set_title(f"Final |∇u| ({surf0.name})"); fix_matplotlib_3d(ax2)
+                draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
+
+                cbar = fig3d.colorbar(sc2, ax=[ax1, ax2], shrink=0.85); cbar.set_label(r"$|\nabla u|$")
+                plt.show()
+                
+                # --- NEW: Imshow using inferred grid shape (simple & compact) ---
+                G_init_grid  = np.asarray(Gmag_init).reshape(nθ0, nφ0)
+                G_final_grid = np.asarray(Gmag_final).reshape(nθ0, nφ0)
+                _imshow_pair(G_init_grid, G_final_grid,
+                            title_left=f"Initial |∇u| ({surf0.name})",
+                            title_right=f"Final |∇u| ({surf0.name})",
+                            cmap=PLOT_CMAP)
             
         # mean across all packs for a stable metric
         final_score = 0.0
