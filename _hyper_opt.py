@@ -187,9 +187,54 @@ def suggest_params(trial: Trial, base_raw_cfg: Dict[str, Any], *, vary_steps: bo
         model_tbl["fourier_scale"] = 2.0 * math.pi
 
     # hidden sizes: choose width + depth pattern
-    depth = trial.suggest_int("model.depth", 2, 5)
-    width = trial.suggest_categorical("model.width", [32, 48, 64, 96, 128])
-    model_tbl["hidden_sizes"] = [int(width)] * int(depth)
+    # --- Hidden sizes: broaden search + allow shape patterns ---
+    # Depth: include deeper options; PINN/SIREN often 3–6, occasionally 7–8.
+    depth = int(trial.suggest_int("model.depth", 3, 7))
+
+    # Base width: widen range (keep moderate priors)
+    width = int(trial.suggest_categorical("model.width", [32, 48, 64, 96, 128, 192, 256]))
+
+    # Pattern: uniform / pyramid / bottleneck
+    arch_pattern = trial.suggest_categorical("model.arch_pattern", ["uniform", "pyramid", "bottleneck"])
+
+    def build_hidden_sizes(depth: int, width: int, pattern: str):
+        # ensure at least 2 to form a "shape" if needed
+        d = max(2, depth)
+
+        if pattern == "uniform":
+            return [width] * depth
+
+        # choose two scale factors to vary ends vs middle
+        # favor modest variation (helps conditioning)
+        widen_outer = trial.suggest_categorical("model.arch_outer_scale", [0.75, 1.0, 1.25])
+        widen_mid   = trial.suggest_categorical("model.arch_mid_scale",   [1.0, 1.25, 1.5])
+
+        if pattern == "pyramid":
+            # increasing to the middle, then decreasing (symmetric-ish)
+            left = [int(round(width * (1 + (widen_mid - 1) * (i/(d/2))))) for i in range(d//2)]
+            if (d % 2) == 1:
+                mid  = [int(round(width * widen_mid))]
+                right= left[::-1]
+                return (left + mid + right)[:depth]
+            else:
+                right= left[::-1]
+                return (left + right)[:depth]
+
+        if pattern == "bottleneck":
+            # wide → narrow → wide
+            left = [int(round(width * (1 + (widen_outer - 1) * (1 - i/(d/2))))) for i in range(d//2)]
+            if (d % 2) == 1:
+                mid  = [int(round(width * (2 - widen_outer)))]
+                right= left[::-1]
+                return (left + mid + right)[:depth]
+            else:
+                right= left[::-1]
+                return (left + right)[:depth]
+
+        # fallback
+        return [width] * depth
+
+    model_tbl["hidden_sizes"] = build_hidden_sizes(depth, width, arch_pattern)
 
     # pin R0_for_fourier to geometry.R0 unless user set it
     geom_tbl = _ensure_table(cfg, "geometry")

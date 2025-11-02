@@ -47,7 +47,7 @@ interior = 2048  # interior points per step
 boundary = 2048  # boundary points per step
 
 [multi_valued]
-kappa = 0.2   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
+kappa = 0.924   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
 
 [sampling]
 N_in = 10000          # interior sample count
@@ -57,12 +57,12 @@ rng_seed = 0
 bdry_presample_mult = 16     # importance-sampling pre-pool multiplier
 
 [regularization]
-zero_mean_weight = 0.1      # was hard-coded default via runtime
+zero_mean_weight = 0.455      # was hard-coded default via runtime
 
 [model]
 hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
-activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
-siren = true            # turn on true SIREN init/forward
+activation = "softplus" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
+siren = false            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
 use_fourier = false            # turn positional encoding on/off
 fourier_bands = [1.0, 2.0, 4.0, 8.0]   # frequency multipliers (in 1/R0 units)
@@ -70,12 +70,12 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 500
-lr = 0.003
-lam_bc = 5.0
+steps = 2500
+lr = 0.00075
+lam_bc = 1.92
 log_every = 50
 mini_epoch = 51
-lam_warm = 50.0      # initial (warm-start) λ for boundary loss
+lam_warm = 11.6      # initial (warm-start) λ for boundary loss
 
 lam_grad = 0.0                 # 0 disables gradient-matching
 grad_target_backprop = false    # usually keep false at first
@@ -92,22 +92,22 @@ lbfgs_boundary = 0     # per surface boundary points used by LBFGS
 lbfgs_weighting = "equal" # reserved for future weighting policies
 
 use_augmented_lagrangian = true   # false keeps old behavior
-al_rho = 1.0                      # penalty (ρ) for the AL quadratic term
-al_update_every = 10              # how often to update λ_AL (in steps)
-al_clip = 0.0                     # optional: clip |λ_AL| to this value; 0 disables
+al_rho = 0.623                      # penalty (ρ) for the AL quadratic term
+al_update_every = 15              # how often to update λ_AL (in steps)
+al_clip = 4.33                     # optional: clip |λ_AL| to this value; 0 disables
 
-grad_clip_norm = 1.0
-weight_decay = 0           # decoupled WD in AdamW (set >0 to use)
+grad_clip_norm = 2.74
+weight_decay = 5.46e-8           # decoupled WD in AdamW (set >0 to use)
 #lr_warmup_steps = 0          # e.g., 200
 lr_warmup_frac = 0.05 
-lr_min_ratio = 0.05          # cosine floor: lr_min = lr * lr_min_ratio
+lr_min_ratio = 0.031          # cosine floor: lr_min = lr * lr_min_ratio
 use_ema = false
 ema_decay = 0.999                 # Polyak EMA decay
 ema_eval = true                   # use EMA params for eval & LBFGS init
 
 use_lookahead = false
-lookahead_sync_period = 5        # k steps between slow-weight syncs
-lookahead_slow_step = 0.5        # α (0..1), typical 0.5
+lookahead_sync_period = 8        # k steps between slow-weight syncs
+lookahead_slow_step = 0.307        # α (0..1), typical 0.5
 
 lbfgs_l2 = 0.0
 
