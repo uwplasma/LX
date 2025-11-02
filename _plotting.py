@@ -243,59 +243,60 @@ def debug_plot_normals(
     N_len = np.linalg.norm(N, axis=-1)         # <-- correct array; not Nb_pts
 
     # === 3D overlay plot ===
-    fig = plt.figure(figsize=(12, 5), constrained_layout=True)
-    axL = fig.add_subplot(1, 2, 1, projection="3d")
-    axR = fig.add_subplot(1, 2, 2, projection="3d")
+    if show_plots:
+        fig = plt.figure(figsize=(12, 5), constrained_layout=True)
+        axL = fig.add_subplot(1, 2, 1, projection="3d")
+        axR = fig.add_subplot(1, 2, 2, projection="3d")
 
-    sc = axL.scatter(P[:,0], P[:,1], P[:,2], c=angles_deg, s=2, cmap=cmap)
-    cb = fig.colorbar(sc, ax=axL, shrink=0.8)
-    cb.set_label("angle(N, N_ref) [deg]")
-    axL.set_title(f"{title_prefix}: angle to PCA normal")
+        sc = axL.scatter(P[:,0], P[:,1], P[:,2], c=angles_deg, s=2, cmap=cmap)
+        cb = fig.colorbar(sc, ax=axL, shrink=0.8)
+        cb.set_label("angle(N, N_ref) [deg]")
+        axL.set_title(f"{title_prefix}: angle to PCA normal")
 
-    step = max(1, Nb_pts // min(Nb_pts, quiver_max))
-    QP = P[::step]; QN = N[::step]
-    axL.quiver(QP[:,0], QP[:,1], QP[:,2], QN[:,0], QN[:,1], QN[:,2],
-               length=quiver_len, normalize=True, linewidth=0.6)
+        step = max(1, Nb_pts // min(Nb_pts, quiver_max))
+        QP = P[::step]; QN = N[::step]
+        axL.quiver(QP[:,0], QP[:,1], QP[:,2], QN[:,0], QN[:,1], QN[:,2],
+                length=quiver_len, normalize=True, linewidth=0.6)
 
-    sc2 = axR.scatter(P[:,0], P[:,1], P[:,2], c=tan_leak, s=2, cmap=cmap)
-    cb2 = fig.colorbar(sc2, ax=axR, shrink=0.8)
-    cb2.set_label(r"$\|N - (N\cdot N_{\rm ref}) N_{\rm ref}\|$  (tangent leakage)")
-    axR.set_title(f"{title_prefix}: tangent leakage")
-    QNref = N_ref[::step]
-    axR.quiver(QP[:,0], QP[:,1], QP[:,2], QNref[:,0], QNref[:,1], QNref[:,2],
-               length=quiver_len, normalize=True, linewidth=0.6)
+        sc2 = axR.scatter(P[:,0], P[:,1], P[:,2], c=tan_leak, s=2, cmap=cmap)
+        cb2 = fig.colorbar(sc2, ax=axR, shrink=0.8)
+        cb2.set_label(r"$\|N - (N\cdot N_{\rm ref}) N_{\rm ref}\|$  (tangent leakage)")
+        axR.set_title(f"{title_prefix}: tangent leakage")
+        QNref = N_ref[::step]
+        axR.quiver(QP[:,0], QP[:,1], QP[:,2], QNref[:,0], QNref[:,1], QNref[:,2],
+                length=quiver_len, normalize=True, linewidth=0.6)
 
-    for ax in (axL, axR):
-        ax.set_box_aspect([np.ptp(P[:,0]), np.ptp(P[:,1]), np.ptp(P[:,2])])
-        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+        for ax in (axL, axR):
+            ax.set_box_aspect([np.ptp(P[:,0]), np.ptp(P[:,1]), np.ptp(P[:,2])])
+            ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+        
+        plt.show()
 
-    if show_plots: plt.show()
+        # === Histograms / summary ===
+        fig2, axs = plt.subplots(1, 3, figsize=(12, 3.5), constrained_layout=True)
+        axs[0].hist(angles_deg, bins=50)
+        axs[0].set_title("angle(N, N_ref) [deg]")
+        axs[0].set_xlabel("deg"); axs[0].set_ylabel("count")
 
-    # === Histograms / summary ===
-    fig2, axs = plt.subplots(1, 3, figsize=(12, 3.5), constrained_layout=True)
-    axs[0].hist(angles_deg, bins=50)
-    axs[0].set_title("angle(N, N_ref) [deg]")
-    axs[0].set_xlabel("deg"); axs[0].set_ylabel("count")
+        axs[1].hist(tan_leak, bins=50)
+        axs[1].set_title("tangent leakage")
+        axs[1].set_xlabel("||N - (N·Nref)Nref||")
 
-    axs[1].hist(tan_leak, bins=50)
-    axs[1].set_title("tangent leakage")
-    axs[1].set_xlabel("||N - (N·Nref)Nref||")
+        Nf = N_len[np.isfinite(N_len)]
+        if Nf.size == 0:
+            Nf = np.array([0.0])
+        rng = float(Nf.max() - Nf.min())
+        if rng == 0.0:
+            bins = "auto"; range_kw = None
+        else:
+            bins = 50
+            pad = 0.02 * rng + 1e-8
+            range_kw = (float(Nf.min() - pad), float(Nf.max() + pad))
 
-    Nf = N_len[np.isfinite(N_len)]
-    if Nf.size == 0:
-        Nf = np.array([0.0])
-    rng = float(Nf.max() - Nf.min())
-    if rng == 0.0:
-        bins = "auto"; range_kw = None
-    else:
-        bins = 50
-        pad = 0.02 * rng + 1e-8
-        range_kw = (float(Nf.min() - pad), float(Nf.max() + pad))
-
-    axs[2].hist(Nf, bins=bins, range=range_kw)
-    axs[2].set_title(r"Histogram of $\|{\bf n}\|$")
-    axs[2].set_xlabel("norm")
-    if show_plots: plt.show()
+        axs[2].hist(Nf, bins=bins, range=range_kw)
+        axs[2].set_title(r"Histogram of $\|{\bf n}\|$")
+        axs[2].set_xlabel("norm")
+        plt.show()
 
     # Print quick stats
     _stat_line("angle(deg)", angles_deg, fmt=".3f")

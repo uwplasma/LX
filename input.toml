@@ -1,7 +1,7 @@
 [hyperparameter_optimization]
-hpo_disable_plots = false
-hpo_disable_ckpt = false
-hpo_disable_lbfgs = false
+hpo_disable_plots = true
+hpo_disable_ckpt = true
+hpo_disable_lbfgs = true
 
 [surfaces]       # "single" | "torus" | "files"
 mode = "files"   
@@ -70,7 +70,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 2000
+steps = 500
 lr = 0.003
 lam_bc = 5.0
 log_every = 50

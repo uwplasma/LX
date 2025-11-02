@@ -365,7 +365,7 @@ def loss_fn_batch(params, pts_interior, pts_bdry, normals_bdry, key: jax.Array):
 # Filtered versions keep non-JAX parts (if any) out of JIT
 loss_value_and_grad = eqx.filter_value_and_grad(loss_fn_batch, has_aux=True)
 
-@eqx.filter_jit(donate="all")
+@eqx.filter_jit
 def train_step(params, opt_state, optimizer, pts_interior, pts_bdry, normals_bdry, key):
     (loss_val, aux), grads = loss_value_and_grad(params, pts_interior, pts_bdry, normals_bdry, key)
     params_f, params_s = eqx.partition(params, eqx.is_inexact_array)
@@ -614,7 +614,7 @@ def loss_many(params,
 
 loss_many_value_and_grad = eqx.filter_value_and_grad(loss_many, has_aux=True)
 
-@eqx.filter_jit(donate="all")
+@eqx.filter_jit
 def train_step_many(params,
                     opt_state,
                     optimizer,

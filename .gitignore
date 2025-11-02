@@ -215,3 +215,4 @@ pyqsc_surface.csv
 wout.nc
 wout_surface.csv
 wout_surface_normals.csv
+lx_optuna.db.schema.lock.lock

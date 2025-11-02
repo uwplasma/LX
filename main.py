@@ -576,6 +576,9 @@ def main(config_path: str = "input.toml"):
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
+    ema_f = None          # placeholder; will be (tree copy) if use_ema later
+    slow_f = None         # placeholder; will be (tree copy) if use_lookahead later
+
     like_state = TrainState(
         opt_state=opt_state,
         ema_f=(ema_f if bool(params.get("use_ema", False)) else None),
