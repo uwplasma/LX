@@ -460,7 +460,7 @@ class SirenMLP(eqx.Module):
         # Hidden layers init: U[-sqrt(6/in)/omega0, +sqrt(6/in)/omega0]
         for li, width in enumerate(widths[1:], start=1):
             prev = widths[li-1]
-            bound = jnp.sqrt(6.0/prev) / self.omega0
+            bound = jnp.sqrt(6.0/prev)# / self.omega0
             W = jax.random.uniform(keys[li], (width, prev), minval=-bound, maxval=bound)
             b = jnp.zeros((width,))
             self.layers.append((W, b))

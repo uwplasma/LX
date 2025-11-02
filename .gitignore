@@ -214,3 +214,4 @@ qsc_surfaces_from_api.npz
 pyqsc_surface.csv
 wout.nc
 wout_surface.csv
+wout_surface_normals.csv

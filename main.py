@@ -55,7 +55,8 @@ import dataclasses
 
 # ---------------- local imports ----------------
 from _initialization import build_params_from_path
-from _plotting import fix_matplotlib_3d, plot_surface_with_vectors_ax, draw_box_edges
+from _plotting import (fix_matplotlib_3d, plot_surface_with_vectors_ax,
+                       draw_box_edges, debug_plot_normals)
 from _geometry import (
     surface_points_and_normals,
     fixed_box_points,
@@ -79,6 +80,7 @@ from _multisurface import build_torus_family
 from _input_output import dump_effective_toml
 from _geometry_files import build_surfaces_from_files, build_surfaces_from_files_or_npz
 from _train_state import save_train_state, load_train_state, TrainState
+from _normals_debug import compare_normals_report
 
 # =============================================================================
 # ========================== GLOBAL / PARAM BINDING ===========================
@@ -605,6 +607,9 @@ def main(config_path: str = "input.toml"):
 
         runtime.restored_step = restored_step
         runtime.al_lambda = _al_val
+        # Clamp the restored AL multiplier to a sane range before any use
+        if getattr(runtime, "al_enabled", False):
+            runtime.al_lambda = float(np.clip(float(runtime.al_lambda), -2.0, 2.0))
 
         # core state trees/keys
         opt_state = ts.opt_state
@@ -668,6 +673,29 @@ def main(config_path: str = "input.toml"):
         # ===== SINGLE SURFACE (as before) =====
         # Build boundary grid for the current runtime geometry:
         P_bdry, N_bdry, Xg, Yg, Zg = surface_points_and_normals(N_bdry_theta, N_bdry_phi)
+        N_bdry = debug_plot_normals(
+            P_bdry=np.asarray(P_bdry),
+            N_bdry=np.asarray(N_bdry),
+            k_pca=20,
+            quiver_max=1500,
+            quiver_len=0.06,
+            title_prefix="Boundary normals",
+            align_provided_to_pca=True,
+            show_plots=False,#not HPO_DISABLE_PLOTS,
+        )
+        # -------- NEW: hard verification that we use the provided normals ----------
+        # Try to detect grid shape (Xg,Yg,Zg exist here)
+        norm_report = compare_normals_report(
+            name="single",
+            P_bdry=np.asarray(P_bdry),
+            N_provided=np.asarray(N_bdry),
+            grid_shape=(int(Xg.shape[0]), int(Xg.shape[1])),
+            X=np.asarray(Xg), Y=np.asarray(Yg), Z=np.asarray(Zg),
+            use_fourth_order=True,
+            do_pca_check=True,
+            print_hist=True,
+        )
+        # If outwardness disagrees or angles are huge, you’ll see it in the prints.
 
         # Robust outwardness check (centroid test)
         P_grid = jnp.stack([Xg, Yg, Zg], axis=-1)                              # (nθ,nφ,3)
@@ -906,6 +934,18 @@ def main(config_path: str = "input.toml"):
                 raise RuntimeError("No torus surfaces listed under [[surfaces.torus_list]] for mode='torus'.")
 
             dataset = build_torus_family(torus_list, N_bdry_theta, N_bdry_phi)
+            # === Normalize/align normals for ALL torus surfaces once ===
+            for surf in dataset:
+                surf.N_bdry = debug_plot_normals(
+                    P_bdry=np.asarray(surf.P_bdry),
+                    N_bdry=np.asarray(surf.N_bdry),
+                    k_pca=20,
+                    quiver_max=1500,
+                    quiver_len=0.06,
+                    title_prefix=f"{surf.name} normals",
+                    align_provided_to_pca=True,
+                    show_plots=not HPO_DISABLE_PLOTS,
+                )
             print(f"[DATA] Loaded {len(dataset)} torus surfaces for pretraining.")
 
             # Optional: pick first surface for initial plotting/grids (for visualization later)
@@ -937,6 +977,49 @@ def main(config_path: str = "input.toml"):
             dataset = build_surfaces_from_files_or_npz(files_list)
             print(f"[DATA] Loaded {len(dataset)} file-based surfaces.")
 
+            # === Normalize/align normals for ALL file-based surfaces once ===
+            for surf in dataset:
+                surf.N_bdry = debug_plot_normals(
+                    P_bdry=np.asarray(surf.P_bdry),
+                    N_bdry=np.asarray(surf.N_bdry),
+                    k_pca=20,
+                    quiver_max=1500,
+                    quiver_len=0.06,
+                    title_prefix=f"{surf.name} normals",
+                    align_provided_to_pca=True,
+                    show_plots=False,#not HPO_DISABLE_PLOTS,
+                )
+                # ---- NEW: verification per surface
+                shp = getattr(surf, "shape_thetaphi", None)
+                if shp is not None:
+                    nT, nP = int(shp[0]), int(shp[1])
+                    P0 = np.asarray(surf.P_bdry)
+                    X0 = P0[:, 0].reshape(nT, nP, order="C")
+                    Y0 = P0[:, 1].reshape(nT, nP, order="C")
+                    Z0 = P0[:, 2].reshape(nT, nP, order="C")
+                    compare_normals_report(
+                        name=surf.name,
+                        P_bdry=P0,
+                        N_provided=np.asarray(surf.N_bdry),
+                        grid_shape=(nT, nP),
+                        X=X0, Y=Y0, Z=Z0,
+                        use_fourth_order=True,
+                        do_pca_check=True,
+                        print_hist=False,
+                    )
+                else:
+                    compare_normals_report(
+                        name=surf.name,
+                        P_bdry=np.asarray(surf.P_bdry),
+                        N_provided=np.asarray(surf.N_bdry),
+                        grid_shape=None,
+                        X=None, Y=None, Z=None,
+                        use_fourth_order=False,
+                        do_pca_check=True,
+                        print_hist=False,
+                    )
+
+            # Keep using surf0 for previews/plots below
             surf0 = dataset[0]
 
             # Detect whether this surface came from a parametric grid (NPZ) or is a point cloud
@@ -1228,7 +1311,7 @@ def main(config_path: str = "input.toml"):
                 Qids = jnp.arange(0, Pb.shape[0], step)
                 V1 = Gvec_init.reshape(-1, 3)[Qids]
                 P1 = Pb[Qids]
-                ax1.quiver(P1[:,0], P1[:,1], P1[:,2], V1[:,0], V1[:,1], V1[:,2], length=0.05, normalize=True)
+                ax1.quiver(P1[:,0], P1[:,1], P1[:,2], V1[:,0], V1[:,1], V1[:,2], length=0.25, normalize=True)
                 ax1.set_title(f"Initial |∇u| ({surf0.name})"); fix_matplotlib_3d(ax1)
                 draw_box_edges(ax1, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
 
@@ -1238,7 +1321,7 @@ def main(config_path: str = "input.toml"):
                                 vmin=vmin_shared, vmax=vmax_shared, cmap=PLOT_CMAP, s=1)
                 V2 = Gvec_final.reshape(-1, 3)[Qids]
                 P2 = Pb[Qids]
-                ax2.quiver(P2[:,0], P2[:,1], P2[:,2], V2[:,0], V2[:,1], V2[:,2], length=0.05, normalize=True)
+                ax2.quiver(P2[:,0], P2[:,1], P2[:,2], V2[:,0], V2[:,1], V2[:,2], length=0.25, normalize=True)
                 ax2.set_title(f"Final |∇u| ({surf0.name})"); fix_matplotlib_3d(ax2)
                 draw_box_edges(ax2, xmin, xmax, ymin, ymax, zmin, zmax, lw=1.0, alpha=0.6)
 

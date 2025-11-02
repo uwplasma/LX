@@ -11,6 +11,8 @@ Requires: jax, jaxlib, equinox, diffrax, optax, toml (or tomllib on 3.11+), nump
 """
 
 from __future__ import annotations
+import jax
+jax.config.update("jax_enable_x64", True)
 import os, sys, math
 from pathlib import Path
 from typing import Sequence, Tuple, Callable, List, Optional
@@ -18,12 +20,14 @@ from typing import Sequence, Tuple, Callable, List, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 
-import jax
 import jax.numpy as jnp
 import equinox as eqx
 import diffrax as dfx
 
 import matplotlib as mpl
+
+from fractions import Fraction
+
 
 # -----------------------------
 # Project-local imports (edit if your paths differ)
@@ -36,6 +40,133 @@ from _state import runtime
 from _geometry import build_surface_torus
 from _geometry_files import build_surfaces_from_files   # files mode
 from _multisurface import SurfaceItem                    # dataclass with P_bdry, N_bdry, inside_mask_fn
+
+# -----------------------------
+# JAX Poincaré (dense, JIT-safe; no dynamic indexing)
+# -----------------------------
+# ---------- Plot helpers (paper-quality & equal aspect) ----------
+def apply_paper_style():
+    """Good-looking defaults for papers. scale in {"1col","2col"}."""
+    # if scale == "1col":
+    # fig_w = 3.4  # inches (APS single column ≈ 3.375")
+    # else:
+    fig_w = 5.5  # inches (two-column width)
+    mpl.rcParams.update({
+        "figure.figsize": (fig_w, fig_w),   # square Poincaré
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "font.size": 12,        # base font
+        "axes.titlesize": 13,
+        "axes.labelsize": 12.5,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 10.5,
+        "axes.linewidth": 0.9,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "xtick.minor.width": 0.6,
+        "ytick.minor.width": 0.6,
+        "xtick.major.size": 4,
+        "ytick.major.size": 4,
+        "xtick.minor.size": 2.5,
+        "ytick.minor.size": 2.5,
+        # Keep mathtext (no LaTeX dependency); looks good enough for most journals
+        "text.usetex": False,
+    })
+    return fig_w
+
+def set_equal_data_aspect(ax, rmin, rmax, zmin, zmax, pad_frac=0.03):
+    """Make x/y have equal scale based on data limits, with symmetric padding."""
+    # Initial padded limits
+    def _pad(lo, hi, frac):
+        span = hi - lo
+        if span <= 0:
+            span = max(1e-6, abs(hi) if abs(hi) > 0 else 1.0)
+        pad = frac * span
+        return lo - pad, hi + pad
+
+    rlo, rhi = _pad(float(rmin), float(rmax), pad_frac)
+    zlo, zhi = _pad(float(zmin), float(zmax), pad_frac)
+
+    # Enforce equal data span: expand the smaller range to match the larger
+    rc = 0.5 * (rlo + rhi)
+    zc = 0.5 * (zlo + zhi)
+    rspan = rhi - rlo
+    zspan = zhi - zlo
+    span = max(rspan, zspan)
+    rlo, rhi = rc - 0.5*span, rc + 0.5*span
+    zlo, zhi = zc - 0.5*span, zc + 0.5*span
+
+    ax.set_xlim(rlo, rhi)
+    ax.set_ylim(zlo, zhi)
+    ax.set_aspect("equal", adjustable="box")  # 1 unit in R equals 1 unit in Z
+
+def _angle_wrap_jnp(a):
+    return (a + jnp.pi) % (2*jnp.pi) - jnp.pi
+
+def _wrap_diff_jnp(a_minus_b):
+    return _angle_wrap_jnp(a_minus_b)
+
+@jax.jit
+def poincare_RZ_points_jax_dense(Y_all: jnp.ndarray, phi0: float):
+    """
+    Y_all: (S, T, 3) with possible NaNs after exit masking.
+    phi0: scalar (radians).
+    Returns:
+      R_flat: (S*(T-1),)
+      Z_flat: (S*(T-1),)
+      mask_flat: bool (S*(T-1),) indicating which entries are true crossings.
+    """
+    # Valid samples
+    valid = ~jnp.any(jnp.isnan(Y_all), axis=-1)            # (S,T)
+
+    # Coordinates & angle
+    X = Y_all[..., 0]; Y = Y_all[..., 1]; Z = Y_all[..., 2]
+    phi = jnp.arctan2(Y, X)                                # (S,T)
+    dphi = _wrap_diff_jnp(phi - phi0)                      # (S,T)
+    s = jnp.sign(dphi)
+    s = jnp.where(s == 0.0, 1.0, s)
+
+    # Segment endpoints (between t and t+1)
+    valid_seg = valid[..., :-1] & valid[..., 1:]           # (S,T-1)
+    changed   = (s[..., :-1] * s[..., 1:] < 0.0) & valid_seg
+
+    # Gather all segments densely
+    p0 = Y_all[:, :-1, :]                                  # (S,T-1,3)
+    p1 = Y_all[:,  1:, :]                                  # (S,T-1,3)
+    d0 = dphi[:, :-1]                                      # (S,T-1)
+    d1 = dphi[:,  1:]                                      # (S,T-1)
+
+    # Linear interpolation fraction for *every* segment
+    t = d0 / (d0 - d1)
+    t = jnp.clip(t, 0.0, 1.0)
+
+    # Interpolated points (S,T-1,3)
+    p = p0 + t[..., None] * (p1 - p0)
+
+    # Cylindrical R and Z for all candidates
+    R = jnp.linalg.norm(p[..., :2], axis=-1)               # (S,T-1)
+    Zc = p[..., 2]                                         # (S,T-1)
+
+    # Flatten (static shape) + flatten mask
+    R_flat    = R.reshape(-1)
+    Z_flat    = Zc.reshape(-1)
+    mask_flat = changed.reshape(-1)
+
+    return R_flat, Z_flat, mask_flat
+
+def poincare_multi_phi_jax(Y_all: jnp.ndarray, phis: jnp.ndarray):
+    """
+    Vectorized over multiple φ values.
+    Returns Python lists (ragged after masking) for easy plotting.
+    """
+    # vmapped dense outputs with static shapes
+    R_flat, Z_flat, M_flat = jax.vmap(poincare_RZ_points_jax_dense, in_axes=(None, 0))(Y_all, phis)
+    # Convert each φ's flat arrays to NumPy and apply masks on CPU (variable length ok here)
+    R_list = [np.asarray(R_flat[k])[np.asarray(M_flat[k])] for k in range(R_flat.shape[0])]
+    Z_list = [np.asarray(Z_flat[k])[np.asarray(M_flat[k])] for k in range(Z_flat.shape[0])]
+    return R_list, Z_list
+
 
 # Files helpers
 
@@ -74,6 +205,32 @@ def seeds_for_files_surface(surf: SurfaceItem, nseed: int = 25, eps: float = 1e-
         Pi = Pi[::stride][:nseed]
     return Pi.astype(np.float64)
 
+def phi_label_pi(phi: float, wrap=True, max_den=24) -> str:
+    """
+    Return LaTeX string like r"$\\phi=\\pi/2$" for a given angle in radians.
+    - wrap=True: first wrap phi into (-pi, pi]; set False to use raw value
+    - max_den: limit denominator when approximating rational multiples of pi
+    """
+    if wrap:
+        # wrap to (-pi, pi]
+        phi = (phi + np.pi) % (2*np.pi) - np.pi
+
+    r = Fraction(phi / np.pi).limit_denominator(max_den)
+    p, q = r.numerator, r.denominator
+
+    def _mul_pi(pp, qq):
+        if pp == 0:
+            return "0"
+        sign = "-" if pp < 0 else ""
+        pp = abs(pp)
+        if qq == 1:
+            coeff = "" if pp == 1 else f"{pp}"
+            return f"{sign}{coeff}\\pi"
+        else:
+            coeff = "" if pp == 1 else f"{pp}"
+            return f"{sign}{coeff}\\pi/{qq}"
+
+    return rf"$\phi={_mul_pi(p, q)}$"
 
 def add_colored_surface_points(ax, surf: SurfaceItem, u_fn, *, cmap="viridis", alpha=0.9):
     """
@@ -394,8 +551,8 @@ def main(config_path="input.toml",
          eps: float = 1e-3,
          save_stride: int = 1,
          rtol: float = 1e-5,
-         atol: float = 1e-7):
-    jax.config.update("jax_enable_x64", True)
+         atol: float = 1e-7,
+         n_save: int = 2001,):
 
     cfg = load_config(config_path)
     apply_runtime_from_config(cfg)   # <<< make geometry use the same runtime as main.py
@@ -469,16 +626,68 @@ def main(config_path="input.toml",
     # Forward and backward in parallel
     ts_f, Yf = integrate_streamlines_vmap(
         seeds_arr, f, t_final=t_final, box=box,
-        backward=False, n_save=args.n_save, rtol=rtol, atol=atol
+        backward=False, n_save=n_save, rtol=rtol, atol=atol
     )
     ts_b, Yb = integrate_streamlines_vmap(
         seeds_arr, f, t_final=t_final, box=box,
-        backward=True,  n_save=args.n_save, rtol=rtol, atol=atol
+        backward=True,  n_save=n_save, rtol=rtol, atol=atol
     )
 
     # Concatenate backward (reversed) + forward for each seed
     Y = np.concatenate([np.flip(Yb, axis=1), Yf], axis=1)  # (S, 2*n_save, 3)
+    
+    # -----------------------------
+    # Poincaré sections φ = const (single overlaid figure)
+    # -----------------------------
+    if args.poincare_phi:
+        phis = jnp.asarray(args.poincare_phi, dtype=jnp.float64)
 
+        # Compute R,Z for each φ (vectorized in JAX, masked on CPU)
+        R_list, Z_list = poincare_multi_phi_jax(jnp.asarray(Y), phis)
+
+        # Build one figure and overlay all sections (paper-style)
+        apply_paper_style()  # or "2col" for a larger square
+        fig_p, ax_p = plt.subplots()     # uses the rcParams figure size set above
+
+        any_points = False
+        for k, phi0 in enumerate(np.asarray(phis)):
+            R, Z = R_list[k], Z_list[k]
+            if R.size == 0:
+                continue
+            any_points = True
+            # Rasterize points for small PDF size; keep axes/vector text as vector
+            ax_p.scatter(R, Z, s=1, alpha=0.85, rasterized=True, label=phi_label_pi(float(phi0), wrap=False))
+
+        ax_p.set_xlabel(r"$R=\sqrt{x^2+y^2}$")
+        ax_p.set_ylabel(r"$Z$")
+        ax_p.set_title("Poincaré section(s): cylindrical $\phi$")
+
+        if any_points:
+            R_all = np.concatenate([r for r in R_list if r.size])
+            Z_all = np.concatenate([z for z in Z_list if z.size])
+            # (optional) outlier trimming
+            # rmin, rmax = np.percentile(R_all, [0.5, 99.5])
+            # zmin, zmax = np.percentile(Z_all, [0.5, 99.5])
+            rmin, rmax = float(np.min(R_all)), float(np.max(R_all))
+            zmin, zmax = float(np.min(Z_all)), float(np.max(Z_all))
+            set_equal_data_aspect(ax_p, rmin, rmax, zmin, zmax, pad_frac=0.03)
+        else:
+            # Fall back to geometry box (also with equal aspect)
+            R_max_box = float(np.sqrt(x_max**2 + y_max**2))
+            set_equal_data_aspect(ax_p, 0.0, R_max_box, z_min, z_max, pad_frac=0.03)
+
+        ax_p.grid(True, alpha=0.3)
+        ax_p.legend(loc="best", frameon=True, framealpha=0.85)
+        fig_p.tight_layout()
+
+        if args.poincare_out:
+            suffix = "_multi" if len(phis) > 1 else f"_phi{float(phis[0]):.6f}".replace(".", "p").replace("-", "m")
+            out_png = f"{args.poincare_out}{suffix}.png"
+            out_pdf = f"{args.poincare_out}{suffix}.pdf"
+            fig_p.savefig(out_png)  # 300 dpi from rcParams
+            fig_p.savefig(out_pdf)  # vector (points rasterized, axes/text vector)
+            print(f"[POINCARE] Saved {out_png} and {out_pdf}")
+            
     # Plot
     fig = plt.figure(figsize=(8,6))
     ax = fig.add_subplot(111, projection="3d")
@@ -513,18 +722,22 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="input.toml", help="Path to config TOML")
     ap.add_argument("--ckpt", default=None, help="Path to checkpoint (.eqx) with arrays-only weights")
-    ap.add_argument("--tfinal", type=float, default=6.0, help="Integration horizon (forward/backward)")
+    ap.add_argument("--tfinal", type=float, default=2000.0, help="Integration horizon (forward/backward)")
     ap.add_argument("--normalize", action="store_true", help="Follow only direction of ∇u (unit-speed)")
     ap.add_argument("--clip", type=float, default=None, help="Clip ||∇u|| to this max norm (after optional normalization)")
-    ap.add_argument("--nseed", type=int, default=25, help="Number of field lines (seed points) along x at y=z=0")
-    ap.add_argument("--eps", type=float, default=1e-3, help="Inset from the surface along x so seeds start inside")
+    ap.add_argument("--nseed", type=int, default=5, help="Number of field lines (seed points) along x at y=z=0")
+    ap.add_argument("--eps", type=float, default=6e-2, help="Inset from the surface along x so seeds start inside")
     ap.add_argument("--save-stride", type=int, default=1,
                     help="Keep every N-th internal solver step (1=all).")
-    ap.add_argument("--rtol", type=float, default=1e-5, help="Solver relative tolerance.")
-    ap.add_argument("--atol", type=float, default=1e-7, help="Solver absolute tolerance.")
-    ap.add_argument("--n-save", type=int, default=2001,
+    ap.add_argument("--rtol", type=float, default=1e-10, help="Solver relative tolerance.")
+    ap.add_argument("--atol", type=float, default=1e-10, help="Solver absolute tolerance.")
+    ap.add_argument("--n-save", type=int, default=1500,
                     help="Number of evenly spaced save times between t0 and t1.")
+    ap.add_argument("--poincare-phi", type=float, nargs="*", default=[0],
+                    help="One or more cylindrical angles (in radians) for φ=const Poincaré sections. Example: --poincare-phi 0 1.57079632679")
+    ap.add_argument("--poincare-out", default=None,
+                    help="If set, base filename to save Poincaré plots (e.g., 'poincare'). Files will be suffixed with the φ value.")
     args = ap.parse_args()
     main(args.config, args.ckpt, t_final=args.tfinal, normalize=args.normalize, clip_grad=args.clip,
         nseed=args.nseed, eps=args.eps, save_stride=args.save_stride,
-        rtol=args.rtol, atol=args.atol)
+        rtol=args.rtol, atol=args.atol, n_save=args.n_save)

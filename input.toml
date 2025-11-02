@@ -26,16 +26,12 @@ mode = "files"
 #]
 #files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
 #files = ["qsc_surfaces_from_api.npz"]
-files = [{ name = "preciseQA", path = "wout_surface.csv", format = "points", normals_path = ""}]
+files = [{ name = "preciseQA", path = "wout_surface.csv", format = "points", normals_path = "wout_surface_normals.csv", normals_mode = "estimate"}]
 
 torus_list = [
     { name = "T1", a0 = 0.35, a1 = 0.20, N_harm = 3 },
     { name = "T2", a0 = 0.30, a1 = 0.10, N_harm = 2 },
-    { name = "T3", a0 = 0.40, a1 = 0.05, N_harm = 4 },
-    { name = "T4", a0 = 0.20, a1 = 0.20, N_harm = 1 },
-    { name = "T5", a0 = 0.10, a1 = 0.05, N_harm = 5 },
-    { name = "T6", a0 = 0.45, a1 = 0.15, N_harm = 2 },
-]
+    { name = "T3", a0 = 0.40, a1 = 0.05, N_harm = 4 }]
 
 [geometry]
 R0 = 1.0      # major radius
@@ -64,7 +60,7 @@ bdry_presample_mult = 16     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.1      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [32, 32]   # MLP hidden layer sizes
+hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 30.0     # standard choice from the SIREN paper
@@ -74,7 +70,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 100
+steps = 2000
 lr = 0.003
 lam_bc = 5.0
 log_every = 50
@@ -86,7 +82,7 @@ grad_target_backprop = false    # usually keep false at first
 
 
 # --- LBFGS (polish) ---
-lbfgs_steps = 50        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 100        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 50
 

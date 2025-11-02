@@ -42,7 +42,10 @@ import jax.numpy as jnp
 
 def compute_boundary(filename: str, s: float, ntheta: int, nphi: int):
     """
-    Returns X, Y, Z on a (ntheta x nphi) grid using vmecPlot2's get boundary routine.
+    Compute the boundary surface and analytic unit normals from a VMEC wout file.
+
+    Returns (X, Y, Z, NX, NY, NZ) where NX, NY and NZ are the components of
+    outward‐pointing unit normals on the (ntheta×nphi) grid.
     """
 
     f = netcdf_file(filename,'r',mmap=False)
@@ -77,41 +80,102 @@ def compute_boundary(filename: str, s: float, ntheta: int, nphi: int):
     rmns_interp = vmap(lambda row: jnp.interp(s, s_full_grid, row, left='extrapolate'), in_axes=1)(rmns)
     zmns_interp = vmap(lambda row: jnp.interp(s, s_full_grid, row, left='extrapolate'), in_axes=1)(zmns)
     zmnc_interp = vmap(lambda row: jnp.interp(s, s_full_grid, row, left='extrapolate'), in_axes=1)(zmnc)
- 
-    def compute_coords_at_point(theta, phi):
-        cosangle = jnp.cos(xm * theta - xn * phi)
-        sinangle = jnp.sin(xm * theta - xn * phi)
-        this_R = jnp.dot(rmnc_interp, cosangle) + jnp.dot(rmns_interp, sinangle)
-        this_X = this_R * jnp.cos(phi)
-        this_Y = this_R * jnp.sin(phi)
-        this_Z = jnp.dot(zmns_interp, sinangle) + jnp.dot(zmnc_interp, cosangle)
-        return this_X, this_Y, this_Z
     
-    # Vectorize over both theta and phi dimensions
-    compute_vectorized = vmap(vmap(compute_coords_at_point, in_axes=(None, 0)), in_axes=(0, None))
-    X, Y, Z = compute_vectorized(theta1D, phi1D)
+    # Build (θ,φ) grids and precompute angle arrays
+    theta2d, phi2d = jnp.meshgrid(theta1D, phi1D, indexing="ij")
+    angles = xm[:, None, None] * theta2d[None, :, :] - xn[:, None, None] * phi2d[None, :, :]
+    sin_angles = jnp.sin(angles)
+    cos_angles = jnp.cos(angles)
 
-    return jnp.asarray(X), jnp.asarray(Y), jnp.asarray(Z)
+    # Fourier sums for R and Z
+    r_coordinate = (
+        jnp.einsum("m,mjk->jk", rmnc_interp, cos_angles)
+        + jnp.einsum("m,mjk->jk", rmns_interp, sin_angles)
+    )
+    z_coordinate = (
+        jnp.einsum("m,mjk->jk", zmns_interp, sin_angles)
+        + jnp.einsum("m,mjk->jk", zmnc_interp, cos_angles)
+    )
+    X = r_coordinate * jnp.cos(phi2d)
+    Y = r_coordinate * jnp.sin(phi2d)
+    Z = z_coordinate
+
+    # Analytic partial derivatives (see explanation above)
+    dR_dtheta = (
+        jnp.einsum("m,mjk,m->jk", rmnc_interp, -sin_angles, xm)
+        + jnp.einsum("m,mjk,m->jk", rmns_interp,  cos_angles, xm)
+    )
+    dZ_dtheta = (
+        jnp.einsum("m,mjk,m->jk", zmns_interp,  cos_angles, xm)
+        + jnp.einsum("m,mjk,m->jk", zmnc_interp, -sin_angles, xm)
+    )
+    dX_dtheta = dR_dtheta * jnp.cos(phi2d)
+    dY_dtheta = dR_dtheta * jnp.sin(phi2d)
+
+    dR_dphi = (
+        jnp.einsum("m,mjk,m->jk", rmnc_interp,  sin_angles, xn)
+        + jnp.einsum("m,mjk,m->jk", rmns_interp, -cos_angles, xn)
+    )
+    dZ_dphi = (
+        jnp.einsum("m,mjk,m->jk", zmns_interp, -cos_angles, xn)
+        + jnp.einsum("m,mjk,m->jk", zmnc_interp,  sin_angles, xn)
+    )
+    dX_dphi = dR_dphi * jnp.cos(phi2d) - r_coordinate * jnp.sin(phi2d)
+    dY_dphi = dR_dphi * jnp.sin(phi2d) + r_coordinate * jnp.cos(phi2d)
+
+    g_theta = jnp.stack([dX_dtheta, dY_dtheta, dZ_dtheta], axis=-1)
+    g_phi   = jnp.stack([dX_dphi,   dY_dphi,   dZ_dphi  ], axis=-1)
+    normal  = jnp.cross(g_theta, g_phi, axis=-1)
+    mag     = jnp.linalg.norm(normal, axis=-1, keepdims=True) + 1e-12
+    unit_normal = normal / mag
+
+    # Outward orientation by centroid test
+    coords = jnp.stack([X, Y, Z], axis=-1)
+    centroid = jnp.mean(coords.reshape(-1, 3), axis=0)
+    dots = jnp.sum((coords - centroid) * unit_normal, axis=-1)
+    mean_dot = jnp.mean(dots)
+    unit_normal = jnp.where(mean_dot < 0, -unit_normal, unit_normal)
+
+    NX, NY, NZ = unit_normal[..., 0], unit_normal[..., 1], unit_normal[..., 2]
+    return jnp.asarray(X), jnp.asarray(Y), jnp.asarray(Z), jnp.asarray(NX), jnp.asarray(NY), jnp.asarray(NZ)
 
 # ----------------------------- I/O helpers -----------------------------
 
-def save_single_file(out_path: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray):
+def save_single_file(out_path: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
+                  NX: np.ndarray | None = None, NY: np.ndarray | None = None,
+                  NZ: np.ndarray | None = None) -> None:
     """
-    Save X,Y,Z to a single file. Format inferred from extension:
-      .npz -> np.savez(out_path, X=X, Y=Y, Z=Z)
-      .npy -> np.save(out_path, {"X":X, "Y":Y, "Z":Z})
-      .csv -> rows "x,y,z" flattened in C-order
+    Save surface coordinates (and optionally normals) to a single file.
+
+    For .npz files, the keys NX, NY and NZ are stored when normals are supplied.
+    For .npy files, a dictionary with keys X,Y,Z (and NX,NY,NZ if present) is saved.
+    For .csv files, the surface points are saved in the original file and the
+    normals are written to a companion file named `<stem>_normals.csv`.
     """
     ext = out_path.lower().split(".")[-1]
+    have_normals = (NX is not None) and (NY is not None) and (NZ is not None)
     if ext == "npz":
-        np.savez(out_path, X=X, Y=Y, Z=Z)
+        if have_normals:
+            np.savez(out_path, X=X, Y=Y, Z=Z, NX=NX, NY=NY, NZ=NZ)
+        else:
+            np.savez(out_path, X=X, Y=Y, Z=Z)
     elif ext == "npy":
-        np.save(out_path, {"X": X, "Y": Y, "Z": Z}, allow_pickle=True)
+        data_dict = {"X": X, "Y": Y, "Z": Z}
+        if have_normals:
+            data_dict["NX"] = NX
+            data_dict["NY"] = NY
+            data_dict["NZ"] = NZ
+        np.save(out_path, data_dict, allow_pickle=True)
     elif ext == "csv":
         P = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
         np.savetxt(out_path, P, delimiter=",", header="x,y,z", comments="")
+        if have_normals:
+            Pn = np.stack([NX, NY, NZ], axis=-1).reshape(-1, 3)
+            norm_path = out_path.rsplit(".", 1)[0] + "_normals.csv"
+            np.savetxt(norm_path, Pn, delimiter=",", header="nx,ny,nz", comments="")
+            print(f"[INFO] Saved companion normals file to {norm_path}")
     else:
-        raise ValueError(f"Unsupported output extension: .{ext}. Use .npz, .npy, or .csv")
+        raise ValueError(f"Unsupported output extension: .{ext}")
 
 def load_saved_file(path: str):
     """
@@ -259,8 +323,8 @@ def main():
 
     args = ap.parse_args()
 
-    X, Y, Z = compute_boundary(filename=args.filename, s=args.s, ntheta=args.ntheta, nphi=args.nphi)
-    save_single_file(args.out, X, Y, Z)
+    X, Y, Z, NX, NY, NZ = compute_boundary(args.filename, args.s, args.ntheta, args.nphi)
+    save_single_file(args.out, X, Y, Z, NX, NY, NZ)
 
     # Optional: quick info
     print(f"Saved boundary to {args.out} with shape X,Y,Z = {X.shape}")
