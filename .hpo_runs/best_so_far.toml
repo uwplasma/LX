@@ -1,0 +1,113 @@
+[hyperparameter_optimization]
+hpo_disable_plots = true
+hpo_disable_ckpt = true
+hpo_disable_lbfgs = true
+
+[surfaces]
+mode = "files"
+torus_list = [
+    { name = "T1", a0 = 0.35, a1 = 0.2, N_harm = 3 },
+    { name = "T2", a0 = 0.3, a1 = 0.1, N_harm = 2 },
+    { name = "T3", a0 = 0.4, a1 = 0.05, N_harm = 4 },
+]
+
+[[surfaces.files]]
+name = "preciseQA"
+path = "wout_surface.csv"
+format = "points"
+normals_path = "wout_surface_normals.csv"
+normals_mode = "estimate"
+
+[geometry]
+R0 = 1.0
+a0 = 0.35
+a1 = 0.15
+N_harm = 4
+
+[checkpoint]
+path = "pinn_torus_model.eqx"
+
+[batch]
+interior = 2048
+boundary = 2048
+
+[multi_valued]
+kappa = 0.382700054128034
+
+[sampling]
+N_in = 10000
+N_bdry_theta = 32
+N_bdry_phi = 64
+rng_seed = 305
+bdry_presample_mult = 32
+
+[regularization]
+zero_mean_weight = 0.8902932934753239
+
+[model]
+hidden_sizes = [
+    32,
+    32,
+    32,
+    32,
+]
+activation = "softplus"
+siren = true
+siren_omega0 = 20.73840844338529
+use_fourier = false
+fourier_bands = [
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+]
+fourier_scale = 6.283185307179586
+R0_for_fourier = 1.0
+
+[optimization]
+steps = 500
+lr = 0.0005938330139224376
+lam_bc = 2.963748899556435
+log_every = 50
+mini_epoch = 51
+lam_warm = 50.44413589005777
+lam_grad = 0.0
+grad_target_backprop = false
+lbfgs_steps = 0
+lbfgs_tol = 1e-07
+lbfgs_print_every = 50
+lbfgs_interior = 0
+lbfgs_boundary = 0
+lbfgs_weighting = "equal"
+use_augmented_lagrangian = true
+al_rho = 0.11440631545462669
+al_update_every = 12
+al_clip = 7.939478176879709
+grad_clip_norm = 0.5603241667204694
+weight_decay = 0.0
+lr_warmup_frac = 0.05
+lr_min_ratio = 0.17541172419418022
+use_ema = false
+ema_decay = 0.999
+ema_eval = false
+use_lookahead = false
+lookahead_sync_period = 5
+lookahead_slow_step = 0.5
+lbfgs_l2 = 0.0
+lr_warmup_steps = 124
+
+[optimization.lbfgs]
+l2 = 0.0
+
+[box]
+zmin = -0.8
+zmax = 0.8
+points_total = 200000
+seed = 42
+
+[plot]
+cmap = "viridis"
+figsize = [
+    8.0,
+    4.5,
+]
