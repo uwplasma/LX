@@ -1,0 +1,113 @@
+[hyperparameter_optimization]
+hpo_disable_plots = true
+hpo_disable_ckpt = true
+hpo_disable_lbfgs = true
+
+[surfaces]
+mode = "files"
+torus_list = [
+    { name = "T1", a0 = 0.35, a1 = 0.2, N_harm = 3 },
+    { name = "T2", a0 = 0.3, a1 = 0.1, N_harm = 2 },
+    { name = "T3", a0 = 0.4, a1 = 0.05, N_harm = 4 },
+]
+
+[[surfaces.files]]
+name = "preciseQA"
+path = "wout_surface.csv"
+format = "points"
+normals_path = "wout_surface_normals.csv"
+normals_mode = "estimate"
+
+[geometry]
+R0 = 1.0
+a0 = 0.35
+a1 = 0.15
+N_harm = 4
+
+[checkpoint]
+path = "pinn_torus_model.eqx"
+
+[batch]
+interior = 2048
+boundary = 2048
+
+[multi_valued]
+kappa = 0.26982432345004537
+
+[sampling]
+N_in = 10000
+N_bdry_theta = 32
+N_bdry_phi = 64
+rng_seed = 5738
+bdry_presample_mult = 32
+
+[regularization]
+zero_mean_weight = 0.7806022353790585
+
+[model]
+hidden_sizes = [
+    64,
+    80,
+    80,
+    64,
+]
+activation = "sin"
+siren = true
+siren_omega0 = 14.730544659179563
+use_fourier = false
+fourier_bands = [
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+]
+fourier_scale = 6.283185307179586
+R0_for_fourier = 1.0
+
+[optimization]
+steps = 2500
+lr = 0.0013070657831705061
+lam_bc = 1.729581268546409
+log_every = 50
+mini_epoch = 51
+lam_warm = 14.03157143140931
+lam_grad = 0.0
+grad_target_backprop = false
+lbfgs_steps = 0
+lbfgs_tol = 1e-07
+lbfgs_print_every = 50
+lbfgs_interior = 0
+lbfgs_boundary = 0
+lbfgs_weighting = "equal"
+use_augmented_lagrangian = true
+al_rho = 0.11889707073855221
+al_update_every = 29
+al_clip = 6.255824942161431
+grad_clip_norm = 4.160570454504485
+weight_decay = 7.109496705613623e-05
+lr_warmup_frac = 0.05
+lr_min_ratio = 0.1348757721406438
+use_ema = false
+ema_decay = 0.999
+ema_eval = false
+use_lookahead = true
+lookahead_sync_period = 3
+lookahead_slow_step = 0.7909199055856722
+lbfgs_l2 = 0.0
+lr_warmup_steps = 0
+
+[optimization.lbfgs]
+l2 = 0.0
+
+[box]
+zmin = -0.8
+zmax = 0.8
+points_total = 200000
+seed = 42
+
+[plot]
+cmap = "viridis"
+figsize = [
+    8.0,
+    4.5,
+]
