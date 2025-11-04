@@ -32,45 +32,46 @@ interior = 2048
 boundary = 2048
 
 [multi_valued]
-kappa = 0.26982432345004537
+kappa = 0.674357869667623
 
 [sampling]
 N_in = 10000
 N_bdry_theta = 32
 N_bdry_phi = 64
-rng_seed = 5738
-bdry_presample_mult = 32
+rng_seed = 1276
+bdry_presample_mult = 24
 
 [regularization]
-zero_mean_weight = 0.7806022353790585
+zero_mean_weight = 0.6239169242157726
 
 [model]
 hidden_sizes = [
-    64,
-    80,
-    80,
-    64,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
 ]
 activation = "sin"
 siren = true
-siren_omega0 = 14.730544659179563
-use_fourier = false
+siren_omega0 = 29.02369907189587
+use_fourier = true
 fourier_bands = [
     1.0,
     2.0,
-    4.0,
-    8.0,
 ]
 fourier_scale = 6.283185307179586
 R0_for_fourier = 1.0
 
 [optimization]
 steps = 2500
-lr = 0.0013070657831705061
-lam_bc = 1.729581268546409
+lr = 0.0005128338671121836
+lam_bc = 5.879375719653203
 log_every = 50
 mini_epoch = 51
-lam_warm = 14.03157143140931
+lam_warm = 9.97042741445085
 lam_grad = 0.0
 grad_target_backprop = false
 lbfgs_steps = 0
@@ -80,21 +81,21 @@ lbfgs_interior = 0
 lbfgs_boundary = 0
 lbfgs_weighting = "equal"
 use_augmented_lagrangian = true
-al_rho = 0.11889707073855221
-al_update_every = 29
-al_clip = 6.255824942161431
-grad_clip_norm = 4.160570454504485
-weight_decay = 7.109496705613623e-05
+al_rho = 0.11149849506581341
+al_update_every = 23
+al_clip = 7.1634125885076205
+grad_clip_norm = 0.9068701248513202
+weight_decay = 8.449859851413149e-05
 lr_warmup_frac = 0.05
-lr_min_ratio = 0.1348757721406438
+lr_min_ratio = 0.13061421664766124
 use_ema = false
 ema_decay = 0.999
 ema_eval = false
-use_lookahead = true
-lookahead_sync_period = 3
-lookahead_slow_step = 0.7909199055856722
+use_lookahead = false
+lookahead_sync_period = 8
+lookahead_slow_step = 0.307
 lbfgs_l2 = 0.0
-lr_warmup_steps = 0
+lr_warmup_steps = 48
 
 [optimization.lbfgs]
 l2 = 0.0
