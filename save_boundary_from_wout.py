@@ -319,18 +319,19 @@ def main():
     ap.add_argument("--nphi", type=int, default=64, help="Grid points in toroidal angle")
 
     # Output
-    ap.add_argument("--out", type=str, default="wout_surface.csv", help="Output path: .npz | .npy | .csv")
+    ap.add_argument("--out", type=str, default=".csv", help="Output file: .npz | .npy | .csv")
 
     args = ap.parse_args()
 
+    output_file = args.filename[:-3]+args.out
     X, Y, Z, NX, NY, NZ = compute_boundary(args.filename, args.s, args.ntheta, args.nphi)
-    save_single_file(args.out, X, Y, Z, NX, NY, NZ)
+    save_single_file(output_file, X, Y, Z, NX, NY, NZ)
 
     # Optional: quick info
-    print(f"Saved boundary to {args.out} with shape X,Y,Z = {X.shape}")
+    print(f"Saved boundary to {output_file} with shape X,Y,Z = {X.shape}")
     
     # Verify: reload and compare
-    compare_and_plot(args.out, X, Y, Z)
+    compare_and_plot(output_file, X, Y, Z)
 
 if __name__ == "__main__":
     main()

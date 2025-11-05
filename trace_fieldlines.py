@@ -378,12 +378,13 @@ def integrate_streamline(
     term = dfx.ODETerm(f)
     event = dfx.Event(out_of_box)
     saveat = dfx.SaveAt(ts=jnp.linspace(t0, t1, int(n_save), dtype=jnp.float64))
-    progress_meter = dfx.TqdmProgressMeter()
+    # progress_meter = dfx.TqdmProgressMeter()
 
     sol = dfx.diffeqsolve(
         term, solver, t0=t0, t1=t1, dt0=dt0_signed, y0=y0,
         stepsize_controller=stepsize_controller,
-        max_steps=200_000, progress_meter=progress_meter,
+        max_steps=200_000,
+        #progress_meter=progress_meter,
         saveat=saveat,
         event=event,
     )

@@ -1,6 +1,6 @@
 [hyperparameter_optimization]
-hpo_disable_plots = true
-hpo_disable_ckpt = true
+hpo_disable_plots = false
+hpo_disable_ckpt = false
 hpo_disable_lbfgs = true
 
 [surfaces]       # "single" | "torus" | "files"
@@ -26,7 +26,9 @@ mode = "files"
 #]
 #files = [{ name = "pyQSC", path = "pyqsc_surface.csv", format = "points", normals_path = ""}]
 #files = ["qsc_surfaces_from_api.npz"]
-files = [{ name = "preciseQA", path = "wout_surface.csv", format = "points", normals_path = "wout_surface_normals.csv", normals_mode = "estimate"}]
+files = [{ name = "preciseQA", path = "wout_precise_QA.csv", format = "points", normals_path = "wout_precise_QA_normals.csv", normals_mode = "provided"},
+         { name = "preciseQH", path = "wout_precise_QH.csv", format = "points", normals_path = "wout_precise_QH_normals.csv", normals_mode = "provided"},
+         { name = "LandremanSenguptaPlunk53", path = "wout_LandremanSenguptaPlunk_5.3.csv", format = "points", normals_path = "wout_LandremanSenguptaPlunk_5.3_normals.csv", normals_mode = "provided"}]
 
 torus_list = [
     { name = "T1", a0 = 0.35, a1 = 0.20, N_harm = 3 },
@@ -60,29 +62,29 @@ bdry_presample_mult = 16     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.455      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
-activation = "softplus" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
-siren = false            # turn on true SIREN init/forward
-siren_omega0 = 30.0     # standard choice from the SIREN paper
+hidden_sizes = [128, 128, 128, 128, 128, 128]   # MLP hidden layer sizes
+activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
+siren = true            # turn on true SIREN init/forward
+siren_omega0 = 29.0     # standard choice from the SIREN paper
 use_fourier = false            # turn positional encoding on/off
 fourier_bands = [1.0, 2.0, 4.0, 8.0]   # frequency multipliers (in 1/R0 units)
 fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0)
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 2500
-lr = 0.00075
-lam_bc = 1.92
+steps = 500
+lr = 0.0005
+lam_bc = 6
 log_every = 50
 mini_epoch = 51
-lam_warm = 11.6      # initial (warm-start) λ for boundary loss
+lam_warm = 10      # initial (warm-start) λ for boundary loss
 
 lam_grad = 0.0                 # 0 disables gradient-matching
 grad_target_backprop = false    # usually keep false at first
 
 
 # --- LBFGS (polish) ---
-lbfgs_steps = 100        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 200        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 50
 
@@ -92,18 +94,18 @@ lbfgs_boundary = 0     # per surface boundary points used by LBFGS
 lbfgs_weighting = "equal" # reserved for future weighting policies
 
 use_augmented_lagrangian = true   # false keeps old behavior
-al_rho = 0.623                      # penalty (ρ) for the AL quadratic term
-al_update_every = 15              # how often to update λ_AL (in steps)
-al_clip = 4.33                     # optional: clip |λ_AL| to this value; 0 disables
+al_rho = 0.11                      # penalty (ρ) for the AL quadratic term
+al_update_every = 23              # how often to update λ_AL (in steps)
+al_clip = 7                     # optional: clip |λ_AL| to this value; 0 disables
 
-grad_clip_norm = 2.74
-weight_decay = 5.46e-8           # decoupled WD in AdamW (set >0 to use)
+grad_clip_norm = 0.9
+weight_decay = 8e-5           # decoupled WD in AdamW (set >0 to use)
 #lr_warmup_steps = 0          # e.g., 200
 lr_warmup_frac = 0.05 
-lr_min_ratio = 0.031          # cosine floor: lr_min = lr * lr_min_ratio
+lr_min_ratio = 0.13          # cosine floor: lr_min = lr * lr_min_ratio
 use_ema = false
 ema_decay = 0.999                 # Polyak EMA decay
-ema_eval = true                   # use EMA params for eval & LBFGS init
+ema_eval = false                   # use EMA params for eval & LBFGS init
 
 use_lookahead = false
 lookahead_sync_period = 8        # k steps between slow-weight syncs

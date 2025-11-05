@@ -1128,7 +1128,7 @@ def main(config_path: str = "input.toml"):
                 mean_g0 = float(jnp.mean(gmag0))
                 print(f"[{it:5d}] loss={float(L):.6e}  lin={float(Lin):.3e}  lbc={float(Lbc):.3e}  "
                     f"|lap|_rms={stats['lap_rms']:.3e}  "
-                    f"Lg_mean={float(Lg_mean):.3e}  "
+                    # f"Lg_mean={float(Lg_mean):.3e}  "
                     f"|n·∇u|_rms={stats['nbc_rms']:.3e}  "
                     f"||g||={stats['grad_L2']:.3e}  mean|∇u|(surf0)={mean_g0:.3e}  mean(u)={float(mean_u):.3e}  "
                     f"λ_bc={runtime.lam_bc:.2f}  "
