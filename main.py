@@ -362,7 +362,7 @@ def _quick_scatter(P, title="Boundary scatter (no grid)"):
     fig = plt.figure(figsize=(6.0, 4.5))
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(P[:,0], P[:,1], P[:,2], s=1)
-    ax.set_box_aspect([P[:,0].ptp(), P[:,1].ptp(), P[:,2].ptp()])
+    ax.set_box_aspect([np.ptp(P[:,0]), np.ptp(P[:,1]), np.ptp(P[:,2])])
     ax.set_title(title)
     plt.tight_layout()
     plt.show()
@@ -990,7 +990,7 @@ def main(config_path: str = "input.toml"):
                     quiver_len=0.06,
                     title_prefix=f"{surf.name} normals",
                     align_provided_to_pca=True,
-                    show_plots=False,#not HPO_DISABLE_PLOTS,
+                    show_plots=not HPO_DISABLE_PLOTS,
                 )
                 # ---- NEW: verification per surface
                 shp = getattr(surf, "shape_thetaphi", None)
@@ -1028,6 +1028,7 @@ def main(config_path: str = "input.toml"):
             # Detect whether this surface came from a parametric grid (NPZ) or is a point cloud
             shp = getattr(surf0, "shape_thetaphi", None)
             has_param_grid0 = shp is not None
+
 
             if has_param_grid0:
                 # ----- GRID (NPZ) PATH -----
@@ -1258,14 +1259,14 @@ def main(config_path: str = "input.toml"):
 
                 m1 = plot_surface_with_vectors_ax(ax1, Xg0, Yg0, Zg0, Gmag_init, Nhat_grid0, Gvec=Gvec_init,
                                                 title=f"Initial |∇u| ({surf0.name})",
-                                                cmap=PLOT_CMAP, quiver_len=0.15,
-                                                step_theta=6, step_phi=8, plot_normals=False,
+                                                cmap=PLOT_CMAP, quiver_len=0.10,
+                                                step_theta=10, step_phi=20, plot_normals=False,
                                                 vmin=vmin_shared, vmax=vmax_shared,
                                                 surf_offset=offset)
                 m2 = plot_surface_with_vectors_ax(ax2, Xg0, Yg0, Zg0, Gmag_final, Nhat_grid0, Gvec=Gvec_final,
                                                 title=f"Final |∇u| ({surf0.name})",
-                                                cmap=PLOT_CMAP, quiver_len=0.15,
-                                                step_theta=6, step_phi=8, plot_normals=False,
+                                                cmap=PLOT_CMAP, quiver_len=0.10,
+                                                step_theta=10, step_phi=20, plot_normals=False,
                                                 vmin=vmin_shared, vmax=vmax_shared,
                                                 surf_offset=offset)
 

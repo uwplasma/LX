@@ -189,10 +189,10 @@ def suggest_params(trial: Trial, base_raw_cfg: Dict[str, Any], *, vary_steps: bo
     # hidden sizes: choose width + depth pattern
     # --- Hidden sizes: broaden search + allow shape patterns ---
     # Depth: include deeper options; PINN/SIREN often 3–6, occasionally 7–8.
-    depth = int(trial.suggest_int("model.depth", 3, 7))
+    depth = int(trial.suggest_int("model.depth", 2, 6))
 
     # Base width: widen range (keep moderate priors)
-    width = int(trial.suggest_categorical("model.width", [32, 48, 64, 96, 128, 192, 256]))
+    width = int(trial.suggest_categorical("model.width", [16, 32, 48, 64]))
 
     # Pattern: uniform / pyramid / bottleneck
     arch_pattern = trial.suggest_categorical("model.arch_pattern", ["uniform", "pyramid", "bottleneck"])

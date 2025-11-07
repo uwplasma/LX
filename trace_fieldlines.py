@@ -27,7 +27,8 @@ import diffrax as dfx
 import matplotlib as mpl
 
 from fractions import Fraction
-
+import argparse
+import time
 
 # -----------------------------
 # Project-local imports (edit if your paths differ)
@@ -196,14 +197,19 @@ def seeds_for_files_surface(surf: SurfaceItem, nseed: int = 25, eps: float = 1e-
     Uniform downsample to ~nseed.
     """
     Pb = np.asarray(surf.P_bdry)
-    Nb = np.asarray(surf.N_bdry)
-    Nb = Nb / (np.linalg.norm(Nb, axis=1, keepdims=True) + 1e-12)
-    Pi = Pb - eps * Nb       # nudge inward
-    # Downsample uniformly if too many:
-    if Pi.shape[0] > nseed:
-        stride = max(1, Pi.shape[0] // nseed)
-        Pi = Pi[::stride][:nseed]
-    return Pi.astype(np.float64)
+    # Nb = np.asarray(surf.N_bdry)
+    # Nb = Nb / (np.linalg.norm(Nb, axis=1, keepdims=True) + 1e-12)
+    # Pi = Pb - eps * Nb       # nudge inward
+    # # Downsample uniformly if too many:
+    # if Pi.shape[0] > nseed:
+    #     stride = max(1, Pi.shape[0] // nseed)
+    #     Pi = Pi[::stride][:nseed]
+    # return Pi.astype(np.float64)
+    max_x = 0.95*jnp.max(Pb, axis=0)[0]
+    x_array = jnp.linspace(max_x - eps, max_x, nseed)
+    y_array = jnp.zeros_like(x_array)
+    z_array = jnp.zeros_like(x_array)
+    return jnp.stack([x_array, y_array, z_array], axis=-1).astype(jnp.float64)
 
 def phi_label_pi(phi: float, wrap=True, max_den=24) -> str:
     """
@@ -249,7 +255,7 @@ def add_colored_surface_points(ax, surf: SurfaceItem, u_fn, *, cmap="viridis", a
     m = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
 
     colors = m.to_rgba(Gm_np)
-    ax.scatter(P[:,0], P[:,1], P[:,2], c=colors, s=4, depthshade=False, alpha=float(alpha))
+    ax.scatter(P[:,0], P[:,1], P[:,2], c=colors, s=1, depthshade=False, alpha=float(alpha))
     return m, vmin, vmax
 
 
@@ -356,16 +362,15 @@ def integrate_streamline(
     box: Tuple[float,float,float,float,float,float] = (-1.5,1.5,-1.5,1.5,-1.0,1.0),
     *,
     backward: bool = False,
-    save_stride: int = 1, 
-    n_save: int = 2001,        # <— NEW (1 = keep every internal step)
-    rtol: float = 1e-5,          # <— NEW
-    atol: float = 1e-7,          # <— NEW
+    n_save: int = 2001,    
+    rtol: float = 1e-5,    
+    atol: float = 1e-7,    
 ):
     y0 = jnp.asarray(y0, dtype=jnp.float64)
     t0, t1 = (0.0, -t_final) if backward else (0.0, t_final)
     dt0_signed = -abs(dt0) if backward else abs(dt0)
 
-    solver = dfx.Dopri8()
+    solver = dfx.Tsit5()
     stepsize_controller = dfx.PIDController(rtol=rtol, atol=atol)   # was fixed
 
     x_min, x_max, y_min, y_max, z_min, z_max = box
@@ -623,8 +628,11 @@ def main(config_path="input.toml",
     # Integrate forward and backward for each seed
     # seeds: List[tuple] → array (S,3)
     seeds_arr = np.asarray(seeds, dtype=np.float64)
+    print(f"[SEEDS] Using {seeds_arr.shape[0]} seed points:")
+    print(seeds_arr)
 
     # Forward and backward in parallel
+    start_time = time.time()
     ts_f, Yf = integrate_streamlines_vmap(
         seeds_arr, f, t_final=t_final, box=box,
         backward=False, n_save=n_save, rtol=rtol, atol=atol
@@ -633,6 +641,7 @@ def main(config_path="input.toml",
         seeds_arr, f, t_final=t_final, box=box,
         backward=True,  n_save=n_save, rtol=rtol, atol=atol
     )
+    print(f"[TIME] Total elapsed time: {time.time() - start_time:.2f} seconds")
 
     # Concatenate backward (reversed) + forward for each seed
     Y = np.concatenate([np.flip(Yb, axis=1), Yf], axis=1)  # (S, 2*n_save, 3)
@@ -657,11 +666,11 @@ def main(config_path="input.toml",
                 continue
             any_points = True
             # Rasterize points for small PDF size; keep axes/vector text as vector
-            ax_p.scatter(R, Z, s=1, alpha=0.85, rasterized=True, label=phi_label_pi(float(phi0), wrap=False))
+            ax_p.scatter(R, Z, s=0.3, alpha=0.85, rasterized=True, label=phi_label_pi(float(phi0), wrap=False))
 
         ax_p.set_xlabel(r"$R=\sqrt{x^2+y^2}$")
         ax_p.set_ylabel(r"$Z$")
-        ax_p.set_title("Poincaré section(s): cylindrical $\phi$")
+        ax_p.set_title(r"Poincaré section(s): cylindrical $\phi$")
 
         if any_points:
             R_all = np.concatenate([r for r in R_list if r.size])
@@ -677,7 +686,7 @@ def main(config_path="input.toml",
             R_max_box = float(np.sqrt(x_max**2 + y_max**2))
             set_equal_data_aspect(ax_p, 0.0, R_max_box, z_min, z_max, pad_frac=0.03)
 
-        ax_p.grid(True, alpha=0.3)
+        # ax_p.grid(True, alpha=0.3)
         ax_p.legend(loc="best", frameon=True, framealpha=0.85)
         fig_p.tight_layout()
 
@@ -694,11 +703,11 @@ def main(config_path="input.toml",
     ax = fig.add_subplot(111, projection="3d")
     if mode == "torus":
         # colored |∇u| surface with a colorbar on param grid
-        mappable, vmin, vmax = add_colored_surface(ax, cfg, u_fn, cmap="viridis", alpha=0.40,
+        mappable, vmin, vmax = add_colored_surface(ax, cfg, u_fn, cmap="viridis", alpha=0.70,
                                                 stride_theta=1, stride_phi=1)
     else:
         # files mode: color the boundary points
-        mappable, vmin, vmax = add_colored_surface_points(ax, file_surface, u_fn, cmap="viridis", alpha=0.90)
+        mappable, vmin, vmax = add_colored_surface_points(ax, file_surface, u_fn, cmap="viridis", alpha=0.70)
     cb = plt.colorbar(mappable, ax=ax, pad=0.05); cb.set_label(r"$|\nabla u|$")
     for line in Y:  # line: (2*n_save, 3)
         ax.plot(line[:, 0], line[:, 1], line[:, 2], lw=1.2)
@@ -719,26 +728,23 @@ def main(config_path="input.toml",
     plt.show()
 
 if __name__ == "__main__":
-    import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="input.toml", help="Path to config TOML")
     ap.add_argument("--ckpt", default=None, help="Path to checkpoint (.eqx) with arrays-only weights")
-    ap.add_argument("--tfinal", type=float, default=2000.0, help="Integration horizon (forward/backward)")
+    ap.add_argument("--tfinal", type=float, default=1500.0, help="Integration horizon (forward/backward)")
     ap.add_argument("--normalize", action="store_true", help="Follow only direction of ∇u (unit-speed)")
     ap.add_argument("--clip", type=float, default=None, help="Clip ||∇u|| to this max norm (after optional normalization)")
     ap.add_argument("--nseed", type=int, default=5, help="Number of field lines (seed points) along x at y=z=0")
-    ap.add_argument("--eps", type=float, default=6e-2, help="Inset from the surface along x so seeds start inside")
-    ap.add_argument("--save-stride", type=int, default=1,
-                    help="Keep every N-th internal solver step (1=all).")
-    ap.add_argument("--rtol", type=float, default=1e-10, help="Solver relative tolerance.")
-    ap.add_argument("--atol", type=float, default=1e-10, help="Solver absolute tolerance.")
-    ap.add_argument("--n-save", type=int, default=1500,
-                    help="Number of evenly spaced save times between t0 and t1.")
-    ap.add_argument("--poincare-phi", type=float, nargs="*", default=[0],
+    ap.add_argument("--eps", type=float, default=9e-2, help="Inset from the surface along x so seeds start inside")
+    ap.add_argument("--rtol", type=float, default=1e-11, help="Solver relative tolerance.")
+    ap.add_argument("--atol", type=float, default=1e-11, help="Solver absolute tolerance.")
+    ap.add_argument("--n-save", type=int, default=5,
+                    help="Factor of number of evenly spaced save times between t0 and t1 => total output = n_save * tfinal.")
+    ap.add_argument("--poincare-phi", type=float, nargs="*", default=[0, 1*jnp.pi/4, 2*jnp.pi/4, 3*jnp.pi/4],
                     help="One or more cylindrical angles (in radians) for φ=const Poincaré sections. Example: --poincare-phi 0 1.57079632679")
     ap.add_argument("--poincare-out", default=None,
                     help="If set, base filename to save Poincaré plots (e.g., 'poincare'). Files will be suffixed with the φ value.")
     args = ap.parse_args()
+    n_save = args.n_save*args.tfinal
     main(args.config, args.ckpt, t_final=args.tfinal, normalize=args.normalize, clip_grad=args.clip,
-        nseed=args.nseed, eps=args.eps, save_stride=args.save_stride,
-        rtol=args.rtol, atol=args.atol, n_save=args.n_save)
+        nseed=args.nseed, eps=args.eps, rtol=args.rtol, atol=args.atol, n_save=n_save)
