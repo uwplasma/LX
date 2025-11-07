@@ -31,7 +31,10 @@ mode = "files"
 #         { name = "LandremanSenguptaPlunk53", path = "wout_LandremanSenguptaPlunk_5.3.csv", format = "points", normals_path = "wout_LandremanSenguptaPlunk_5.3_normals.csv", normals_mode = "provided"}]
 #files = [{ name = "preciseQA", path = "wout_precise_QA.csv", format = "points", normals_path = "wout_precise_QA_normals.csv", normals_mode = "estimate"}]
 #files = [{ name = "preciseQA", path = "wout_precise_QA.csv", format = "points", normals_path = "wout_precise_QA_normals.csv", normals_mode = "provided"}]
-files = [{ name = "knotTube", path = "knot_tube.csv", format = "points", normals_path = "knot_tube_normals.csv", normals_mode = "provided"}]
+#files = [{ name = "knotTube", path = "knot_tube.csv", format = "points", normals_path = "knot_tube_normals.csv", normals_mode = "provided"}]
+#files = [{ name = "SLAM", path = "slam_surface.csv", format = "points", normals_path = "slam_surface_normals.csv", normals_mode = "provided"}]
+files = [{ name = "SLAM", path = "slam_surface.csv", format = "points", normals_mode = "estimate"}] # , normals_path = "slam_surface_normals.csv"
+#files = [{ name = "Mirror", path = "sflm_rm4.csv", format = "points", normals_path = "sflm_rm4_normals.csv", normals_mode = "provided"}]
 
 torus_list = [
     { name = "T1", a0 = 0.35, a1 = 0.20, N_harm = 3 },
@@ -39,8 +42,8 @@ torus_list = [
     { name = "T3", a0 = 0.40, a1 = 0.05, N_harm = 4 }]
 
 [geometry]
-R0 = 1.0      # major radius
-a0 = 0.35     # minor radius base
+R0 = 3.0      # major radius
+a0 = 2.0      # minor radius base
 a1 = 0.15     # minor radius modulation amplitude
 N_harm = 4    # mode in a(φ) = a0 + a1 cos(N_harm φ)
 
@@ -55,7 +58,7 @@ boundary = 2048  # boundary points per step
 kappa = 0.4613818989772501   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
 
 [sampling]
-N_in = 10000          # interior sample count
+N_in = 25000          # interior sample count
 N_bdry_theta = 32     # boundary θ resolution
 N_bdry_phi = 256       # boundary φ resolution
 rng_seed = 9308
@@ -65,7 +68,7 @@ bdry_presample_mult = 24     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.6097909498264109      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [48, 48, 48, 48, 48]   # MLP hidden layer sizes
+hidden_sizes = [64, 64, 64, 64, 64, 64]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 13.312137122010249     # standard choice from the SIREN paper
@@ -75,7 +78,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 4000
+steps = 5000
 lr = 0.007452432076639419
 lam_bc = 1.6619587277675008
 log_every = 50
@@ -86,7 +89,7 @@ lam_grad = 0.0                 # 0 disables gradient-matching
 grad_target_backprop = false    # usually keep false at first
 
 # --- LBFGS (polish) ---
-lbfgs_steps = 500        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 1500        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 50
 
