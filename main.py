@@ -684,7 +684,7 @@ def main(config_path: str = "input.toml"):
             quiver_len=0.06,
             title_prefix="Boundary normals",
             align_provided_to_pca=True,
-            show_plots=False,#not HPO_DISABLE_PLOTS,
+            show_plots=not HPO_DISABLE_PLOTS,
         )
         # -------- NEW: hard verification that we use the provided normals ----------
         # Try to detect grid shape (Xg,Yg,Zg exist here)
@@ -990,7 +990,7 @@ def main(config_path: str = "input.toml"):
                     quiver_len=0.06,
                     title_prefix=f"{surf.name} normals",
                     align_provided_to_pca=True,
-                    show_plots=False,#not HPO_DISABLE_PLOTS,
+                    show_plots=not HPO_DISABLE_PLOTS,
                 )
                 # ---- NEW: verification per surface
                 shp = getattr(surf, "shape_thetaphi", None)
