@@ -58,9 +58,9 @@ boundary = 2048  # boundary points per step
 kappa = 0.4613818989772501   # u_mv = kappa * atan2(y,x) / R0; 0 disables multi-valued part
 
 [sampling]
-N_in = 25000          # interior sample count
-N_bdry_theta = 32     # boundary θ resolution
-N_bdry_phi = 256       # boundary φ resolution
+N_in = 10000          # interior sample count
+N_bdry_theta = 16     # boundary θ resolution
+N_bdry_phi = 128       # boundary φ resolution
 rng_seed = 9308
 bdry_presample_mult = 24     # importance-sampling pre-pool multiplier
 
@@ -68,7 +68,7 @@ bdry_presample_mult = 24     # importance-sampling pre-pool multiplier
 zero_mean_weight = 0.6097909498264109      # was hard-coded default via runtime
 
 [model]
-hidden_sizes = [64, 64, 64, 64, 64, 64]   # MLP hidden layer sizes
+hidden_sizes = [32, 32, 32, 32]   # MLP hidden layer sizes
 activation = "sin" # one of: tanh, gelu, sigmoid, silu, softplus, identity, sin
 siren = true            # turn on true SIREN init/forward
 siren_omega0 = 13.312137122010249     # standard choice from the SIREN paper
@@ -78,7 +78,7 @@ fourier_scale = 6.283185307179586      # 2π (leave as-is; multiplied by band/R0
 R0_for_fourier = 1.0
 
 [optimization]
-steps = 5000
+steps = 1250
 lr = 0.007452432076639419
 lam_bc = 1.6619587277675008
 log_every = 50
@@ -89,7 +89,7 @@ lam_grad = 0.0                 # 0 disables gradient-matching
 grad_target_backprop = false    # usually keep false at first
 
 # --- LBFGS (polish) ---
-lbfgs_steps = 1500        # set 0 to disable; 200–500 is typical
+lbfgs_steps = 10        # set 0 to disable; 200–500 is typical
 lbfgs_tol = 1e-7
 lbfgs_print_every = 50
 
