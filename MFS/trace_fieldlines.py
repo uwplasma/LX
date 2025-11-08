@@ -4,8 +4,9 @@ Trace field lines x'(t) = ∇φ(x) from an MFS solution checkpoint (.npz).
 
 Usage:
   python trace_fieldlines.py wout_precise_QH_solution.npz --nfp 4 --save-figure
-
-  python trace_fieldlines.py slam_surface_solution.npz --nfp 2 --save-figure --seeds "3.4:0:0,3.2:0:0,3.1:0:0,3.0:0:0,2.9:0:0,2.8:0:0"
+  python trace_fieldlines.py wout_precise_QA_solution.npz --nfp 2 --save-figure
+## The one below for SLAM may take a few minutes to run for that big tfinal
+  python trace_fieldlines.py slam_surface_solution.npz --nfp 2 --save-figure --seeds "3.3:0:0,3.25:0:0,3.2:0:0,3.15:0:0,3.1:0:0,3.05:0:0,3.0:0:0" --tfinal 13500
 
 Script is parallelized over multiple devices (set number_of_processors_to_use at top).
 
@@ -17,7 +18,7 @@ The .npz must contain (as saved by main.py):
 from __future__ import annotations
 
 import os
-number_of_processors_to_use = 6 # Parallelization, this should divide nfieldlines
+number_of_processors_to_use = 7 # Parallelization, this should divide nfieldlines
 os.environ["XLA_FLAGS"] = f'--xla_force_host_platform_device_count={number_of_processors_to_use}'
 
 import time, argparse
@@ -373,11 +374,42 @@ def integrate_streamlines_vmap(
     X, Y, Z = ys_all[..., 0], ys_all[..., 1], ys_all[..., 2]
     in_box = (X >= x_min) & (X <= x_max) & (Y >= y_min) & (Y <= y_max) & (Z >= z_min) & (Z <= z_max)
 
-    def _cumkeep(mask_t):
+    def _cum_and(mask_t):
         return jax.lax.associative_scan(lambda a, b: a & b, mask_t, axis=0)
 
-    keep_mask = jax.vmap(_cumkeep)(in_box)[..., None]
-    ys_all = jnp.where(keep_mask, ys_all, jnp.nan)
+    def _keep_entered(mask_t: jnp.ndarray) -> jnp.ndarray:
+        # Keep samples after the first time we enter the box, until the first exit.
+        # State machine carried by scan: (started, alive)
+        def step(carry, m):
+            started, alive = carry              # both booleans
+            started_new = jnp.logical_or(started, m)
+            # once started, we stay "alive" only while m==True
+            alive_new   = jnp.where(started_new, jnp.logical_and(alive, m), True)
+            keep        = jnp.logical_and(started_new, alive_new)
+            return (started_new, alive_new), keep
+
+        (_, _), keep_seq = lax.scan(step, (jnp.bool_(False), jnp.bool_(True)), mask_t)
+        return keep_seq
+
+    if args.mask_mode == "none":
+        keep_mask = jnp.ones_like(in_box)
+    elif args.mask_mode == "instant":
+        keep_mask = in_box
+    elif args.mask_mode == "entered":
+        keep_mask = jax.vmap(_keep_entered)(in_box)
+    else:  # "strict"
+        keep_mask = jax.vmap(_cum_and)(in_box)
+
+    if args.mask_report and not backward:
+        kept_per_line = jnp.sum(keep_mask, axis=1)
+        inside0 = in_box[:, 0]
+        print("[MASK] mode:", args.mask_mode, "lines:", int(keep_mask.shape[0]))
+        print("[MASK] kept samples per line (min/median/max):",
+            int(jnp.min(kept_per_line)), int(jnp.median(kept_per_line)), int(jnp.max(kept_per_line)))
+        print("[MASK] seeds inside initial box:", int(jnp.sum(inside0)), "/", int(inside0.shape[0]))
+
+    ys_all = jnp.where(keep_mask[..., None], ys_all, jnp.nan)
+
     return np.asarray(ts), np.asarray(ys_all)
 
 # ------------------------- Poincaré machinery ------------------------- #
@@ -431,6 +463,7 @@ def main(mfs_npz: str,
          poincare_phi: Optional[Sequence[float]] = None,
          poincare_label_pi: bool = False,
          save_figure: bool = False,
+         args=None
          ):
 
     # Load MFS checkpoint & evaluators
@@ -460,11 +493,23 @@ def main(mfs_npz: str,
 
     # Box from boundary point cloud with padding
     mins = P.min(axis=0); maxs = P.max(axis=0)
+    if seeds is not None:
+        mins = np.minimum(mins, np.min(seeds_arr, axis=0))
+        maxs = np.maximum(maxs, np.max(seeds_arr, axis=0))
     pad = box_pad * float(np.linalg.norm(maxs - mins))
     x_min, x_max = float(mins[0]-pad), float(maxs[0]+pad)
     y_min, y_max = float(mins[1]-pad), float(maxs[1]+pad)
     z_min, z_max = float(mins[2]-pad), float(maxs[2]+pad)
     box = (x_min, x_max, y_min, y_max, z_min, z_max)
+
+    # Quick sanity print:
+    inside0 = (
+        (seeds_arr[:,0] >= x_min) & (seeds_arr[:,0] <= x_max) &
+        (seeds_arr[:,1] >= y_min) & (seeds_arr[:,1] <= y_max) &
+        (seeds_arr[:,2] >= z_min) & (seeds_arr[:,2] <= z_max)
+    )
+    print(f"[DEBUG] Seeds inside initial box: {int(inside0.sum())}/{seeds_arr.shape[0]}")
+    print(f"[BOX] Integration box: x[{x_min:.3f}, {x_max:.3f}], y[{y_min:.3f}, {y_max:.3f}], z[{z_min:.3f}, {z_max:.3f}]")
 
     # Integrate fwd/back in parallel
     t0 = time.time()
@@ -501,12 +546,34 @@ def main(mfs_npz: str,
         if any_points:
             R_all = np.concatenate([r for r in R_list if r.size])
             Z_all = np.concatenate([z for z in Z_list if z.size])
-            rmin, rmax = float(np.min(R_all)), float(np.max(R_all))
-            zmin, zmax = float(np.min(Z_all)), float(np.max(Z_all))
-            set_equal_data_aspect(ax_p, rmin, rmax, zmin, zmax, pad_frac=0.03)
+
+            if args.poincare_tight:
+                p_lo, p_hi = args.poincare_pct
+                rlo = float(np.nanpercentile(R_all, p_lo))
+                rhi = float(np.nanpercentile(R_all, p_hi))
+                zlo = float(np.nanpercentile(Z_all, p_lo))
+                zhi = float(np.nanpercentile(Z_all, p_hi))
+
+                # pad a bit
+                def _pad(lo, hi, frac):
+                    span = max(hi - lo, 1e-12)
+                    pad  = frac * span
+                    return lo - pad, hi + pad
+                rlo, rhi = _pad(rlo, rhi, args.poincare_pad_frac)
+                zlo, zhi = _pad(zlo, zhi, args.poincare_pad_frac)
+
+                ax_p.set_xlim(rlo, rhi)
+                ax_p.set_ylim(zlo, zhi)
+                ax_p.set_aspect("auto")  # key line: don't force equal aspect
+            else:
+                # current behavior
+                rmin, rmax = float(np.min(R_all)), float(np.max(R_all))
+                zmin, zmax = float(np.min(Z_all)), float(np.max(Z_all))
+                set_equal_data_aspect(ax_p, rmin, rmax, zmin, zmax, pad_frac=0.03)
         else:
             R_max_box = float(np.sqrt(x_max**2 + y_max**2))
             set_equal_data_aspect(ax_p, 0.0, R_max_box, z_min, z_max, pad_frac=0.03)
+
         if poincare_label_pi:
             ax_p.legend(loc="best", frameon=True, framealpha=0.85)
         fig_p.tight_layout()
@@ -525,7 +592,7 @@ def main(mfs_npz: str,
     Pj = jnp.asarray(P, dtype=jnp.float64)
     def _u_point(x): return u_fn(x[None,:]).squeeze()
     grad_point = jax.jit(jax.grad(_u_point))
-    G = jax.vmap(grad_point)(Pj)           # (Nb,3)
+    G = jax.vmap(grad_point_fn)(Pj)          # (Nb,3)
     Gm = np.linalg.norm(np.asarray(G), axis=1)
     vmin, vmax = float(np.nanpercentile(Gm, 1.0)), float(np.nanpercentile(Gm, 99.0))
     m = mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax), cmap="viridis")
@@ -556,15 +623,15 @@ if __name__ == "__main__":
                     help="Path to mfs_solution.npz (positional or --file).")
     ap.add_argument("-f", "--file", dest="file", type=str, help="Path to mfs_solution.npz (overrides positional if both given).")
     ap.add_argument("--nfp", type=int, default=4, help="Number of field periods for Poincaré sampling.")
-    ap.add_argument("--tfinal", type=float, default=1.0)
-    ap.add_argument("--save-figure", action="store_true", default=False)
+    ap.add_argument("--tfinal", type=float, default=800.0, help="Final integration time for streamlines.")
+    ap.add_argument("--save-figure", action="store_true", default=True, help="Save figures to disk instead of just showing.")
     ### NUMBER OF FIELDLINES, NSEED, WILL BE THE NUMBER OF PROCESSORS USED (DEFINED ON TOP)
     ap.add_argument("--nseed", type=int, default=None)
     ap.add_argument("--normalize", action="store_true")
     ap.add_argument("--clip", type=float, default=None)
     ap.add_argument("--eps", type=float, default=1e-2)
-    ap.add_argument("--rtol", type=float, default=1e-6)
-    ap.add_argument("--atol", type=float, default=1e-6)
+    ap.add_argument("--rtol", type=float, default=1e-9)
+    ap.add_argument("--atol", type=float, default=1e-9)
     ap.add_argument("--n-save", type=int, default=5,
                     help="Factor => total output points = n_save * tfinal")
     ap.add_argument("--poincare-label-pi", action="store_true", help="Use π-fraction labels on Poincaré plots.")
@@ -575,6 +642,20 @@ if __name__ == "__main__":
     ap.add_argument("--strip-tol-frac", type=float, default=0.03, help="Half-width of selection strip (fraction of spread).")
     ap.add_argument("--plane-tol-frac", type=float, default=0.10, help="For torus: |s| tolerance along a_hat (fraction of span).")
     ap.add_argument("--inward-frac", type=float, default=0.02, help="Inward nudge fraction based on local spacing.")
+    ap.add_argument("--poincare-tight", action="store_true", default=True,
+                    help="Tight axes based on data percentiles; disables equal aspect.")
+    ap.add_argument("--poincare-pad-frac", type=float, default=0.03,
+                    help="Padding fraction for tight Poincaré limits.")
+    ap.add_argument("--poincare-pct", type=float, nargs=2, default=[1.0, 99.0],
+                    help="Low/high percentiles for tight limits (e.g., 1 99).")
+    ap.add_argument("--mask-mode", choices=["strict","instant","entered","none"],
+                    default="entered",
+                    help="Masking policy: "
+                        "strict=cumulative AND from t0; "
+                        "instant=keep only samples inside; "
+                        "entered=keep after first entry until exit; "
+                        "none=no masking.")
+    ap.add_argument("--mask-report", action="store_true", default=True, help="Print per-line mask stats.")
     ap.add_argument(
         "--seeds", type=str, default=None,
         help="Comma-separated list of seed points as x:y:z,x:y:z,... (overrides automatic seed computation)"
@@ -615,5 +696,6 @@ if __name__ == "__main__":
         box_pad=args.box_pad,
         poincare_phi=args.poincare_phi,
         save_figure=args.save_figure,
-        poincare_label_pi=args.poincare_label_pi
+        poincare_label_pi=args.poincare_label_pi,
+        args=args
     )

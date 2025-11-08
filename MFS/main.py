@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+## Run as python main.py --sf_min 0.5 --lbfgs-maxiter 50 --k-nn 128 for high-accuracy solve
+## Run as python main.py --sf_min 1.5 --lbfgs-maxiter 5 --k-nn 32 for fast solve
+### Example python main.py wout_precise_QA.csv wout_precise_QA_normals.csv
+### SLAM surface might need --sf_min 3.0 for stability
 """
 Laplace (∇²φ = 0) inside a closed 3D surface with Neumann BC n·∇φ = 0 (total)
 via Method of Fundamental Solutions (MFS) with multivalued pieces (toroidal+poloidal).
@@ -298,8 +302,8 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
     )
 
     # robust starting point (you were scanning 1.5..2.5)
-    log_sf0  = jnp.log(2.0)
-    log_lam0 = jnp.log(1e-2)
+    log_sf0  = jnp.log(1.5)
+    log_lam0 = jnp.log(5e-3)
     p0 = jnp.array([log_sf0, log_lam0], dtype=jnp.float64)
 
     # small box for sf, keep λ unbounded in log-space (still positive)
@@ -634,25 +638,24 @@ def grad_green_x(x, y):
     return - r / (4.0 * jnp.pi * r3[..., None])
 
 # ------------------------- MFS source cloud ---------------------- #
-# --- replace your current build_mfs_sources with this ---
 def build_mfs_sources(Pn, Nn, rk, scale_info, source_factor=2.0, verbose=True):
     """
-    Place MFS sources outside the domain along outward normals:
-      Y = P + δ N, with δ = source_factor * median(rk) in *normalized* units.
-    JAX-safe for JIT when verbose=False.
+    Adaptive MFS sources: Y_i = P_i + δ_i N_i with δ_i = source_factor * rk_i
+    where rk_i is the local kNN radius in the best-fit (u,v) plane.
+    This makes δ smaller in the figure-8 neck and larger in the lobes.
     """
-    # JAX-friendly median (works both traced and eager)
-    rk_med = jnp.median(rk)
-    delta_n = source_factor * rk_med              # stays as a JAX value if traced
-    Yn = Pn + delta_n * Nn                        # broadcast in normalized coords
+    # per-point δ_i
+    delta_n_i = source_factor * rk.reshape(-1)         # (N,)
+    Yn = Pn + delta_n_i[:, None] * Nn                  # (N,3)
 
     if verbose:
-        # Convert to Python floats only for printing (outside JIT)
-        dn = float(np.asarray(delta_n))
-        print(f"[MFS] Using source offset δ_n={dn:.4g} (normalized units).")
-        print(f"[MFS] Sources count: {int(np.asarray(Yn.shape[0]))} (one per boundary point).")
+        dn_med = float(np.median(np.asarray(delta_n_i)))
+        dn_min = float(np.min(np.asarray(delta_n_i)))
+        dn_max = float(np.max(np.asarray(delta_n_i)))
+        print(f"[MFS] Using adaptive source offsets δ_i (normalized): "
+              f"median={dn_med:.4g}, min={dn_min:.4g}, max={dn_max:.4g}")
 
-    return Yn, delta_n
+    return Yn, delta_n_i
 
 # ----------------------------- System build ---------------------- #
 @partial(jit,static_argnames=("grad_t", "grad_p", "use_mv", "center_D", "verbose"))
@@ -750,6 +753,59 @@ def solve_alpha_with_rhs_hard_flux_multi(A, W, g_raw, lam=1e-3, constraints=None
         condNE = float(np.linalg.cond(np.asarray(NE)))
         condS  = float(np.linalg.cond(np.asarray(S)))
         print(f"[LS-α:Schur] NE cond≈{condNE:.3e}, S cond≈{condS:.3e}, λ={lam:.3g}, ||W^0.5 res||={lw2:.3e}")
+    return alpha
+
+def augmented_lagrangian_solve(A, W, g_raw, lam, constraints, rho0=1e-2, rho_max=1e3, iters=5, verbose=True):
+    """
+    Augmented Lagrangian on linear constraints C^T alpha = d:
+      minimize ||W^{1/2}(A alpha + g)||^2 + lam^2||alpha||^2
+              + μ^T(C^T alpha - d) + (ρ/2)||C^T alpha - d||^2
+    We eliminate μ analytically by folding into the RHS with iterative μ-updates.
+    """
+    # pack constraints -> matrix C (M x K) and vector d (K,)
+    Ccols, dlist = [], []
+    for (c_vec, d_k) in constraints:
+        Ccols.append(c_vec[:, None])
+        dlist.append(d_k)
+    C = jnp.concatenate(Ccols, axis=1)  # (M,K)
+    d = jnp.asarray(dlist, dtype=A.dtype)
+
+    Wv  = jnp.asarray(W).reshape(-1)
+    ATW = A.T * Wv[None, :]
+    ATA = ATW @ A
+    ATg = ATW @ g_raw
+
+    # initialize
+    K = C.shape[1]
+    mu = jnp.zeros((K,), dtype=A.dtype)
+    rho = rho0
+    alpha = jnp.zeros((A.shape[1],), dtype=A.dtype)
+
+    for it in range(iters):
+        # NE(ρ) := A^T W A + lam^2 I + ρ C C^T  (note: C C^T is (M x M), we need in M-space)
+        # Work in α-space via Schur: form NE = ATA + lam^2 I + ρ * (C @ C.T) projected via α
+        # More efficiently: normal eq. with extra term via (C (C^T α)) handled as (ρ C C^T) in M-space:
+        # We augment RHS to include μ and d: rhs = -(ATg) - C (μ + ρ * d)
+        rhs = -ATg - C @ (mu + rho * d)
+
+        NE = ATA + (lam**2) * jnp.eye(A.shape[1], dtype=A.dtype) + rho * (C @ C.T)
+
+        # Cholesky solve
+        L = jnp.linalg.cholesky(NE)
+        y = jsp_linalg.solve_triangular(L, rhs, lower=True)
+        alpha = jsp_linalg.solve_triangular(L.T, y, lower=False)
+
+        # constraint residual and multipliers update
+        r = (C.T @ alpha) - d
+        mu = mu + rho * r
+
+        if verbose:
+            lw2 = float(jnp.sqrt(jnp.dot(Wv, (A @ alpha + g_raw)**2)))
+            crel = float(jnp.linalg.norm(r) / (jnp.linalg.norm(d) + 1e-30))
+            print(f"[AL] it={it}  ||W^1/2 res||={lw2:.3e}  ||C^Tα-d||/||d||={crel:.3e}  rho={rho:.2e}")
+
+        rho = min(rho * 10.0, rho_max)
+
     return alpha
 
 @jit
@@ -1208,8 +1264,9 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     # 3) Enforce on Γ, Γ₋, and end-caps (four constraints):
     constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints  # <-- NEW
 
-    alpha = solve_alpha_with_rhs_hard_flux_multi(
-        A, W, g_raw, lam=lambda_reg_opt, constraints=constraints, verbose=verbose
+    alpha = augmented_lagrangian_solve(
+        A, W, g_raw, lam=lambda_reg_opt, constraints=constraints,
+        rho0=1e2, rho_max=1e4, iters=6, verbose=verbose
     )
     
     print(f"[SOL] a_t={float(a[0]):.6g}, a_p={float(a[1]):.6g}, ||alpha||₂={float(jnp.linalg.norm(alpha)):.3e}")
@@ -1299,9 +1356,9 @@ if __name__ == "__main__":
                     help="CSV file with nx,ny,nz columns (alternative to positional)")
     ap.add_argument("--sf_min", type=float, default=1.0, help="Min source factor for autotuning")
     ap.add_argument("--sf_max", type=float, default=6.5, help="Max source factor for autotuning")
-    ap.add_argument("--lbfgs-maxiter", type=int, default=15, help="Max iterations for L-BFGS")
+    ap.add_argument("--lbfgs-maxiter", type=int, default=5, help="Max iterations for L-BFGS")
     ap.add_argument("--lbfgs-tol", type=float, default=1e-8, help="Tolerance for L-BFGS")
-    ap.add_argument("--k-nn", type=int, default=96) # this sets the k for kNN weights & scales (computational cost)
+    ap.add_argument("--k-nn", type=int, default=64) # this sets the k for kNN weights & scales (computational cost)
     ap.add_argument("--use-mv", action="store_true")
     ap.add_argument("--mv-weight", type=float, default=0.5)
     ap.add_argument("--interior-eps-factor", type=float, default=5e-3)
