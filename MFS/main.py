@@ -301,9 +301,7 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
     p0 = jnp.array([log_sf0, log_lam0], dtype=jnp.float64)
 
     # small box for sf, keep λ unbounded in log-space (still positive)
-    p_star, f_star, g_star, H_star = bfgs_2d(
-        obj, p0, sf_min=3.5, sf_max=6.0, max_iter=25, tol=1e-7
-    )
+    p_star, f_star, g_star, H_star = bfgs_2d(obj, p0, sf_min=1.5, sf_max=6.0, max_iter=5, tol=1e-7)
     log_sf_star, log_lam_star = p_star
     sf_star  = float(jnp.exp(log_sf_star))
     lam_star = float(jnp.exp(log_lam_star))
@@ -1098,8 +1096,6 @@ def build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
 # ------------------------------- main ------------------------------- #
 def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
          use_mv=True, k_nn=48,
-         source_factor=2.0,           # δ_n = source_factor * median(rk)
-         lambda_reg=1e-3,             # Tikhonov λ
          mv_weight=0.5,               # regularization weight for [a_t,a_p]
          interior_eps_factor=5e-3,  # ε ~ interior offset for evaluation, in *normalized* h units
          verbose=True, show_normals=False,
@@ -1272,7 +1268,9 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     return dict(
         P=P, N=N, Pn=Pn, W=W, rk=rk, h_med=h_med,
         alpha=alpha, a=a, delta_n=delta_n, eps_n=eps_n,
-        phi_fn=phi_fn, grad_fn=grad_fn, psi_fn=psi_fn, grad_psi_fn=grad_psi_fn, laplacian_psi_fn=lap_psi_fn
+        phi_fn=phi_fn, grad_fn=grad_fn, psi_fn=psi_fn,
+        grad_psi_fn=grad_psi_fn, laplacian_psi_fn=lap_psi_fn,
+        scinfo=scinfo, Yn=Yn, a_hat=best["a_hat"], kind=kind
     )
 
 if __name__ == "__main__":
@@ -1281,29 +1279,28 @@ if __name__ == "__main__":
     # ap.add_argument("--nrm", default="sflm_rm4_normals.csv")
     # ap.add_argument("--xyz", default="slam_surface.csv")
     # ap.add_argument("--nrm", default="slam_surface_normals.csv")
-    # ap.add_argument("--xyz", default="wout_precise_QH.csv")
-    # ap.add_argument("--nrm", default="wout_precise_QH_normals.csv")
-    ap.add_argument("--xyz", default="wout_precise_QA.csv")
-    ap.add_argument("--nrm", default="wout_precise_QA_normals.csv")
+    ap.add_argument("--xyz", default="wout_precise_QH.csv")
+    ap.add_argument("--nrm", default="wout_precise_QH_normals.csv")
+    # ap.add_argument("--xyz", default="wout_precise_QA.csv")
+    # ap.add_argument("--nrm", default="wout_precise_QA_normals.csv")
     ap.add_argument("--use-mv", action="store_true")
     ap.add_argument("--k-nn", type=int, default=48)
-    ap.add_argument("--source-factor", type=float, default=2.0)
-    ap.add_argument("--lambda-reg", type=float, default=1e-3)
     ap.add_argument("--mv-weight", type=float, default=0.5)
     ap.add_argument("--interior-eps-factor", type=float, default=5e-3)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show-normals", action="store_true")
     ap.add_argument("--toroidal-flux", type=float, default=None,
                     help="If set, prescribes the toroidal flux Φ_t (sets a_t = Φ_t/(2π))")
-    ap.add_argument("--mfs-out", default="mfs_solution.npz",  # NEW: export path
+    ap.add_argument("--mfs-out", default=None,  # NEW: export path
                     help="Write portable MFS solution to this .npz (center,scale,Yn,alpha,a,a_hat,P,N,kind)")
     args = ap.parse_args()
+
+    if args.mfs_out == None:
+        args.mfs_out = args.xyz.replace(".csv", "_solution.npz")
 
     out = main(
         xyz_csv=args.xyz, nrm_csv=args.nrm,
         use_mv=args.use_mv or True, k_nn=args.k_nn,
-        source_factor=args.source_factor,
-        lambda_reg=args.lambda_reg,
         mv_weight=args.mv_weight,
         interior_eps_factor=args.interior_eps_factor,
         verbose=args.verbose or True,
@@ -1320,15 +1317,15 @@ if __name__ == "__main__":
         # Local names still in scope here: scinfo, Yn, best/kind, best["a_hat"]
         np.savez(
             args.mfs_out,
-            center=np.asarray(scinfo.center, dtype=float),
-            scale=float(np.asarray(scinfo.scale)),
-            Yn=np.asarray(Yn, dtype=float),
+            center=np.asarray(out["scinfo"].center, dtype=float),
+            scale=float(np.asarray(out["scinfo"].scale)),
+            Yn=np.asarray(out["Yn"], dtype=float),
             alpha=np.asarray(out["alpha"], dtype=float),
             a=np.asarray(out["a"], dtype=float),
-            a_hat=np.asarray(best["a_hat"], dtype=float),
+            a_hat=np.asarray(out["a_hat"], dtype=float),
             P=np.asarray(out["P"], dtype=float),
             N=np.asarray(out["N"], dtype=float),
-            kind=str(best.get("kind","torus")),
+            kind=str(out["kind"]),
         )
         print(f"[SAVE] Wrote MFS checkpoint → {args.mfs_out}")
     except Exception as e:
