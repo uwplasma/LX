@@ -301,7 +301,7 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
 
     # small box for sf, keep λ unbounded in log-space (still positive)
     p_star, f_star, g_star, H_star = bfgs_2d(
-        obj, p0, sf_min=1.0, sf_max=4.0, max_iter=30, tol=1e-6
+        obj, p0, sf_min=3.5, sf_max=6.0, max_iter=25, tol=1e-7
     )
     log_sf_star, log_lam_star = p_star
     sf_star  = float(jnp.exp(log_sf_star))
@@ -958,25 +958,26 @@ def plot_geometry_and_solution(P, N, grads_where, title_suffix="", show_normals=
     axL.view_init(elev=20, azim=35); fix_matplotlib_3d(axL)
     cbar = fig.colorbar(sc, ax=axL, shrink=0.7, label=r"$|\nabla \phi|$ on $\Gamma_-$")
 
-    # --- Right panel: axis-aware coordinates ---
-    if a_hat is None:
-        # backward compatible: fall back to old (ϕ_z, θ)
-        phi, theta = _angles_phi_theta(P, N)
-        x_axis_vals = np.asarray(phi); x_label = "toroidal angle ϕ (rad)"
-        y_axis_vals = np.asarray(theta); y_label = "poloidal angle θ (rad)"
-    else:
+    # --- Right panel: coordinates for imshow ---
+    # For torus: x = TRUE cylindrical φ := atan2(y,x); y = poloidal θ (tokamak-style)
+    # For mirror: keep (s, θ) as before.
+    if kind == "mirror":
+        # keep axis-aware (s, θ)
         phi_a, theta, s = angles_for_axis(
-            jnp.asarray(P), jnp.asarray(N), jnp.asarray(a_hat),
-            center=jnp.asarray(np.mean(np.asarray(P), axis=0))  # or scinfo.center if available here
+            jnp.asarray(P), jnp.asarray(N), jnp.asarray(a_hat) if a_hat is not None else jnp.array([0.0,0.0,1.0]),
+            center=jnp.asarray(np.mean(np.asarray(P), axis=0))
         )
-        if kind == "mirror":
-            x_axis_vals = np.asarray(s)
-            x_label = "axial coordinate s"
-            # center & scale range nicely:
-            x_axis_vals = x_axis_vals - np.median(x_axis_vals)
-        else:
-            x_axis_vals = np.asarray(phi_a)
-            x_label = "azimuth ϕ_a (rad)"
+        x_axis_vals = np.asarray(s) - np.median(np.asarray(s))
+        x_label = "axial coordinate s"
+        y_axis_vals = np.asarray(theta)
+        y_label = "poloidal angle θ (rad)"
+    else:
+        # TORUS: true cylindrical φ on x-axis
+        Pnp = np.asarray(P)
+        x_axis_vals = np.arctan2(Pnp[:,1], Pnp[:,0])  # TRUE φ
+        x_label = "toroidal angle ϕ (rad)"
+        # Build θ the same robust way you already do (tokamak-style)
+        phi, theta = _angles_phi_theta(P, N)
         y_axis_vals = np.asarray(theta)
         y_label = "poloidal angle θ (rad)"
 
@@ -1037,6 +1038,62 @@ def plot_laplacian_errors_on_interior_band(P, lap_psi_at_interior, eps):
     ax2.set_xlabel("|∇²ψ|"); ax2.set_ylabel("count")
     plt.tight_layout(); plt.show()
 
+def build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
+                              grad_t, grad_p, a, a_hat,
+                              q=0.02, ds_frac=0.02, k_cap=32, side="low"):
+    """
+    Build (c_cap, d_cap) for a virtual end-cap perpendicular to a_hat.
+    - side: "low" or "high": chooses s-quantile q or 1-q
+    - ds_frac: half-thickness in axial coordinate as a fraction of axial span
+    """
+    X = jnp.asarray(P)
+    a = jnp.asarray(a_hat) / jnp.maximum(1e-30, jnp.linalg.norm(a_hat))
+    c = jnp.asarray(scinfo.center)
+
+    # axial coordinate s and span
+    s = jnp.sum((X - c[None,:]) * a[None,:], axis=1)
+    s_min, s_max = float(jnp.min(s)), float(jnp.max(s))
+    s_span = max(1e-9, s_max - s_min)
+
+    s0 = np.quantile(np.asarray(s), q if side == "low" else 1.0 - q)
+    ds = ds_frac * s_span
+    mask = np.abs(np.asarray(s) - s0) <= ds
+    if not np.any(mask):
+        raise RuntimeError(f"No points found for {side} cap; try increasing ds_frac.")
+
+    # cap points and normals (constant ±a_hat)
+    P_cap = X[mask, :]
+    N_cap = ( -a if side == "low" else a )[None, :].repeat(P_cap.shape[0], axis=0)
+
+    # weights on cap in plane ⟂ a_hat via kNN
+    # build plane basis (e1,e2) ⟂ a_hat
+    e1_np, e2_np = _orthonormal_complement(np.array(a_hat))
+    e1 = jnp.asarray(e1_np); e2 = jnp.asarray(e2_np)
+    Xc = P_cap - c[None, :]
+    u1 = np.asarray(jnp.sum(Xc * e1[None,:], axis=1))
+    u2 = np.asarray(jnp.sum(Xc * e2[None,:], axis=1))
+    UV = np.column_stack([u1, u2])
+
+    k_eff = min(k_cap+1, len(UV))
+    nbrs = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree").fit(UV)
+    dists, _ = nbrs.kneighbors(UV)
+    rk_cap = dists[:, -1]
+    W_cap = jnp.asarray(np.pi * rk_cap**2, dtype=jnp.float64)
+
+    # collocation on the cap (use normalized coords for grad_t/grad_p)
+    Xn_cap = (P_cap - scinfo.center) * scinfo.scale
+    A_cap = build_A_rows_at_points(Xn_cap, N_cap, Yn, scinfo)
+
+    # MV contribution on the cap
+    Gt_cap = grad_t(Xn_cap)
+    Gp_cap = grad_p(Xn_cap)
+    g_cap  = scinfo.scale * jnp.sum(N_cap * (a[0]*Gt_cap + a[1]*Gp_cap), axis=1)
+
+    # flux constraint vector for the cap
+    c_cap, d_cap = make_flux_constraint(A_cap, W_cap, g_cap)
+    return c_cap, d_cap
+
+
 # ------------------------------- main ------------------------------- #
 def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
          use_mv=True, k_nn=48,
@@ -1044,7 +1101,9 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
          lambda_reg=1e-3,             # Tikhonov λ
          mv_weight=0.5,               # regularization weight for [a_t,a_p]
          interior_eps_factor=5e-3,  # ε ~ interior offset for evaluation, in *normalized* h units
-         verbose=True, show_normals=False):
+         verbose=True, show_normals=False,
+         toroidal_flux=None,          # NEW: prescribe Φ_t (sets a_t = Φ_t/(2π)) if not None
+        ):
 
     # Load & orient
     P, N = load_surface_xyz_normals(xyz_csv, nrm_csv, verbose=verbose)
@@ -1079,6 +1138,16 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
         a = jnp.zeros((2,), dtype=jnp.float64)
         g_raw = jnp.zeros((Pn.shape[0],), dtype=jnp.float64)
 
+    # --- OVERRIDE a_t if a toroidal flux is prescribed ---
+    if use_mv and (toroidal_flux is not None):
+        a_t_fixed = float(toroidal_flux) / (2.0 * np.pi)
+        a = jnp.array([a_t_fixed, 0.0], dtype=jnp.float64)
+        if verbose:
+            print(f"[MV-FIX] Prescribing toroidal flux Φ_t={toroidal_flux:.6g} ⇒ a_t={a_t_fixed:.6g}; setting a_p=0.")
+        # Rebuild g_raw with fixed a
+        grad_t_bdry = grad_t(Pn)
+        grad_p_bdry = grad_p(Pn)
+        g_raw = scinfo.scale * jnp.sum(Nn * (a[0]*grad_t_bdry + a[1]*grad_p_bdry), axis=1)
 
     # === Prepare constraints ===
     # Boundary constraint:
@@ -1093,7 +1162,7 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
 
     # g_in from MV on interior:
     # OPTIONAL speed path: reuse boundary normals for ring; ϕ̂_tan, θ̂ remain consistent for tiny offsets
-    use_fast_ring = True
+    use_fast_ring = (kind == "torus")  # mirrors need accurate θ̂
     Gt_in = grad_t(Xn_in)
     if use_fast_ring:
         # Build poloidal direction with boundary normals to avoid nearest-neighbor search
@@ -1114,11 +1183,27 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     W_ring = build_ring_weights(P_in, Pn, k=k_nn)
     c_int, d_int = make_flux_constraint(A_in, W_ring, g_in)
 
+    # --- Add two virtual end-cap flux constraints (close the open sleeve) ---
+    try:
+        c_cap_low,  d_cap_low  = build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
+                                                        grad_t, grad_p, a, best["a_hat"],
+                                                        q=0.02, ds_frac=0.02, k_cap=k_nn, side="low")
+        c_cap_high, d_cap_high = build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
+                                                        grad_t, grad_p, a, best["a_hat"],
+                                                        q=0.02, ds_frac=0.02, k_cap=k_nn, side="high")
+        cap_constraints = [(c_cap_low,  -d_cap_low),
+                        (c_cap_high, -d_cap_high)]
+    except Exception as e:
+        print("[WARN] Cap constraints failed; continuing without them:", e)
+        cap_constraints = []
+
     # Choose your policy:
     # 1) Most robust in practice: enforce on Γ₋ only
     # constraints = [(c_int, -d_int)]
     # 2) Enforce on both Γ and Γ₋ (two constraints):
-    constraints = [(c_bdry, -d_bdry), (c_int, -d_int)]
+    # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)]
+    # 3) Enforce on Γ, Γ₋, and end-caps (four constraints):
+    constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints  # <-- NEW
 
     alpha = solve_alpha_with_rhs_hard_flux_multi(
         A, W, g_raw, lam=lambda_reg_opt, constraints=constraints, verbose=verbose
@@ -1150,16 +1235,7 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     vec_stats("[EVAL Γ₋] normalized BC |n·∇φ|/|∇φ|", rn)
 
     # Flux neutrality on Γ₋ (should be ~0)
-    # Build *ring* weights W_ring using the same plane as boundary
-    c_plane, E_plane, _ = best_fit_axis(np.array(Pn), verbose=False)
-    Ploc_ring = project_to_local((P_in - 0.0) * scinfo.scale * 0 + P_in, c_plane, E_plane)  # project ring
-    XY = np.asarray(Ploc_ring[:, :2])
-    k_eff = min(k_nn+1, len(XY))
-    nbrs = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree").fit(XY)
-    dists, _ = nbrs.kneighbors(XY)
-    rk_ring = dists[:, -1]
-    W_ring = jnp.asarray(np.pi * rk_ring**2, dtype=jnp.float64)
-
+    # reuse the ring weights from the constraint stage
     n_dot_grad_ring = jnp.sum(N * grad_on_ring, axis=1)
     flux = float(jnp.dot(W_ring, n_dot_grad_ring))
     area_ring = float(jnp.sum(W_ring))
@@ -1200,20 +1276,21 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
 
 if __name__ == "__main__":
     # Set these to your file names as needed:
-    # xyz_csv = "wout_precise_QA.csv"
-    # nrm_csv = "wout_precise_QA_normals.csv"
+    xyz_csv = "wout_precise_QA.csv"
+    nrm_csv = "wout_precise_QA_normals.csv"
     # xyz_csv = "wout_precise_QH.csv"
     # nrm_csv = "wout_precise_QH_normals.csv"
     # xyz_csv = "slam_surface.csv"
     # nrm_csv = "slam_surface_normals.csv"
-    xyz_csv = "sflm_rm4.csv"
-    nrm_csv = "sflm_rm4_normals.csv"
+    # xyz_csv = "sflm_rm4.csv"
+    # nrm_csv = "sflm_rm4_normals.csv"
     _ = main(
         xyz_csv=xyz_csv, nrm_csv=nrm_csv,
-        use_mv=True, k_nn=48,
+        use_mv=True, k_nn=64,
         source_factor=2.0,        # try 1.5–3.0 if needed
         lambda_reg=1e-3,          # try 3e-4..3e-3 depending on noise
         mv_weight=0.5,            # 0.2..1.0 is reasonable
         interior_eps_factor=5e-3,
-        verbose=True
+        verbose=True,
+        toroidal_flux=1.0
     )
