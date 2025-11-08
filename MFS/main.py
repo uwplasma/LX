@@ -271,7 +271,9 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
              use_mv=True,
              mv_weight=0.5,
              interior_eps_factor=5e-3,
-             verbose=True):
+             verbose=True,
+             sf_min=1.0, sf_max=6.5,
+             lbfgs_maxiter=15, lbfgs_tol=1e-8):
     # 1) MV bases and a (once)
     if use_mv:
         kind, a_hat, E_axes, c_axes, svals = detect_geometry_and_axis(Pn, verbose=True)
@@ -301,7 +303,7 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
     p0 = jnp.array([log_sf0, log_lam0], dtype=jnp.float64)
 
     # small box for sf, keep λ unbounded in log-space (still positive)
-    p_star, f_star, g_star, H_star = bfgs_2d(obj, p0, sf_min=1.5, sf_max=6.0, max_iter=5, tol=1e-7)
+    p_star, f_star, g_star, H_star = bfgs_2d(obj, p0, sf_min=sf_min, sf_max=sf_max, max_iter=lbfgs_maxiter, tol=lbfgs_tol)
     log_sf_star, log_lam_star = p_star
     sf_star  = float(jnp.exp(log_sf_star))
     lam_star = float(jnp.exp(log_lam_star))
@@ -1099,7 +1101,8 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
          mv_weight=0.5,               # regularization weight for [a_t,a_p]
          interior_eps_factor=5e-3,  # ε ~ interior offset for evaluation, in *normalized* h units
          verbose=True, show_normals=False,
-         toroidal_flux=None,          # NEW: prescribe Φ_t (sets a_t = Φ_t/(2π)) if not None
+         toroidal_flux=None,          # prescribe Φ_t (sets a_t = Φ_t/(2π)) if not None
+         sf_min=1.0, sf_max=6.5, lbfgs_maxiter=30, lbfgs_tol=1e-8
         ):
 
     # Load & orient
@@ -1117,7 +1120,10 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     print(f"[SCALE] median local spacing h_med≈{h_med:.4g} (normalized units)")
     
     # --- Auto-tune ---
-    best = autotune(P, N, Pn, Nn, W, rk, scinfo, use_mv=use_mv, mv_weight=mv_weight, interior_eps_factor=interior_eps_factor, verbose=True)
+    best = autotune(P, N, Pn, Nn, W, rk, scinfo, use_mv=use_mv, mv_weight=mv_weight,
+                    interior_eps_factor=interior_eps_factor, verbose=True,
+                    sf_min=sf_min, sf_max=sf_max,
+                    lbfgs_maxiter=lbfgs_maxiter, lbfgs_tol=lbfgs_tol)
     source_factor_opt = best["source_factor"]
     lambda_reg_opt    = best["lambda_reg"]
     # Reuse pre-built things to avoid recompute:
@@ -1274,24 +1280,36 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     )
 
 if __name__ == "__main__":
+    # default_xyz = "wout_precise_QA.csv"
+    # default_normals = "wout_precise_QA_normals.csv"
+    default_xyz = "slam_surface.csv"
+    default_normals = "slam_surface_normals.csv"
+    # default_xyz = "sflm_rm4.csv"
+    # default_normals = "sflm_rm4_normals.csv"
+    # default_xyz = "wout_precise_QH.csv"
+    # default_normals = "wout_precise_QH_normals.csv"
     ap = argparse.ArgumentParser()
-    # ap.add_argument("--xyz", default="sflm_rm4.csv")
-    # ap.add_argument("--nrm", default="sflm_rm4_normals.csv")
-    # ap.add_argument("--xyz", default="slam_surface.csv")
-    # ap.add_argument("--nrm", default="slam_surface_normals.csv")
-    ap.add_argument("--xyz", default="wout_precise_QH.csv")
-    ap.add_argument("--nrm", default="wout_precise_QH_normals.csv")
-    # ap.add_argument("--xyz", default="wout_precise_QA.csv")
-    # ap.add_argument("--nrm", default="wout_precise_QA_normals.csv")
+    ap.add_argument("xyz", nargs="?", default=default_xyz,
+                    help="CSV file with x,y,z columns (positional or --xyz)")
+    ap.add_argument("normals", nargs="?", default=default_normals,
+                    help="CSV file with nx,ny,nz columns (positional or --nrm)")
+    ap.add_argument("--xyz", dest="xyz_flag", default=default_xyz,
+                    help="CSV file with x,y,z columns (alternative to positional)")
+    ap.add_argument("--normals", dest="nrm_flag", default=default_normals,
+                    help="CSV file with nx,ny,nz columns (alternative to positional)")
+    ap.add_argument("--sf_min", type=float, default=1.0, help="Min source factor for autotuning")
+    ap.add_argument("--sf_max", type=float, default=6.5, help="Max source factor for autotuning")
+    ap.add_argument("--lbfgs-maxiter", type=int, default=15, help="Max iterations for L-BFGS")
+    ap.add_argument("--lbfgs-tol", type=float, default=1e-8, help="Tolerance for L-BFGS")
+    ap.add_argument("--k-nn", type=int, default=96) # this sets the k for kNN weights & scales (computational cost)
     ap.add_argument("--use-mv", action="store_true")
-    ap.add_argument("--k-nn", type=int, default=48)
     ap.add_argument("--mv-weight", type=float, default=0.5)
     ap.add_argument("--interior-eps-factor", type=float, default=5e-3)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show-normals", action="store_true")
     ap.add_argument("--toroidal-flux", type=float, default=None,
                     help="If set, prescribes the toroidal flux Φ_t (sets a_t = Φ_t/(2π))")
-    ap.add_argument("--mfs-out", default=None,  # NEW: export path
+    ap.add_argument("--mfs-out", default=None,
                     help="Write portable MFS solution to this .npz (center,scale,Yn,alpha,a,a_hat,P,N,kind)")
     args = ap.parse_args()
 
@@ -1299,13 +1317,15 @@ if __name__ == "__main__":
         args.mfs_out = args.xyz.replace(".csv", "_solution.npz")
 
     out = main(
-        xyz_csv=args.xyz, nrm_csv=args.nrm,
+        xyz_csv=args.xyz, nrm_csv=args.normals,
         use_mv=args.use_mv or True, k_nn=args.k_nn,
         mv_weight=args.mv_weight,
         interior_eps_factor=args.interior_eps_factor,
         verbose=args.verbose or True,
         show_normals=args.show_normals,
-        toroidal_flux=args.toroidal_flux
+        toroidal_flux=args.toroidal_flux,
+        sf_min=args.sf_min, sf_max=args.sf_max,
+        lbfgs_maxiter=args.lbfgs_maxiter, lbfgs_tol=args.lbfgs_tol
     )
 
     # --- SAVE a portable checkpoint for the tracer ---

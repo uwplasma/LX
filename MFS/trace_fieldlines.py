@@ -3,9 +3,11 @@
 Trace field lines x'(t) = ∇φ(x) from an MFS solution checkpoint (.npz).
 
 Usage:
-  python trace_fieldlines.py --mfs mfs_solution.npz \
-      --tfinal 1000 --n-save 1000 --nseed 32 --eps 1e-3 \
-      --poincare-phi 0 1.57079632679 --poincare-out poincare
+  python trace_fieldlines.py wout_precise_QH_solution.npz --nfp 4 --save-figure
+
+  python trace_fieldlines.py slam_surface_solution.npz --nfp 2 --save-figure --seeds "3.4:0:0,3.2:0:0,3.1:0:0,3.0:0:0,2.9:0:0,2.8:0:0"
+
+Script is parallelized over multiple devices (set number_of_processors_to_use at top).
 
 The .npz must contain (as saved by main.py):
   center(3,), scale(scalar), Yn(M,3), alpha(M,),
@@ -13,7 +15,12 @@ The .npz must contain (as saved by main.py):
 """
 
 from __future__ import annotations
-import os, sys, math, time, argparse
+
+import os
+number_of_processors_to_use = 6 # Parallelization, this should divide nfieldlines
+os.environ["XLA_FLAGS"] = f'--xla_force_host_platform_device_count={number_of_processors_to_use}'
+
+import time, argparse
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -26,6 +33,16 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import diffrax as dfx
+
+from jax import jit, vmap, tree_util, random, lax, device_put
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+
+mesh = Mesh(jax.devices(), ("dev",))
+spec=PartitionSpec("dev", None)
+spec_index=PartitionSpec("dev")
+sharding = NamedSharding(mesh, spec)
+sharding_index = NamedSharding(mesh, spec_index)
+out_sharding = NamedSharding(mesh, PartitionSpec("dev", None, None))
 
 # ----------------------------- Styling ----------------------------- #
 def apply_paper_style():
@@ -263,6 +280,9 @@ def seeds_along_axis_from_boundary(
     pL, nL = P[iL], N[iL]
     pR, nR = P[iR], N[iR]
 
+    pL = (pL+pR)/2.01
+    pR = pR*0.99
+
     # Estimate a data-driven spacing in the strip to set inward epsilon automatically
     # crude kNN via projection to 1D u1:
     if u1_sel.size >= 8:
@@ -341,7 +361,13 @@ def integrate_streamlines_vmap(
         )
         return sol.ys
 
-    ys_all = jax.vmap(_solve_one)(seeds)  # (S, n_save, 3)
+    ys_all = jax.jit(
+        jax.vmap(_solve_one),
+        in_shardings=sharding,          # one arg -> one sharding; seeds has shape (S,3)
+        out_shardings=out_sharding      # output (S, n_save, 3)
+    )(
+        device_put(seeds, sharding)     # put seeds on sharded devices
+    )
 
     x_min, x_max, y_min, y_max, z_min, z_max = box
     X, Y, Z = ys_all[..., 0], ys_all[..., 1], ys_all[..., 2]
@@ -403,7 +429,9 @@ def main(mfs_npz: str,
          n_save: int = 2001,
          box_pad: float = 0.10,
          poincare_phi: Optional[Sequence[float]] = None,
-         poincare_out: Optional[str] = None):
+         poincare_label_pi: bool = False,
+         save_figure: bool = False,
+         ):
 
     # Load MFS checkpoint & evaluators
     m = load_mfs_solution(mfs_npz)
@@ -448,8 +476,10 @@ def main(mfs_npz: str,
         seeds_arr, f, t_final=t_final, box=box,
         backward=True,  n_save=n_save, rtol=rtol, atol=atol
     )
-    print(f"[TIME] Total elapsed time: {time.time() - t0:.2f} s")
+    Yb = Yf
     Y = np.concatenate([np.flip(Yb, axis=1), Yf], axis=1)  # (S, 2*n_save, 3)
+    # Y = Yf
+    print(f"[TIME] Total elapsed time: {time.time() - t0:.2f} s")
 
     # Poincaré (optional)
     if poincare_phi and len(poincare_phi) > 0:
@@ -462,7 +492,10 @@ def main(mfs_npz: str,
             R, Z = R_list[k], Z_list[k]
             if R.size == 0: continue
             any_points = True
-            ax_p.scatter(R, Z, s=0.3, alpha=0.85, rasterized=True, label=phi_label_pi(float(phi0), wrap=False))
+            if poincare_label_pi:
+                ax_p.scatter(R, Z, s=0.3, alpha=0.85, rasterized=True, label=phi_label_pi(float(phi0), wrap=True))
+            else:
+                ax_p.scatter(R, Z, s=0.3, alpha=0.85, rasterized=True, color="b")
         ax_p.set_xlabel(r"$R=\sqrt{x^2+y^2}$"); ax_p.set_ylabel(r"$Z$")
         ax_p.set_title(r"Poincaré section(s): cylindrical $\phi$")
         if any_points:
@@ -474,13 +507,15 @@ def main(mfs_npz: str,
         else:
             R_max_box = float(np.sqrt(x_max**2 + y_max**2))
             set_equal_data_aspect(ax_p, 0.0, R_max_box, z_min, z_max, pad_frac=0.03)
-        ax_p.legend(loc="best", frameon=True, framealpha=0.85)
+        if poincare_label_pi:
+            ax_p.legend(loc="best", frameon=True, framealpha=0.85)
         fig_p.tight_layout()
-        if poincare_out:
+        if save_figure:
             suffix = "_multi" if len(phis) > 1 else f"_phi{float(phis[0]):.6f}".replace(".", "p").replace("-", "m")
+            poincare_out = mfs_npz.replace(".npz", "_poincare")
             fig_p.savefig(f"{poincare_out}{suffix}.png")
-            fig_p.savefig(f"{poincare_out}{suffix}.pdf")
-            print(f"[POINCARE] Saved {poincare_out}{suffix}.png/.pdf")
+            # fig_p.savefig(f"{poincare_out}{suffix}.pdf")
+            print(f"[POINCARE] Saved {poincare_out}{suffix}.png")
 
     # Plot 3D with |∇φ| on boundary points
     fig = plt.figure(figsize=(8,6))
@@ -506,34 +541,69 @@ def main(mfs_npz: str,
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.set_title("Field lines of ∇φ (MFS)")
     ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max); ax.set_zlim(z_min, z_max)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    if save_figure:
+        figure_out = mfs_npz.replace(".npz", "_fieldlines.png")
+        fig.savefig(figure_out)
+        print(f"[FIGURE] Saved {figure_out}")
+    plt.show()
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mfs", type=str, default='wout_precise_QH_solution.npz', help="Path to mfs_solution.npz")
-    ap.add_argument("--tfinal", type=float, default=250.0)
+    ### MAIN PARAMETERS TO CHANGE
+    # Single argument usable as positional or optional (--file / -f).
+    ap.add_argument("file", nargs="?", type=str, default="wout_precise_QH_solution.npz",
+                    help="Path to mfs_solution.npz (positional or --file).")
+    ap.add_argument("-f", "--file", dest="file", type=str, help="Path to mfs_solution.npz (overrides positional if both given).")
+    ap.add_argument("--nfp", type=int, default=4, help="Number of field periods for Poincaré sampling.")
+    ap.add_argument("--tfinal", type=float, default=1.0)
+    ap.add_argument("--save-figure", action="store_true", default=False)
+    ### NUMBER OF FIELDLINES, NSEED, WILL BE THE NUMBER OF PROCESSORS USED (DEFINED ON TOP)
+    ap.add_argument("--nseed", type=int, default=None)
     ap.add_argument("--normalize", action="store_true")
     ap.add_argument("--clip", type=float, default=None)
-    ap.add_argument("--nseed", type=int, default=5)
     ap.add_argument("--eps", type=float, default=1e-2)
-    ap.add_argument("--rtol", type=float, default=1e-10)
-    ap.add_argument("--atol", type=float, default=1e-10)
-    ap.add_argument("--n-save", type=int, default=4,
+    ap.add_argument("--rtol", type=float, default=1e-6)
+    ap.add_argument("--atol", type=float, default=1e-6)
+    ap.add_argument("--n-save", type=int, default=5,
                     help="Factor => total output points = n_save * tfinal")
+    ap.add_argument("--poincare-label-pi", action="store_true", help="Use π-fraction labels on Poincaré plots.")
     ap.add_argument("--box-pad", type=float, default=0.10)
-    ap.add_argument("--poincare-phi", type=float, nargs="*", default=[0, 0.25*np.pi, 0.5*np.pi, 0.75*np.pi])
-    ap.add_argument("--poincare-out", default=None)
+    ap.add_argument("--poincare-nphi", type=int, default=4)
     ap.add_argument("--seed-mode", choices=["axis", "boundary"], default="axis",
                     help="axis: chord across center using a_hat; boundary: old inward-offset sampling")
     ap.add_argument("--strip-tol-frac", type=float, default=0.03, help="Half-width of selection strip (fraction of spread).")
     ap.add_argument("--plane-tol-frac", type=float, default=0.10, help="For torus: |s| tolerance along a_hat (fraction of span).")
     ap.add_argument("--inward-frac", type=float, default=0.02, help="Inward nudge fraction based on local spacing.")
+    ap.add_argument(
+        "--seeds", type=str, default=None,
+        help="Comma-separated list of seed points as x:y:z,x:y:z,... (overrides automatic seed computation)"
+    )
 
     args = ap.parse_args()
 
+    # Parse seeds if provided
+    user_seeds = None
+    if args.seeds is not None:
+        try:
+            user_seeds = []
+            for item in args.seeds.split(","):
+                xyz = tuple(float(v) for v in item.split(":"))
+                if len(xyz) == 3:
+                    user_seeds.append(xyz)
+            if len(user_seeds) == 0:
+                user_seeds = None
+        except Exception as e:
+            print(f"[ERROR] Could not parse --seeds argument: {e}")
+            user_seeds = None
+
+    args.poincare_phi = jnp.linspace(0, 2*jnp.pi, args.poincare_nphi*args.nfp, endpoint=False).tolist()
+    args.nseed = number_of_processors_to_use
+
     n_save = int(args.n_save * args.tfinal)
     main(
-        mfs_npz=args.mfs,
+        mfs_npz=args.file,
+        seeds=user_seeds,
         t_final=args.tfinal,
         normalize=args.normalize,
         clip_grad=args.clip,
@@ -544,5 +614,6 @@ if __name__ == "__main__":
         n_save=n_save,
         box_pad=args.box_pad,
         poincare_phi=args.poincare_phi,
-        poincare_out=args.poincare_out,
+        save_figure=args.save_figure,
+        poincare_label_pi=args.poincare_label_pi
     )
