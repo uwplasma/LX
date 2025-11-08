@@ -43,6 +43,7 @@ import jax.scipy.linalg as jsp_linalg
 from scipy.interpolate import griddata
 from jax import debug as jax_debug
 from functools import partial
+import argparse
 
 # ------------------------- JAX: 64-bit ------------------------- #
 jax.config.update("jax_enable_x64", True)
@@ -1275,22 +1276,60 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     )
 
 if __name__ == "__main__":
-    # Set these to your file names as needed:
-    xyz_csv = "wout_precise_QA.csv"
-    nrm_csv = "wout_precise_QA_normals.csv"
-    # xyz_csv = "wout_precise_QH.csv"
-    # nrm_csv = "wout_precise_QH_normals.csv"
-    # xyz_csv = "slam_surface.csv"
-    # nrm_csv = "slam_surface_normals.csv"
-    # xyz_csv = "sflm_rm4.csv"
-    # nrm_csv = "sflm_rm4_normals.csv"
-    _ = main(
-        xyz_csv=xyz_csv, nrm_csv=nrm_csv,
-        use_mv=True, k_nn=64,
-        source_factor=2.0,        # try 1.5–3.0 if needed
-        lambda_reg=1e-3,          # try 3e-4..3e-3 depending on noise
-        mv_weight=0.5,            # 0.2..1.0 is reasonable
-        interior_eps_factor=5e-3,
-        verbose=True,
-        toroidal_flux=1.0
+    ap = argparse.ArgumentParser()
+    # ap.add_argument("--xyz", default="sflm_rm4.csv")
+    # ap.add_argument("--nrm", default="sflm_rm4_normals.csv")
+    # ap.add_argument("--xyz", default="slam_surface.csv")
+    # ap.add_argument("--nrm", default="slam_surface_normals.csv")
+    # ap.add_argument("--xyz", default="wout_precise_QH.csv")
+    # ap.add_argument("--nrm", default="wout_precise_QH_normals.csv")
+    ap.add_argument("--xyz", default="wout_precise_QA.csv")
+    ap.add_argument("--nrm", default="wout_precise_QA_normals.csv")
+    ap.add_argument("--use-mv", action="store_true")
+    ap.add_argument("--k-nn", type=int, default=48)
+    ap.add_argument("--source-factor", type=float, default=2.0)
+    ap.add_argument("--lambda-reg", type=float, default=1e-3)
+    ap.add_argument("--mv-weight", type=float, default=0.5)
+    ap.add_argument("--interior-eps-factor", type=float, default=5e-3)
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--show-normals", action="store_true")
+    ap.add_argument("--toroidal-flux", type=float, default=None,
+                    help="If set, prescribes the toroidal flux Φ_t (sets a_t = Φ_t/(2π))")
+    ap.add_argument("--mfs-out", default="mfs_solution.npz",  # NEW: export path
+                    help="Write portable MFS solution to this .npz (center,scale,Yn,alpha,a,a_hat,P,N,kind)")
+    args = ap.parse_args()
+
+    out = main(
+        xyz_csv=args.xyz, nrm_csv=args.nrm,
+        use_mv=args.use_mv or True, k_nn=args.k_nn,
+        source_factor=args.source_factor,
+        lambda_reg=args.lambda_reg,
+        mv_weight=args.mv_weight,
+        interior_eps_factor=args.interior_eps_factor,
+        verbose=args.verbose or True,
+        show_normals=args.show_normals,
+        toroidal_flux=args.toroidal_flux
     )
+
+    # --- SAVE a portable checkpoint for the tracer ---
+    # Pull everything we need out of 'out' and the local scope
+    try:
+        # Objects available at end of main():
+        #   P, N, Pn, W, rk, h_med, alpha, a, delta_n, eps_n,
+        #   phi_fn, grad_fn, psi_fn, grad_psi_fn, laplacian_psi_fn
+        # Local names still in scope here: scinfo, Yn, best/kind, best["a_hat"]
+        np.savez(
+            args.mfs_out,
+            center=np.asarray(scinfo.center, dtype=float),
+            scale=float(np.asarray(scinfo.scale)),
+            Yn=np.asarray(Yn, dtype=float),
+            alpha=np.asarray(out["alpha"], dtype=float),
+            a=np.asarray(out["a"], dtype=float),
+            a_hat=np.asarray(best["a_hat"], dtype=float),
+            P=np.asarray(out["P"], dtype=float),
+            N=np.asarray(out["N"], dtype=float),
+            kind=str(best.get("kind","torus")),
+        )
+        print(f"[SAVE] Wrote MFS checkpoint → {args.mfs_out}")
+    except Exception as e:
+        print("[WARN] Could not save MFS checkpoint:", e)
