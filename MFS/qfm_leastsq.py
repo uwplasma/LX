@@ -791,10 +791,10 @@ def main():
         try:
             fig = plt.figure(figsize=(9,7))
             ax = fig.add_subplot(111, projection='3d')
-            ax.scatter(P[:,0], P[:,1], P[:,2], s=3, alpha=0.25, label="Boundary")
-            sca = ax.scatter(X[:,0], X[:,1], X[:,2], c=psi, s=3, cmap="viridis", alpha=0.6)
+            ax.scatter(P[:,0], P[:,1], P[:,2], s=1, alpha=0.25, label="Boundary")
+            sca = ax.scatter(X[:,0], X[:,1], X[:,2], c=psi, s=1, cmap="viridis", alpha=0.6)
             for i, (S, c) in enumerate(zip(surfaces, levels)):
-                ax.scatter(S[:,0], S[:,1], S[:,2], s=6, color=surf_colors[i], label=f"ψ={c}")
+                ax.scatter(S[:,0], S[:,1], S[:,2], s=1, color=surf_colors[i], label=f"ψ={c}")
             fig.colorbar(sca, ax=ax, shrink=0.7, label="ψ")
             ax.legend(); ax.set_title("QFMin via least-squares ψ")
             plt.tight_layout()
