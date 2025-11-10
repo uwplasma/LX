@@ -521,9 +521,8 @@ def main(mfs_npz: str,
         seeds_arr, f, t_final=t_final, box=box,
         backward=True,  n_save=n_save, rtol=rtol, atol=atol
     )
-    Yb = Yf
+    # Yb = Yf
     Y = np.concatenate([np.flip(Yb, axis=1), Yf], axis=1)  # (S, 2*n_save, 3)
-    # Y = Yf
     print(f"[TIME] Total elapsed time: {time.time() - t0:.2f} s")
 
     # Poincaré (optional)
@@ -678,7 +677,7 @@ if __name__ == "__main__":
             print(f"[ERROR] Could not parse --seeds argument: {e}")
             user_seeds = None
 
-    args.poincare_phi = jnp.linspace(0, 2*jnp.pi, args.poincare_nphi*args.nfp, endpoint=False).tolist()
+    args.poincare_phi = jnp.linspace(0, 2*jnp.pi/args.nfp, args.poincare_nphi, endpoint=False).tolist()
     args.nseed = number_of_processors_to_use
 
     n_save = int(args.n_save * args.tfinal)

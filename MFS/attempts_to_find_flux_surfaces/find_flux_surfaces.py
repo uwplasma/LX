@@ -209,12 +209,40 @@ def field_grad(field: Field, X: jnp.ndarray) -> jnp.ndarray:
     mv = field.sc.scale * (field.a[0] * Gt + field.a[1] * Gp)
     return mv + dS
 
+@jit
+def field_grad_with_local_theta(field: Field, X: jnp.ndarray, Nsurf: jnp.ndarray) -> jnp.ndarray:
+    """
+    Same as field_grad, but builds θ̂ using the *current* surface normals Nsurf
+    instead of nearest boundary normals. More accurate deep inside.
+    """
+    Xn = field.sc.normalize(X)
+    # Green part (single-valued)
+    dS = vmap(_grad_S_alpha_at, in_axes=(0, None, None))(Xn, field.Yn, field.alpha) * field.sc.scale
+    # MV: toroidal part (independent of normals)
+    Gt = grad_t_fn(Xn, field.a_hat)
+
+    # MV: poloidal part θ̂ using Nsurf (local)
+    a = field.a_hat / jnp.maximum(1e-30, jnp.linalg.norm(field.a_hat))
+    r_par = jnp.sum(Xn * a[None, :], axis=1, keepdims=True) * a[None, :]
+    r_perp = Xn - r_par
+    phi_hat = jnp.cross(a[None, :], r_perp)
+    phi_hat = phi_hat / jnp.maximum(1e-30, jnp.linalg.norm(phi_hat, axis=1, keepdims=True))
+    # project azimuth onto tangent plane of current surface
+    phi_tan = phi_hat - jnp.sum(phi_hat * Nsurf, axis=1, keepdims=True) * Nsurf
+    phi_tan = phi_tan / jnp.maximum(1e-30, jnp.linalg.norm(phi_tan, axis=1, keepdims=True))
+    theta_hat = jnp.cross(Nsurf, phi_tan)
+    theta_hat = theta_hat / jnp.maximum(1e-30, jnp.linalg.norm(theta_hat, axis=1, keepdims=True))
+
+    mv = field.sc.scale * (field.a[0] * Gt + field.a[1] * theta_hat)
+    return mv + dS
+
 # ---------------------- surface normals (JAX) ---------------------- #
 
 def build_fixed_knn(P0_np: np.ndarray, k_norm: int = 16):
-    """Neighbor indices (NumPy) reused across iterations for speed."""
-    nbrs = NearestNeighbors(n_neighbors=min(k_norm, len(P0_np)), algorithm="kd_tree").fit(P0_np)
+    k_eff = min(k_norm, max(3, len(P0_np)-1))  # ensure ≥3 and leave room to exclude self if needed
+    nbrs = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree").fit(P0_np)
     dists, idxs = nbrs.kneighbors(P0_np)
+    # (we keep self in; covariance on (k) neighbors including self is fine for smoothing normals)
     return idxs.astype(np.int32)
 
 @jit
@@ -244,6 +272,15 @@ def qflux_rms_linf(W: jnp.ndarray, Nsurf: jnp.ndarray, grad_on: jnp.ndarray):
     rms = jnp.sqrt(jnp.dot(W, n_dot * n_dot) / (jnp.sum(W) + 1e-30))
     linf = jnp.max(jnp.abs(n_dot))
     return rms, linf, n_dot
+
+@jit
+def angle_weighted_energy(W: jnp.ndarray, Nsurf: jnp.ndarray, G: jnp.ndarray):
+    # E = ⟨ (n·G)^2 / (|G|^2 + eps^2) ⟩_W
+    n_dot = jnp.sum(Nsurf * G, axis=1, keepdims=True)
+    G_norm = jnp.linalg.norm(G, axis=1, keepdims=True)
+    eps = 1e-2 * jnp.median(G_norm) + 1e-30
+    e = (n_dot * n_dot) / (G_norm * G_norm + eps * eps)
+    return (jnp.dot(W, e[:, 0]) / (jnp.sum(W) + 1e-30)).squeeze()
 
 @jit
 def signed_dist_and_nout(X: jnp.ndarray, Pb: jnp.ndarray, Nb: jnp.ndarray):
@@ -317,6 +354,10 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
     Nb = jnp.asarray(Nb_out_np)      # (Nb,3)
     is_inside_host = is_inside_func if is_inside_func is not None else build_inside_tester(Pb_ref_np, Nb_out_np)
 
+    def refresh_norm_neighbors_host(X_np: np.ndarray, k: int) -> np.ndarray:
+        # rebuild neighbors with sklearn on host
+        return build_fixed_knn(X_np, k_norm=k)
+
     # Debug: initial inside stats
     inside_init = is_inside_host(np.asarray(X))
     print(f"[EVOLVE:init] Inside points: {inside_init.sum()}/{len(inside_init)}. "
@@ -336,7 +377,7 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
 
     # helper: one iteration (JITed)
     @jit
-    def one_step(X, Pb, Nb, L, W, dt, beta, margin):
+    def one_step(X, Pb, Nb, L, W, dt, beta, margin, idxs_norm):
         """
         One descent step with:
         - inward alignment of geometry normals (vs nearest boundary outward normal)
@@ -352,15 +393,26 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
         Nsurf = jnp.where(dot_no > 0.0, -Nsurf_raw, Nsurf_raw)              # inward-oriented
 
         # Field gradient and quadratic-flux terms
-        G = field_grad(field, X)
+        # Use local normals to define θ̂ (improves accuracy deep inside)
+        G = field_grad_with_local_theta(field, X, Nsurf)
         rms, linf, n_dot = qflux_rms_linf(W, Nsurf, G)
 
-        # Steepest descent (along geometry normal) + smoothing
-        step_n = (n_dot[:, None]) * Nsurf                                   # (N,3)
-        step_s = L @ X                                                       # (N,3) graph-Laplacian smoothing
+        # Steepest descent (angle-weighted): scale by 1/(|G|^2 + eps^2)
+        G_norm = jnp.linalg.norm(G, axis=1, keepdims=True)                  # (N,1)
+        # robust epsilon from the current surface (JAX-friendly)
+        eps = 1e-2 * jnp.median(G_norm) + 1e-30
+        w = 1.0 / (G_norm * G_norm + eps * eps)                             # (N,1)
+        step_n = (w * n_dot[:, None]) * Nsurf                                # (N,3)
+        step_s = L @ X                                                       # (N,3)
 
-        # Gentle cap on the normal step to avoid spikes
-        cap = jnp.maximum(5e-4, 0.2 * jnp.median(jnp.linalg.norm(step_n, axis=1)))
+        # Proximity damper: smoothly shrink step_n as we approach the wall
+        t = jnp.clip((s_here + 2.0 * margin) / (2.0 * margin), 0.0, 1.0)
+        damper = 1.0 - 0.75 * t     # was 1.0 - t
+        step_n = step_n * damper[:, None]
+
+        # Gentle cap on the normal step to avoid spikes (allow larger motion)
+        p90 = jnp.percentile(jnp.linalg.norm(step_n, axis=1), 90.0)
+        cap = jnp.maximum(1e-3, 2.5 * p90)
         sn_norm = jnp.linalg.norm(step_n, axis=1, keepdims=True) + 1e-30
         scale = jnp.minimum(1.0, cap / sn_norm)
         step_n = step_n * scale
@@ -370,7 +422,8 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
         # adaptive smoothing scale to match magnitudes
         sn_med = jnp.median(jnp.linalg.norm(step_n, axis=1)) + 1e-12
         ss_med = jnp.median(jnp.linalg.norm(step_s, axis=1)) + 1e-12
-        beta_eff = beta * (sn_med / ss_med)   # keeps smoothing “in range” of step_n
+        ratio = sn_med / ss_med
+        beta_eff = jnp.clip(beta * ratio, 0.005 * beta, 1.5 * beta)  # keeps smoothing “in range” of step_n
         dX = -dt * (step_n + beta_eff * step_s)
 
         # --- Tangent projection barrier near the wall ---
@@ -378,7 +431,7 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
         # outward component amount:
         dX_out = jnp.sum(dX * Nout_here, axis=1, keepdims=True)             # (N,1)
         # mask of "near" points
-        near = (s_here > -2.0 * margin).astype(dX.dtype)[:, None]           # (N,1)
+        near = (s_here > -1.2 * margin).astype(dX.dtype)[:, None]           # (N,1)
         # only subtract outward (positive) component when near
         dX_corrected = dX - near * jnp.maximum(0.0, dX_out) * Nout_here
 
@@ -394,27 +447,93 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
                n_norm_med, s_norm_med, s_min, s_med, near_frac)
 
     def body_fun(it, carry):
-        X, dt_curr = carry
+        X, dt_curr, idxs_norm_cur = carry
+        idxs_norm_new = idxs_norm_cur
+        # Baseline candidate (1.0 * dt_curr)
+        X1, aux1 = one_step(X, Pb, Nb, L, W, dt_curr,        beta, margin, idxs_norm_new)
+        rms1, linf1, ndm1, ndx1, nnmed1, smed1, smin1, smid1, nfrac1 = aux1
+        # Backtracking candidates (0.7 and 0.4 * dt_curr)
+        X2, aux2 = one_step(X, Pb, Nb, L, W, 0.7 * dt_curr,  beta, margin, idxs_norm_new)
+        rms2, linf2, *_ = aux2
+        X3, aux3 = one_step(X, Pb, Nb, L, W, 0.4 * dt_curr,  beta, margin, idxs_norm_new)
+        rms3, linf3, *_ = aux3
+        X4, aux4 = one_step(X, Pb, Nb, L, W, 0.2 * dt_curr, beta, margin, idxs_norm_new)
+        rms4, linf4, *_ = aux4
 
-        X_trial, aux_t = one_step(X, Pb, Nb, L, W, dt_curr, beta, margin)
-        rms_t, linf_t, ndm_t, ndx_t, nnmed_t, smed_t, smin_t, smid_t, nfrac_t = aux_t
+        # Current energy (no step): angle-weighted, consistent with descent direction
+        N_now = _normals_from_cov(X, idxs_norm_new)
+        G_now = field_grad_with_local_theta(field, X, N_now)
+        E0 = angle_weighted_energy(W, N_now, G_now)
+        rms0, linf0, _ = qflux_rms_linf(W, N_now, G_now)     # move up
+        n_dot0 = jnp.sum(N_now * G_now, axis=1)
+        abs_nd = jnp.abs(n_dot0)
+        p95 = jnp.percentile(abs_nd, 95.0)
+        p99 = jnp.percentile(abs_nd, 99.0)
+        jax.debug.print("[n·G] rms0={r0:.3e} linf0={l0:.3e} p95={p95:.3e} p99={p99:.3e}",
+                        r0=rms0, l0=linf0, p95=p95, p99=p99)
 
-        # Current metrics (no step)
-        G_now = field_grad(field, X)
-        N_now = _normals_from_cov(X, idxs_norm)
-        rms_now, linf_now, _ = qflux_rms_linf(W, N_now, G_now)
+        # Candidate energies (match the one_step logic: local theta)
+        def energy_of(Xcand):
+            N_c = _normals_from_cov(Xcand, idxs_norm_new)
+            G_c = field_grad_with_local_theta(field, Xcand, N_c)
+            return angle_weighted_energy(W, N_c, G_c)
 
-        improve = (rms_t < rms_now) | ((jnp.abs(rms_t - rms_now) < 1e-4 * (1.0 + rms_now)) & (linf_t <= linf_now))
+        E1 = energy_of(X1)
+        E2 = energy_of(X2)
+        E3 = energy_of(X3)
+        E4 = energy_of(X4)
 
-        X_next = jnp.where(improve, X_trial, X)        # <- keep previous geometry if no improvement
-        dt_next = jnp.where(improve,
-                            jnp.minimum(1.10 * dt_curr, 1.5 * dt),
-                            jnp.maximum(0.5 * dt_curr, 0.02 * dt))
+        jax.debug.print(
+            "[E] E0={E0:.6e} E1={E1:.6e} E2={E2:.6e} E3={E3:.6e} "
+            "dE1={d1:.2e} dE2={d2:.2e} dE3={d3:.2e}",
+            E0=E0, E1=E1, E2=E2, E3=E3, d1=E1-E0, d2=E2-E0, d3=E3-E0
+        )
 
+        # Armijo-like acceptance: strict energy decrease, or tiny delta with better Linf
+        def ok(En, rms_c, linf_c):
+            dE = En - E0
+            goodE  = dE < -2e-6 * (1.0 + E0)         # was 1e-6
+            goodR  = (rms_c <= 0.9975 * rms0)        # was 0.995
+            goodL  = (linf_c <= 0.9975 * linf0)      # was 0.995
+            tinyE  = jnp.abs(dE) < 2e-5 * (1.0 + E0) # was 1e-5
+            return goodE | (tinyE & (goodR | goodL))
+
+        imp1 = ok(E1, rms1, linf1)
+        imp2 = ok(E2, rms2, linf2) & (~imp1)
+        imp3 = ok(E3, rms3, linf3) & (~imp1) & (~imp2)
+        imp4 = ok(E4, rms4, linf4) & (~imp1) & (~imp2) & (~imp3)
+
+        # Stack energies and candidates so we can JAX-index them
+        Es   = jnp.stack([E1, E2, E3, E4], axis=0)                # (4,)
+        Xs   = jnp.stack([X1, X2, X3, X4], axis=0)                # (4, N, 3)
+        dts  = jnp.stack([
+            jnp.minimum(1.10*dt_curr, 1.5*dt),
+            jnp.maximum(0.8*dt_curr, 0.05*dt),
+            jnp.maximum(0.6*dt_curr, 0.03*dt),
+            jnp.maximum(0.4*dt_curr, 0.02*dt),
+        ], axis=0)                                                # (4,)
+
+        Ms   = jnp.stack([imp1, imp2, imp3, imp4], axis=0)        # (4,) bool
+        any_imp = jnp.any(Ms)
+
+        # First improving candidate (smallest index), else global argmin energy
+        # argmax on [imp1,imp2,...] returns first True because False=0, True=1 and ties break to first
+        idx_imp = jnp.argmax(Ms).astype(jnp.int32)
+        idx_min = jnp.argmin(Es).astype(jnp.int32)
+        idx     = jnp.where(any_imp, idx_imp, idx_min).astype(jnp.int32)
+
+        X_next  = Xs[idx]                                         # (N,3)
+        dt_next = dts[idx]                                        # ()
+        improve = any_imp
+
+        # For logs, show the actually chosen candidate’s metrics
+        r_log = jnp.where(imp1, rms1, jnp.where(imp2, rms2, jnp.where(imp3, rms3, rms0)))
+        l_log = jnp.where(imp1, linf1, jnp.where(imp2, linf2, jnp.where(imp3, linf3, linf0)))
         s_after, _ = signed_dist_and_nout(X_next, Pb, Nb)
         outs = jnp.sum((s_after >= -margin).astype(jnp.int32))
-        r_log = jnp.where(improve, rms_t, rms_now)
-        l_log = jnp.where(improve, linf_t, linf_now)
+
+        # For nn/s stats, re-use the first candidate’s (good enough for trend)
+        nnmed_t, smed_t, smin_t, smid_t, nfrac_t = nnmed1, smed1, smin1, smid1, nfrac1
 
         # Option A: print boolean directly
         jax.debug.print(
@@ -426,14 +545,34 @@ def evolve_qfmin_surface(P0_world: jnp.ndarray,
             imp=improve
         )
 
-        return (X_next, dt_next)
+        return (X_next, dt_next, idxs_norm_new)
 
-    X_final, _dt_final = lax.fori_loop(0, iters, body_fun, (X, dt))
+    epochs = max(1, (iters + 9) // 10)           # e.g., refresh every ~10 steps
+    steps_per_epoch = max(1, iters // epochs)
+
+    state = (X, dt, jnp.asarray(idxs_norm))      # carry: (X, dt, idxs_norm)
+    for ep in range(epochs):
+        state = lax.fori_loop(0, steps_per_epoch, body_fun, state)
+        X, dt, idxs_norm_cur = state
+        # host-side refresh of kNN using sklearn (legal now)
+        X_np = np.asarray(X)                      # ✅ allowed here
+        idxs_norm = build_fixed_knn(X_np, k_norm=k_knn_normals)
+        state = (X, dt, jnp.asarray(idxs_norm))
+
+    # pad remaining iterations if not divisible
+    done_iters = epochs * steps_per_epoch
+    if done_iters < iters:
+        state = lax.fori_loop(0, iters - done_iters, body_fun, state)
+
+    X_final, _dt_final, idxs_norm = state
 
     # ensure strict inside at the end
     X_np = np.asarray(X_final)
-    X_np = project_inside(np.asarray(Pb), np.asarray(Nb), X_np, eps=0.05*float(margin_world), max_iters=4)
+    # Stronger nudge and a few more passes; still cheap at this size
+    X_np = project_inside(np.asarray(Pb), np.asarray(Nb), X_np,
+                        eps=0.15*float(margin_world), max_iters=6, growth=1.6)
     X_final = jnp.asarray(X_np)
+
 
     # Final metrics (non-jitted print friendly)
     Nsurf_final = _normals_from_cov(X_final, idxs_norm)
@@ -616,13 +755,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('mfs_npz', help='Checkpoint produced by main.py (…_solution.npz)')
     ap.add_argument('--n-surfaces', type=int, default=1)
-    ap.add_argument('--offset-min', type=float, default=0.25,
+    ap.add_argument('--offset-min', type=float, default=0.35,
                     help='Min inward offset as fraction of median h (normalized)')
     ap.add_argument('--offset-max', type=float, default=1.2,
                     help='Max inward offset as fraction of median h (normalized)')
     ap.add_argument('--k-nn', type=int, default=64, help='k for kNN area weights')
-    ap.add_argument('--dt', type=float, default=0.08)
-    ap.add_argument('--beta', type=float, default=0.12,
+    ap.add_argument('--dt', type=float, default=0.06)
+    ap.add_argument('--beta', type=float, default=0.06,
                     help='Graph-Laplacian smoothing strength')
     ap.add_argument('--iters', type=int, default=25)
     ap.add_argument('--tol', type=float, default=1e-4)
@@ -652,7 +791,7 @@ def main():
     h_world = h_med / float(np.asarray(field.sc.scale))
     print(f"[SCALE] median h_world≈{h_world:.6g}. "
         f"offsets range: [{args.offset_min*h_world:.3e}, {args.offset_max*h_world:.3e}] (world units)")
-    margin_world = 0.05 * h_world   # <-- stronger safety buffer in world units
+    margin_world = 0.10 * h_world   # <-- stronger safety buffer in world units
 
     offsets = np.linspace(args.offset_min, args.offset_max, max(1, args.n_surfaces))
     surfaces = []
