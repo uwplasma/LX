@@ -253,21 +253,24 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     h_band = float(args.band_h) * voxel
     band = (np.abs(s_signed) <= h_band) & inside
 
-    # Adapt to target fraction of inside (e.g., 10%)
+    # Adapt to target fraction of inside (aim ~10%, tighten if >15%)
+    
     target_frac = 0.10
+    max_frac    = 0.15
     n_in = int(inside.sum())
     if n_in > 0:
-        frac = band.sum() / n_in
-        if frac > 1.25 * target_frac:  # too fat → shrink by quantile
-            # use inside-only |s| distribution to pick a thinner band
-            abs_s_inside = np.abs(s_signed[inside])
+        abs_s_inside = np.abs(s_signed[inside])
+        # If current band too fat, shrink by quantile down to >= 0.5 voxel
+        for _ in range(3):
+            frac = band.sum() / n_in
+            if frac <= max_frac:
+                break
             kth = int(max(1, target_frac * n_in))
-            # np.partition gives kth smallest; guard bounds
             kth = min(kth, abs_s_inside.size - 1)
             h_band_new = float(np.partition(abs_s_inside, kth)[kth])
-            # also keep it ≥ 0.5 voxel to avoid empty band
             h_band = max(0.5 * voxel, h_band_new)
             band = (np.abs(s_signed) <= h_band) & inside
+
     pstat("Boundary band fraction", band.astype(float))
 
     # Axis seeds via collapsing random interior points along +grad φ
@@ -350,7 +353,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     # Outside nodes also fixed (identity rows already in L)
     fixed[np.logical_not(inside)] = True; val[np.logical_not(inside)] = 0.0
 
-    # Impose Dirichlet: overwrite rows
+    # Impose Dirichlet on rows (standard row stamping)
     pinfo("Imposing Dirichlet rows ...")
     L = L.tolil()
     rows = np.where(fixed)[0]
@@ -359,34 +362,72 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     rhs[rows] = val[rows]
     L = L.tocsr()
 
-    # Symmetrize to reduce tiny non-SPD artifacts from row stamping
-    L = (L + L.T) * 0.5
-    L = L.tocsr()
+    # --- NEW: extract the reduced free-free system ---
+    free  = ~fixed
+    fidx  = np.where(free)[0]
+    cidx  = np.where(fixed)[0]   # complement (fixed nodes)
 
+    n_free = int(free.sum())
+    if n_free == 0:
+        raise RuntimeError("No free interior unknowns after band selection.")
+
+    # Known Dirichlet values on fixed nodes
+    psi_fixed = val[fixed]  # shape (n_fixed,)
+
+    # Blocks
+    L_ff = L[free][:, free].tocsr()
+    L_fc = L[free][:, fixed].tocsr()
+
+    # Correct RHS for fixed contributions:
+    # L_ff * psi_f = rhs_f  with  rhs_f = rhs[free] - L_fc * psi_fixed
+    rhs_f = rhs[free] - L_fc.dot(psi_fixed)
+
+    # Symmetrize the reduced system (should already be nearly SPD)
+    L_ff = (L_ff + L_ff.T) * 0.5
+    L_ff = L_ff.tocsr()
+
+    # Try ILU(0) on the reduced system; if it fails, try AMG (if available),
+    # else fall back to Jacobi.
     try:
-        ilu = spilu(L.tocsc(), drop_tol=0.0, fill_factor=1.0)  # ILU(0)
-        M   = LinearOperator(L.shape, ilu.solve)
-        pinfo("[PCG] Using ILU(0) preconditioner")
+        ilu = spilu(
+            L_ff.tocsc(),
+            drop_tol=1e-4,      # allow dropping tiny fill
+            fill_factor=5.0,    # more fill → better PC
+            diag_pivot_thresh=0.1
+        )
+        M = LinearOperator(L_ff.shape, ilu.solve)
+        pinfo("[PCG] Using ILU(0) preconditioner on reduced system")
     except Exception as e:
-        pinfo(f"[PCG] ILU failed ({e}); falling back to Jacobi")
-        from scipy.sparse import diags as spdiags
-        diagL = np.array(L.diagonal(), dtype=float)
-        inv_diag = np.where(diagL > 0, 1.0/diagL, 1.0)
-        M = spdiags(inv_diag, offsets=0)
+        pinfo(f"[PCG] ILU failed on reduced system ({e}); trying AMG if available...")
+        try:
+            import pyamg  # optional dependency
+            ml = pyamg.ruge_stuben_solver(L_ff)  # classical AMG
+            M = LinearOperator(L_ff.shape, lambda x: ml.aspreconditioner()(x))
+            pinfo("[PCG] Using AMG preconditioner (pyamg)")
+        except Exception as _:
+            pinfo("[PCG] Falling back to Jacobi")
+            from scipy.sparse import diags as spdiags
+            diagL = np.array(L_ff.diagonal(), dtype=float)
+            inv_diag = np.where(diagL > 0, 1.0/diagL, 1.0)
+            M = spdiags(inv_diag, offsets=0)
 
     # Solve
-    pinfo("CG solve ...")
+    pinfo("CG solve on reduced system ...")
     t0 = time.time()
-
-    # SciPy API compatibility: prefer rtol/atol, fallback to tol on older versions
     try:
-        psi, info = cg(L, rhs, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M)
+        psi_f, info = cg(L_ff, rhs_f, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M)
     except TypeError:
-        # Older SciPy (uses 'tol' only)
-        psi, info = cg(L, rhs, tol=cg_tol, maxiter=cg_maxit, M=M)
-
+        psi_f, info = cg(L_ff, rhs_f, tol=cg_tol, maxiter=cg_maxit, M=M)
     t1 = time.time()
-    pinfo(f"CG done: info={info}, wall={t1-t0:.2f}s")
+    
+    # Report true reduced residual
+    r_free = L_ff @ psi_f - rhs_f
+    pinfo(f"[PCG] reduced residual: L2={np.linalg.norm(r_free):.3e}, Linf={np.max(np.abs(r_free)):.3e}")
+    pinfo(f"CG done (reduced): info={info}, iters<= {cg_maxit}, wall={t1-t0:.2f}s")
+
+    # Scatter back to full psi vector
+    psi = np.array(rhs)  # start with rhs so Dirichlet values are in place
+    psi[free] = psi_f
 
     # Quality metrics
     # parallel derivative proxy: |t_hat·∇ψ|
@@ -473,7 +514,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         ax2.hist(np.abs(par), bins=60, alpha=0.8)
         ax2.set_yscale('log'); ax2.set_xlabel(r"$|\,\hat t\cdot\nabla\psi\,|$")
         ax2.set_title("Field-aligned derivative magnitude (smaller is better)")
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
 
         # Residual scatter & slices
         fig2, axa = plt.subplots(1,3, figsize=(14,4))
@@ -481,7 +522,26 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         im0 = axa[0].imshow(r3[:,:,nz//2].T, origin='lower', aspect='equal'); plt.colorbar(im0, ax=axa[0]); axa[0].set_title("residual @ z mid")
         im1 = axa[1].imshow(r3[:,ny//2,:].T, origin='lower', aspect='equal'); plt.colorbar(im1, ax=axa[1]); axa[1].set_title("residual @ y mid")
         im2 = axa[2].imshow(r3[nx//2,:,:].T, origin='lower', aspect='equal'); plt.colorbar(im2, ax=axa[2]); axa[2].set_title("residual @ x mid")
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
+
+        # Iso-surface at ψ=0.5
+        vol_safe = np.nan_to_num(vol, nan=-1.0)
+        level = 0.5
+        verts, faces, normals, values = marching_cubes(vol_safe, level=level)
+
+        # map voxel coords -> physical coords
+        vx = mins[0] + verts[:,0]*(maxs[0]-mins[0])/(nx-1)
+        vy = mins[1] + verts[:,1]*(maxs[1]-mins[1])/(ny-1)
+        vz = mins[2] + verts[:,2]*(maxs[2]-mins[2])/(nz-1)
+
+        fig_iso = plt.figure(figsize=(7,6))
+        ax_iso = fig_iso.add_subplot(111, projection='3d')
+        ax_iso.plot_trisurf(vx, vy, faces, vz, alpha=0.7, linewidth=0.05)
+        ax_iso.set_title(r"Iso-surface $\psi=0.5$")
+        ax_iso.set_xlabel("x"); ax_iso.set_ylabel("y"); ax_iso.set_zlabel("z")
+        plt.tight_layout()
+        
+        plt.show()
 
     return dict(psi=psi, grid=(xs,ys,zs), inside=inside, quality=dict(parallel_dot_grad=par, residual=r))
 
