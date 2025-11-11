@@ -23,6 +23,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import cg
 import matplotlib.pyplot as plt
 from skimage.measure import marching_cubes
+from scipy.sparse.linalg import spilu, LinearOperator
 
 # ---------------------------- Debug utils ---------------------------- #
 def pct(a, p): return float(np.percentile(np.asarray(a), p))
@@ -120,23 +121,16 @@ class Evaluators:
 # ----------------------- Geometry: inside mask & bands -------------------- #
 def inside_mask_from_surface(P_surf, N_surf, Xq):
     """
-    Sign test via nearest neighbor: inside if (x - p_nn)·n_nn < 0 (outward normals).
-    Robust for reasonably smooth closed surfaces.
+    Inside if (x - p_nn)·n_nn < 0 (outward normals).
+    Return: inside(bool), idx(int), signed distance s (float)
     """
     nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(P_surf)
     d, idx = nbrs.kneighbors(Xq)
     p = P_surf[idx[:,0], :]
     n = N_surf[idx[:,0], :]
-    s = np.sum((Xq - p)*n, axis=1)  # >0 outside (along outward normals)
-    return (s < 0.0), idx[:,0]
+    s = np.sum((Xq - p)*n, axis=1)  # >0 outside
+    return (s < 0.0), idx[:,0], s
 
-def boundary_band_mask(P_surf, Xq, k=4, band_h=2.0):
-    nbrs = NearestNeighbors(n_neighbors=k, algorithm="kd_tree").fit(P_surf)
-    d, _ = nbrs.kneighbors(Xq)
-    # band if mean distance to nearest neighbors < band_h * local spacing estimate
-    dn = np.mean(d, axis=1)
-    thr = band_h*np.median(dn)
-    return dn < thr
 
 # ---------------------- Axis seeds by gradient collapse ------------------- #
 def collapse_to_axis(grad_phi, X0, step=0.02, iters=400, tol=1e-6):
@@ -243,11 +237,18 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     Xq = np.column_stack([XX.ravel(), YY.ravel(), ZZ.ravel()])
     pinfo(f"Grid: {nx}x{ny}x{nz} ~ {Xq.shape[0]} nodes; spacing dx≈{dx:.3g},dy≈{dy:.3g},dz≈{dz:.3g}")
 
+    voxel = min(dx, dy, dz)
+
     # Inside & boundary bands
-    inside, nn_idx = inside_mask_from_surface(P, N, Xq)
+    # After loading Xq and computing inside, also get 's'
+    inside, nn_idx, s_signed = inside_mask_from_surface(P, N, Xq)
     pstat("Inside mask", inside.astype(float))
-    band = boundary_band_mask(P, Xq, k=4, band_h=band_h)
-    band = np.logical_and(band, inside)
+    # Estimate surface spacing from P (median NN distance on the surface)
+    nbrs_surf = NearestNeighbors(n_neighbors=4, algorithm="kd_tree").fit(P)
+    d_surf, _ = nbrs_surf.kneighbors(P)            # (Ns, 4)
+    surf_h = float(np.median(d_surf[:,1]))         # use first non-zero neighbor
+    h_band = float(args.band_h) * voxel
+    band = (np.abs(s_signed) <= h_band) & inside   # thin boundary layer inside Γ
     pstat("Boundary band fraction", band.astype(float))
 
     # Axis seeds via collapsing random interior points along +grad φ
@@ -260,8 +261,11 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     # Cluster axis points to a 1D set (thin tube): use kNN thinning
     nbrs = NearestNeighbors(n_neighbors=8).fit(axis_pts)
     # Just keep them all; band selection will take radius
-    axis_band = axis_band_mask(axis_pts, Xq, rad=axis_band_radius*np.linalg.norm(span))
-    axis_band = np.logical_and(axis_band, inside)
+    # axis_band = axis_band_mask(axis_pts, Xq, rad=axis_band_radius*np.linalg.norm(span))
+    # axis_band = np.logical_and(axis_band, inside)
+    # pick radius as a few voxels wide
+    axis_band_radius = 2.5 * voxel   # ~2–3 voxels
+    axis_band = axis_band_mask(axis_pts, Xq, rad=axis_band_radius) & inside
     pstat("Axis band fraction", axis_band.astype(float))
 
     # Evaluate grad φ everywhere inside (vectorized in chunks to save memory)
@@ -278,6 +282,33 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     t_hat[mask_t] = (G[mask_t].T / gnorm[mask_t]).T
     D = diffusion_tensor(G, eps=eps)
 
+    n_tot = Xq.shape[0]
+    n_in  = int(inside.sum())
+    n_bnd = int(band.sum())
+    n_ax  = int(axis_band.sum())
+
+    # Nodes we actually solve for (unfixed interior)
+    fixed = np.zeros(n_tot, dtype=bool)
+    fixed[band] = True
+    fixed[axis_band] = True
+    fixed[~inside] = True
+    n_fixed = int(fixed.sum())
+    n_free  = int(n_tot - n_fixed)
+
+    pinfo(f"[COUNT] total={n_tot} inside={n_in} band={n_bnd} axis={n_ax} fixed={n_fixed} free={n_free}")
+    if (n_bnd / max(1, n_in)) > 0.25:
+        pinfo("[WARN] boundary band too thick; try --band-h ≈ 1.0–2.0 (voxel units)")
+    if (n_ax / max(1, n_in)) > 0.05:
+        pinfo("[WARN] axis band too thick; try axis radius ≈ 1–2 voxels")
+    if n_free < 0.2 * n_in:
+        pinfo("[WARN] too few free interior nodes; shrink bands or refine grid (--N)")
+    if n_free <= 0:
+        pinfo("[WARN] No free interior unknowns! Your boundary/axis bands are covering everything.")
+    pinfo(f"[BAND] surf_h={surf_h:.3e}, h_band={h_band:.3e}, "
+        f"band/inside={(n_bnd/max(1,n_in))*100:.1f}% of interior")
+    pinfo(f"[AXIS] axis_band_radius={axis_band_radius:.3e}, "
+        f"axis/inside={(n_ax/max(1,n_in))*100:.1f}% of interior")
+    
     # Assemble SPD operator
     pinfo("Assembling sparse operator L ...")
     L, rhs = build_sparse_operator(nx, ny, nz, dx, dy, dz, inside, D)
@@ -299,6 +330,17 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     L[rows, rows] = 1.0
     rhs[rows] = val[rows]
     L = L.tocsr()
+
+    try:
+        ilu = spilu(L.tocsc(), drop_tol=0.0, fill_factor=1.0)  # ILU(0)
+        M   = LinearOperator(L.shape, ilu.solve)
+        pinfo("[PCG] Using ILU(0) preconditioner")
+    except Exception as e:
+        pinfo(f"[PCG] ILU failed ({e}); falling back to Jacobi")
+        from scipy.sparse import diags as spdiags
+        diagL = np.array(L.diagonal(), dtype=float)
+        inv_diag = np.where(diagL > 0, 1.0/diagL, 1.0)
+        M = spdiags(inv_diag, offsets=0)
 
     # Solve
     pinfo("CG solve ...")
@@ -344,6 +386,37 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
 
     par = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz).ravel()
     pstat("|t·∇ψ| (interior)", par)
+
+    # build boolean voxel masks
+    band_vox  = band.reshape(nx,ny,nz)
+    axis_vox  = axis_band.reshape(nx,ny,nz)
+    inside_vox= inside.reshape(nx,ny,nz)
+
+    # dilate bands by one cell to avoid numerical mixing (simple pad + max)
+    def dilate1(b):
+        # cheap 6-neighbor dilation
+        bb = b.copy()
+        bb[1:,:,:] |= b[:-1,:,:]; bb[:-1,:,:] |= b[1:,:,:]
+        bb[:,1:,:] |= b[:,:-1,:]; bb[:,:-1,:] |= b[:,1:,:]
+        bb[:,:,1:] |= b[:,:,:-1]; bb[:,:,:-1] |= b[:,:,1:]
+        return bb
+
+    band_dil  = dilate1(band_vox)
+    axis_dil  = dilate1(axis_vox)
+
+    core = inside_vox.copy()
+    core[band_dil] = False
+    core[axis_dil] = False
+
+    # interior core slice to match (nx-2,ny-2,nz-2)
+    core_mid = core[1:-1,1:-1,1:-1]
+    gn_mid   = gnorm.reshape(nx,ny,nz)[1:-1,1:-1,1:-1]
+    mask_mid = core_mid & (gn_mid > 1e-10)
+
+    par_core = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz)
+    par = par_core[mask_mid].ravel()
+    pstat("|t·∇ψ| (interior core)", par)
+    pinfo(f"[CORE] kept {par.size} samples ({100.0*par.size/max(1,core_mid.size):.1f}% of interior core)")
 
     # Flux neutrality check inside: ∫ div(D∇ψ) dV ≈ 0 → sample residual
     # quick residual r = Lψ - rhs (dense-free via multiply)
