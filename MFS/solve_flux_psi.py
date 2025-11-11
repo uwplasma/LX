@@ -76,33 +76,44 @@ class Evaluators:
     a: jnp.ndarray
     a_hat: jnp.ndarray
 
-    @jit
-    def _S_batch(self, Xn):
-        def S_at(xn):
-            Gv = vmap(lambda y: green_G(xn, y))(self.Yn)
-            return jnp.dot(Gv, self.alpha)
-        return vmap(S_at)(Xn)
-
-    @jit
-    def _dS_batch(self, Xn):
-        def dS_at(xn):
-            Gg = vmap(lambda y: grad_green_x(xn, y))(self.Yn)  # (M,3)
-            return jnp.sum(Gg*self.alpha[:,None], axis=0)      # (3,)
-        return vmap(dS_at)(Xn)
-
     def build(self):
-        sc_c = self.center; sc_s = self.scale
-        grad_mv = make_mv_grads(self.a, self.a_hat, sc_c, sc_s)
+        sc_c   = jnp.asarray(self.center)
+        sc_s   = jnp.asarray(self.scale)
+        Yn_c   = jnp.asarray(self.Yn)
+        alpha_c= jnp.asarray(self.alpha)
+        a_c    = jnp.asarray(self.a)
+        a_hatc = jnp.asarray(self.a_hat)
+
+        # --- closures depend only on arrays captured above (no `self` arg) ---
+
+        @jit
+        def S_batch(Xn):
+            # returns Σ_j α_j G(Xn, Y_j) for each Xn row
+            def S_at(xn):
+                Gv = vmap(lambda y: green_G(xn, y))(Yn_c)
+                return jnp.dot(Gv, alpha_c)
+            return vmap(S_at)(Xn)
+
+        @jit
+        def dS_batch(Xn):
+            # returns ∑_j α_j ∇_x G(Xn, Y_j) for each Xn row
+            def dS_at(xn):
+                Gg = vmap(lambda y: grad_green_x(xn, y))(Yn_c)  # (M,3)
+                return jnp.sum(Gg * alpha_c[:, None], axis=0)    # (3,)
+            return vmap(dS_at)(Xn)
+
+        # your multivalued gradient builder (uses center/scale internally)
+        grad_mv = make_mv_grads(a_c, a_hatc, sc_c, sc_s)
 
         @jit
         def phi_fn(X):
-            Xn = (X - sc_c)*sc_s
-            return self._S_batch(Xn)  # φ_mv value not needed; only ∇φ
+            Xn = (X - sc_c) * sc_s
+            return S_batch(Xn)
 
         @jit
         def grad_phi_fn(X):
-            Xn = (X - sc_c)*sc_s
-            return grad_mv(X) + sc_s*self._dS_batch(Xn)
+            Xn = (X - sc_c) * sc_s
+            return grad_mv(X) + sc_s * dS_batch(Xn)
 
         return phi_fn, grad_phi_fn
 
@@ -129,11 +140,13 @@ def boundary_band_mask(P_surf, Xq, k=4, band_h=2.0):
 
 # ---------------------- Axis seeds by gradient collapse ------------------- #
 def collapse_to_axis(grad_phi, X0, step=0.02, iters=400, tol=1e-6):
-    X = jnp.asarray(X0)
+    X = jnp.asarray(X0, dtype=jnp.float64)
+    @jit
     def one_step(X):
-        g = grad_phi(X[None,:])[0]
+        g = grad_phi(X[None, :])[0]
         n = jnp.linalg.norm(g) + 1e-30
-        return X + step*(g/n)
+        return X + step * (g / n)
+    # do the fixed-iteration loop in Python; it's fine since one_step is jitted
     for _ in range(iters):
         X_new = one_step(X)
         if float(jnp.linalg.norm(X_new - X)) < tol:
@@ -258,8 +271,11 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     chunk = 50000
     for s in range(0, Xq.shape[0], chunk):
         G[s:s+chunk] = eval_grad_chunk(Xq[s:s+chunk])
-    gnorm = np.linalg.norm(G, axis=1) + 1e-30
-    t_hat = (G.T/gnorm).T
+    eps_t = 1e-12
+    gnorm = np.linalg.norm(G, axis=1)
+    mask_t = (gnorm > eps_t)
+    t_hat = np.zeros_like(G)
+    t_hat[mask_t] = (G[mask_t].T / gnorm[mask_t]).T
     D = diffusion_tensor(G, eps=eps)
 
     # Assemble SPD operator
@@ -287,21 +303,46 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     # Solve
     pinfo("CG solve ...")
     t0 = time.time()
-    psi, info = cg(L, rhs, tol=cg_tol, maxiter=cg_maxit)
+
+    # Cheap diagonal (Jacobi) preconditioner
+    from scipy.sparse import diags as spdiags
+    diagL = np.array(L.diagonal(), dtype=float)
+    # Guard against zeros on Dirichlet rows:
+    inv_diag = np.where(diagL > 0, 1.0/diagL, 1.0)
+    M = spdiags(inv_diag, offsets=0)
+
+    # Symmetrize to reduce tiny non-SPD artifacts from row stamping
+    L = (L + L.T) * 0.5
+    # Ensure CSR for fast matvec
+    L = L.tocsr()
+
+    # SciPy API compatibility: prefer rtol/atol, fallback to tol on older versions
+    try:
+        psi, info = cg(L, rhs, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M)
+    except TypeError:
+        # Older SciPy (uses 'tol' only)
+        psi, info = cg(L, rhs, tol=cg_tol, maxiter=cg_maxit, M=M)
+
     t1 = time.time()
     pinfo(f"CG done: info={info}, wall={t1-t0:.2f}s")
 
     # Quality metrics
     # parallel derivative proxy: |t_hat·∇ψ|
     # compute ∇ψ by central differences (skip edges)
-    psi3 = psi.reshape(ny, nx, nz).transpose(1,0,2) # x,y,z indexing
-    dpsidx = (psi3[2:,:,:]-psi3[:-2,:,:])/(2*dx)
-    dpsidy = (psi3[:,2:,:]-psi3[:,:-2,:])/(2*dy)
-    dpsidz = (psi3[:,:,2:]-psi3[:,:,:-2])/(2*dz)
-    t_hat_x = t_hat[:,0].reshape(nx,ny,nz); t_hat_y=t_hat[:,1].reshape(nx,ny,nz); t_hat_z=t_hat[:,2].reshape(nx,ny,nz)
-    # interior slice for inner products
-    tx = t_hat_x[1:-1,1:-1,1:-1]; ty = t_hat_y[1:-1,1:-1,1:-1]; tz = t_hat_z[1:-1,1:-1,1:-1]
-    par = (tx*dpsidx[1:-1,1:-1,1:-1] + ty*dpsidy[1:-1,1:-1,1:-1] + tz*dpsidz[1:-1,1:-1,1:-1]).ravel()
+    # x,y,z indexing
+    psi3 = psi.reshape(ny, nx, nz).transpose(1, 0, 2)  # (nx, ny, nz)
+
+    # Centered differences on the common interior core -> (nx-2, ny-2, nz-2)
+    dpsidx = (psi3[2:,   1:-1, 1:-1] - psi3[:-2, 1:-1, 1:-1]) / (2*dx)
+    dpsidy = (psi3[1:-1, 2:,   1:-1] - psi3[1:-1, :-2, 1:-1]) / (2*dy)
+    dpsidz = (psi3[1:-1, 1:-1, 2:  ] - psi3[1:-1, 1:-1, :-2 ]) / (2*dz)
+
+    # Match t_hat to the same interior core
+    t_hat_x = t_hat[:,0].reshape(nx,ny,nz)[1:-1,1:-1,1:-1]
+    t_hat_y = t_hat[:,1].reshape(nx,ny,nz)[1:-1,1:-1,1:-1]
+    t_hat_z = t_hat[:,2].reshape(nx,ny,nz)[1:-1,1:-1,1:-1]
+
+    par = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz).ravel()
     pstat("|t·∇ψ| (interior)", par)
 
     # Flux neutrality check inside: ∫ div(D∇ψ) dV ≈ 0 → sample residual
@@ -352,7 +393,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("npz", help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    ap.add_argument("--N", type=int, default=32, help="grid resolution per axis")
+    ap.add_argument("--N", type=int, default=26, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=1e-3, help="parallel diffusion weight (smaller => more field-aligned)")
     ap.add_argument("--band-h", type=float, default=1.5, help="boundary band thickness multiplier")
     ap.add_argument("--axis-seed-count", type=int, default=64, help="number of interior seeds to collapse onto axis")
