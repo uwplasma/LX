@@ -789,7 +789,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         # take only inside region
         vol = psi.reshape(nx,ny,nz).copy()
         vol[~inside.reshape(nx,ny,nz)] = np.nan
-        for lv in [0.3, 0.6]:
+        for lv in [0.1, 0.5]:
             try:
                 verts, faces, norm, val = marching_cubes(np.nan_to_num(vol, nan=-1.0), level=lv)
                 # map verts from index to real coords
@@ -802,7 +802,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2], s=2, c='k', alpha=0.35)
         ax.quiver(Pb[:,0], Pb[:,1], Pb[:,2], Gb[:,0], Gb[:,1], Gb[:,2],
                     length=gscale, normalize=True, linewidth=0.5, color='tab:red', alpha=0.6)
-        ax.set_title("Isosurfaces of ψ (0.2, 0.4) + boundary points")
+        ax.set_title("Isosurfaces of ψ (0.1, 0.5) + boundary points")
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
         fix_matplotlib_3d(ax)
 
@@ -829,8 +829,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
             pinfo(f"Marching cubes (normalized) failed at ψ≈{psi0_n:.2f}: {e}")
             Viso = Fiso = None
 
-        phi_list = np.linspace(-np.pi, np.pi, 8, endpoint=False)
-        figp, axes = plt.subplots(2, 4, figsize=(14,7), constrained_layout=True)
+        phi_list = jnp.linspace(0, 2*jnp.pi/args.nfp, 4, endpoint=False).tolist()
+        figp, axes = plt.subplots(1, 4, figsize=(14,7), constrained_layout=True)
         axes = axes.ravel()
 
         for aidx, phi0 in enumerate(phi_list):
@@ -852,7 +852,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("npz", help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
+    ap.add_argument("npz", default="wout_precise_QA_solution.npz", help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
+    ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
     ap.add_argument("--N", type=int, default=26, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=1e-2, help="parallel diffusion weight (smaller => more field-aligned)")
     ap.add_argument("--band-h", type=float, default=1.0, help="boundary band thickness multiplier")
