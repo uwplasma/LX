@@ -155,7 +155,9 @@ def axis_band_mask(P_axis, Xq, rad):
 
 # ------------------------- Diffusion tensor and stencil ------------------- #
 def diffusion_tensor(gradphi, eps):
-    t = gradphi / (np.linalg.norm(gradphi, axis=-1, keepdims=True) + 1e-30)
+    nrm = np.linalg.norm(gradphi, axis=-1, keepdims=True)
+    nrm = np.sqrt(np.maximum(nrm*nrm, 1e-12))
+    t = gradphi / nrm
     # P_perp = I - t t^T; P_par = t t^T
     I = np.eye(3)[None,:,:]
     tt = t[..., :, None]*t[..., None, :]
@@ -247,8 +249,25 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     nbrs_surf = NearestNeighbors(n_neighbors=4, algorithm="kd_tree").fit(P)
     d_surf, _ = nbrs_surf.kneighbors(P)            # (Ns, 4)
     surf_h = float(np.median(d_surf[:,1]))         # use first non-zero neighbor
+    # Start from user/voxel suggestion
     h_band = float(args.band_h) * voxel
-    band = (np.abs(s_signed) <= h_band) & inside   # thin boundary layer inside Γ
+    band = (np.abs(s_signed) <= h_band) & inside
+
+    # Adapt to target fraction of inside (e.g., 10%)
+    target_frac = 0.10
+    n_in = int(inside.sum())
+    if n_in > 0:
+        frac = band.sum() / n_in
+        if frac > 1.25 * target_frac:  # too fat → shrink by quantile
+            # use inside-only |s| distribution to pick a thinner band
+            abs_s_inside = np.abs(s_signed[inside])
+            kth = int(max(1, target_frac * n_in))
+            # np.partition gives kth smallest; guard bounds
+            kth = min(kth, abs_s_inside.size - 1)
+            h_band_new = float(np.partition(abs_s_inside, kth)[kth])
+            # also keep it ≥ 0.5 voxel to avoid empty band
+            h_band = max(0.5 * voxel, h_band_new)
+            band = (np.abs(s_signed) <= h_band) & inside
     pstat("Boundary band fraction", band.astype(float))
 
     # Axis seeds via collapsing random interior points along +grad φ
@@ -264,8 +283,17 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     # axis_band = axis_band_mask(axis_pts, Xq, rad=axis_band_radius*np.linalg.norm(span))
     # axis_band = np.logical_and(axis_band, inside)
     # pick radius as a few voxels wide
-    axis_band_radius = 2.5 * voxel   # ~2–3 voxels
-    axis_band = axis_band_mask(axis_pts, Xq, rad=axis_band_radius) & inside
+    # Downsample axis points to avoid "everywhere near-axis" tubes
+    if axis_pts.shape[0] > 64:
+        # quick thinning: keep every k-th point in k-NN order
+        keep = np.linspace(0, axis_pts.shape[0]-1, 64, dtype=int)
+        axis_pts_ds = axis_pts[keep]
+    else:
+        axis_pts_ds = axis_pts
+
+    # Radius ~ 1–1.5 voxels
+    axis_band_radius = 1.25 * voxel
+    axis_band = axis_band_mask(axis_pts_ds, Xq, rad=axis_band_radius) & inside
     pstat("Axis band fraction", axis_band.astype(float))
 
     # Evaluate grad φ everywhere inside (vectorized in chunks to save memory)
@@ -331,6 +359,10 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     rhs[rows] = val[rows]
     L = L.tocsr()
 
+    # Symmetrize to reduce tiny non-SPD artifacts from row stamping
+    L = (L + L.T) * 0.5
+    L = L.tocsr()
+
     try:
         ilu = spilu(L.tocsc(), drop_tol=0.0, fill_factor=1.0)  # ILU(0)
         M   = LinearOperator(L.shape, ilu.solve)
@@ -345,18 +377,6 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     # Solve
     pinfo("CG solve ...")
     t0 = time.time()
-
-    # Cheap diagonal (Jacobi) preconditioner
-    from scipy.sparse import diags as spdiags
-    diagL = np.array(L.diagonal(), dtype=float)
-    # Guard against zeros on Dirichlet rows:
-    inv_diag = np.where(diagL > 0, 1.0/diagL, 1.0)
-    M = spdiags(inv_diag, offsets=0)
-
-    # Symmetrize to reduce tiny non-SPD artifacts from row stamping
-    L = (L + L.T) * 0.5
-    # Ensure CSR for fast matvec
-    L = L.tocsr()
 
     # SciPy API compatibility: prefer rtol/atol, fallback to tol on older versions
     try:
@@ -415,6 +435,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
 
     par_core = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz)
     par = par_core[mask_mid].ravel()
+    if par.size < 100:
+        pinfo("[CORE] very small core sample; shrink bands or increase --N")
     pstat("|t·∇ψ| (interior core)", par)
     pinfo(f"[CORE] kept {par.size} samples ({100.0*par.size/max(1,core_mid.size):.1f}% of interior core)")
 
@@ -467,12 +489,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("npz", help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     ap.add_argument("--N", type=int, default=26, help="grid resolution per axis")
-    ap.add_argument("--eps", type=float, default=1e-3, help="parallel diffusion weight (smaller => more field-aligned)")
-    ap.add_argument("--band-h", type=float, default=1.5, help="boundary band thickness multiplier")
+    ap.add_argument("--eps", type=float, default=1e-2, help="parallel diffusion weight (smaller => more field-aligned)")
+    ap.add_argument("--band-h", type=float, default=1.0, help="boundary band thickness multiplier")
+    ap.add_argument("--cg-maxit", type=int, default=500)
     ap.add_argument("--axis-seed-count", type=int, default=64, help="number of interior seeds to collapse onto axis")
     ap.add_argument("--axis-band-radius", type=float, default=0.02, help="axis band radius as fraction of bbox size")
     ap.add_argument("--cg-tol", type=float, default=1e-8)
-    ap.add_argument("--cg-maxit", type=int, default=300)
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
