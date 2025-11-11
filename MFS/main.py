@@ -91,94 +91,67 @@ class ScaleInfo:
         # IMPORTANT: do NOT call float(scale) here
         return cls(center=center, scale=jnp.asarray(scale))
     
-# ----------------------- 2D quasi-Newton (BFGS) ----------------------- #
-def bfgs_2d(value_and_grad_fn, p0, *,
-            sf_min=1.0, sf_max=4.0,
-            max_iter=25, tol=1e-6):
-    """
-    Tiny 2D BFGS in JAX over p=[log_sf, log_lambda] with early stopping.
-    Early stop when ||g|| < tol or iterations reach max_iter.
-    """
-    def project(p):
-        # p = [log_sf, log_lam]
-        log_sf, log_lam = p
-        sf = jnp.exp(log_sf)
-        sf_clamped = jnp.clip(sf, sf_min, sf_max)
-        log_lam_clamped = jnp.clip(log_lam, -9.0, -3.0)  # λ in [e^-9, e^-3] ≈ [1e-4, 5e-2]
-        return jnp.array([jnp.log(sf_clamped), log_lam_clamped], dtype=p.dtype)
+# --- NEW: small dense BFGS in N-D with projection box ---
+def bfgs_nd(value_and_grad_fn, p0, project_fn, *, max_iter=25, tol=1e-6):
+    p = p0
+    H = jnp.eye(p0.shape[0], dtype=p0.dtype)
+    f_prev = jnp.inf
+    done = False
+    it = 0
 
-    def one_step(state):
-        # state = (p, H, f_prev, it, done)
+    def step(state):
         p, H, f_prev, it, done = state
-
-        # If already done, just return the same state (no-ops) to keep shapes static
         def _advance(_):
-            p_proj = project(p)
+            p_proj = project_fn(p)
             f, g = value_and_grad_fn(p_proj)
 
-            jax_debug.print("[BFGS] it={it}  f={f:.3e}  ||g||={gn:.2e}  sf={sf:.3f}  lam={lam:.3e}",
-                            it=it, f=f, gn=jnp.linalg.norm(g),
-                            sf=jnp.exp(p_proj[0]), lam=jnp.exp(p_proj[1]))
-
-            # descent direction
-            d = - H @ g
-
-            # Backtracking line search (Armijo)
+            d = - H @ g  # descent
+            # Armijo backtracking (up to 4 shrinks)
             def bt_body(carry, _):
                 step, f_curr = carry
-                p_try = project(p_proj + step * d)
+                p_try = project_fn(p_proj + step * d)
                 f_try, _ = value_and_grad_fn(p_try)
                 ok = f_try <= f + 1e-4 * step * (g @ d)
                 step = jnp.where(ok, step, 0.5 * step)
                 f_curr = jnp.where(ok, f_try, f_curr)
                 return (step, f_curr), ok
-
             (step_final, f_new), _ = jax.lax.scan(
-                bt_body,
-                (jnp.array(1.0, dtype=p.dtype), f),
-                jnp.arange(4)   # up to 4 backtracks
+                bt_body, (jnp.array(1.0, p.dtype), f), jnp.arange(4)
             )
-            p_new = project(p_proj + step_final * d)
-
-            # BFGS update with mild Powell damping to keep H SPD
+            p_new = project_fn(p_proj + step_final * d)
             _, g_new = value_and_grad_fn(p_new)
+
             s = p_new - p_proj
             y = g_new - g
             ys = y @ s
-            # Powell damping: ensure y^T s is not too small
-            theta = jnp.where(ys < 0.2 * (s @ (H @ s)), 
-                            (0.8 * (s @ (H @ s))) / (s @ (H @ s) - ys + 1e-30),
-                            1.0)
-            y_tilde = theta * y + (1 - theta) * (H @ s)
+            # Powell damping
+            Hy = H @ s
+            syHs = s @ Hy
+            theta = jnp.where(ys < 0.2 * syHs, 0.8 * syHs / (syHs - ys + 1e-30), 1.0)
+            y_tilde = theta * y + (1 - theta) * Hy
             rho = 1.0 / (y_tilde @ s + 1e-30)
-            I = jnp.eye(2, dtype=p.dtype)
+            I = jnp.eye(p.shape[0], dtype=p.dtype)
             V = I - rho * jnp.outer(s, y_tilde)
             H_new = V @ H @ V.T + rho * jnp.outer(s, s)
 
-            # early stop: gradient small OR relative f change small
             rel = jnp.abs((f_new - f) / (jnp.abs(f) + 1e-30))
             done_new = jnp.logical_or(jnp.linalg.norm(g_new) < tol, rel < 1e-3)
             return (p_new, H_new, f_new, it + 1, done_new)
 
-        def _passthrough(_):
+        def _pass(_):
             return (p, H, f_prev, it + 1, done)
 
-        # If done, do passthrough; else, advance one BFGS step
-        return jax.lax.cond(done, _passthrough, _advance, operand=None)
+        return jax.lax.cond(done, _pass, _advance, operand=None)
 
-    # Initial state
-    H0 = jnp.eye(2, dtype=p0.dtype)
-    f0 = jnp.inf
-    state0 = (p0, H0, f0, jnp.array(0, dtype=jnp.int32), jnp.array(False))
-
-    def cond_fun(state):
-        _, _, f_prev, it, done = state
-        # stop if done or max_iter; also stop if relative change in f is tiny
+    def cond(state):
+        _, _, _, it, done = state
         return jnp.logical_and(it < max_iter, jnp.logical_not(done))
 
-    p_star, H_star, f_star, _, _ = jax.lax.while_loop(cond_fun, one_step, state0)
-    f_star, g_star = value_and_grad_fn(project(p_star))
+    state0 = (p, H, f_prev, jnp.array(0, jnp.int32), jnp.array(False))
+    p_star, H_star, f_star, _, _ = jax.lax.while_loop(cond, step, state0)
+    f_star, g_star = value_and_grad_fn(project_fn(p_star))
     return p_star, f_star, g_star, H_star
+
 
 # ----------------------------- Solvers ----------------------------- #
 def build_ring_weights(P_in, Pn, k=32):
@@ -199,85 +172,16 @@ def build_ring_weights(P_in, Pn, k=32):
     W_ring = jnp.asarray(np.pi * rk_ring**2, dtype=jnp.float64)
     return W_ring
 
-def solve_once(P, N, Pn, Nn, W, rk, scinfo,
-               use_mv, k_nn, source_factor, lambda_reg, mv_weight,
-               interior_eps_factor, verbose=True):
-    # Build sources and system
-    Yn, delta_n = build_mfs_sources(Pn, Nn, rk, scinfo, source_factor=source_factor, verbose=verbose)
-    # sanity: ensure δ points outward (dot > 0 for most points)
-    dot = jnp.sum((Yn - Pn) * Nn, axis=1)
-    print(f"[CHK] (Yn - Pn)·Nn: min={float(dot.min()):.3e}, median={float(jnp.median(dot)):.3e}")
-    kind, a_hat, E_axes, c_axes, svals = detect_geometry_and_axis(Pn, verbose=True)
-    phi_t, grad_t, phi_p, grad_p = multivalued_bases_about_axis(Pn, Nn, a_hat, verbose=True) if use_mv else (
-        (lambda Xn: jnp.zeros((Xn.shape[0],))), (lambda Xn: jnp.zeros_like(Xn)),
-        (lambda Xn: jnp.zeros((Xn.shape[0],))), (lambda Xn: jnp.zeros_like(Xn))
-    )
-    A, D = build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
-                                 use_mv=use_mv, center_D=True, verbose=verbose)
-
-    # Fit multivalued coefficients a and rhs
-    if use_mv:
-        grad_t_bdry, grad_p_bdry = grad_t(Pn), grad_p(Pn)
-        a, D_raw, D0 = fit_mv_coeffs_minimize_rhs(Nn, W, grad_t_bdry, grad_p_bdry, verbose=verbose)
-        g_raw = jnp.sum(Nn * (a[0]*grad_t_bdry + a[1]*grad_p_bdry), axis=1)
-    else:
-        a = jnp.zeros((2,), dtype=jnp.float64)
-        g_raw = jnp.zeros((Pn.shape[0],), dtype=jnp.float64)
-
-    # Solve for alpha
-    alpha = solve_alpha_with_rhs(A, W, g_raw, lam=lambda_reg, verbose=verbose)
-
-    # Build evaluators
-    phi_fn, grad_fn, psi_fn, grad_psi_fn, lap_psi_fn, _ = build_evaluators_mfs(
-        Pn, Yn, alpha, phi_t, phi_p, a, scinfo, grad_t, grad_p
-    )
-
-    # Interior ring diagnostics
-    Wsum = float(jnp.sum(W))
-    Wsqrt = jnp.sqrt(W)
-    h_med = float(np.median(rk))
-    eps_n = max(1e-6, interior_eps_factor * h_med)
-    eps_w = eps_n / scinfo.scale
-    P_in  = P - eps_w * N
-    grad_on_ring = grad_fn(P_in)
-    n_dot_grad   = jnp.sum(N * grad_on_ring, axis=1)
-    bc_w2 = float(jnp.sqrt(jnp.dot(W, n_dot_grad**2)))          # ||n·∇φ||_W2 on Γ₋
-    flux = float(jnp.dot(W, n_dot_grad))                        # ∫Γ₋ n·∇φ dS
-    grad_mag_ring = jnp.linalg.norm(grad_on_ring, axis=1)
-    lap_in = lap_psi_fn(P_in)
-    lap_l2 = float(jnp.linalg.norm(lap_in))                     # ||∇²ψ||_2 on Γ₋
-    alpha_norm = float(jnp.linalg.norm(alpha))
-
-    # Rough normal-equations condition proxy (reuse LS-α build)
-    Aw = Wsqrt[:, None] * A
-    ATA = Aw.T @ Aw
-    NE  = ATA + (lambda_reg**2) * jnp.eye(A.shape[1], dtype=A.dtype)
-    condNE = float(np.linalg.cond(np.asarray(NE)))
-
-    metrics = dict(
-        bc_w2=bc_w2,
-        flux_abs=abs(flux),
-        lap_l2=lap_l2,
-        alpha_norm=alpha_norm,
-        condNE=condNE,
-        a=a,
-        delta_n=delta_n,
-        eps_n=eps_n,
-        eps_w=eps_w,
-        grad_on_ring=grad_on_ring,
-        lap_in=lap_in,
-        phi_fn=phi_fn,
-        grad_fn=grad_fn
-    )
-    return alpha, metrics
-
 def autotune(P, N, Pn, Nn, W, rk, scinfo,
              use_mv=True,
-             mv_weight=0.5,
              interior_eps_factor=5e-3,
              verbose=True,
              sf_min=1.0, sf_max=6.5,
              lbfgs_maxiter=15, lbfgs_tol=1e-8):
+    
+    # harmonic pack (fixed, tiny)
+    h_vals, h_grads = get_harmonic_pack()
+
     # 1) MV bases and a (once)
     if use_mv:
         kind, a_hat, E_axes, c_axes, svals = detect_geometry_and_axis(Pn, verbose=True)
@@ -293,90 +197,237 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
         a = jnp.zeros((2,), dtype=jnp.float64)
         g_raw = jnp.zeros((Pn.shape[0],), dtype=jnp.float64)
 
-    # ---- 2D optimization over (log_sf, log_lambda) ----
-    h_med = float(np.median(rk))
-    obj = make_objective_for_delta_lambda(
-        P, N, Pn, Nn, W, rk, scinfo,
-        grad_t, grad_p, a, g_raw,
-        interior_eps_factor=interior_eps_factor, h_med=h_med
+    obj, eps_bounds = make_objective_for_sf_lam_eps(
+        P, N, Pn, Nn, W, rk, scinfo, grad_t, grad_p, a, g_raw,
+        eps_bounds=(2e-3, 5e-2), h_grads=h_grads, debug_opt=True
     )
 
-    # robust starting point (you were scanning 1.5..2.5)
-    log_sf0  = jnp.log(1.5)
-    log_lam0 = jnp.log(5e-3)
-    p0 = jnp.array([log_sf0, log_lam0], dtype=jnp.float64)
+    # Start near your current defaults
+    p0 = jnp.array([jnp.log(1.5), jnp.log(5e-3), jnp.log(5e-3)], dtype=jnp.float64)
 
-    # small box for sf, keep λ unbounded in log-space (still positive)
-    p_star, f_star, g_star, H_star = bfgs_2d(obj, p0, sf_min=sf_min, sf_max=sf_max, max_iter=lbfgs_maxiter, tol=lbfgs_tol)
-    log_sf_star, log_lam_star = p_star
-    sf_star  = float(jnp.exp(log_sf_star))
-    lam_star = float(jnp.exp(log_lam_star))
+    # Projection box in log-space
+    log_sf_lo, log_sf_hi   = jnp.log(sf_min), jnp.log(sf_max)
+    log_lam_lo, log_lam_hi = jnp.log(1e-4),   jnp.log(5e-2)
+    log_eps_lo, log_eps_hi = jnp.log(eps_bounds[0]), jnp.log(eps_bounds[1])
 
-    # Build final sources at optimum and reuse downstream
+    def project_fn(p):
+        return jnp.array([
+            jnp.clip(p[0], log_sf_lo,  log_sf_hi),
+            jnp.clip(p[1], log_lam_lo, log_lam_hi),
+            jnp.clip(p[2], log_eps_lo, log_eps_hi),
+        ], dtype=p.dtype)
+
+    # === Coarse seeding (stable, tiny budget) ===
+    # Scan a few sensible candidates to avoid a bad basin:
+    sf_grid  = jnp.array([1.2, 2.0, 3.5, 5.0, sf_max], dtype=jnp.float64)
+    lam_grid = jnp.array([3e-3, 5e-3, 1e-2], dtype=jnp.float64)
+    eps_grid = jnp.array([2e-3, 3e-3, 5e-3], dtype=jnp.float64)
+
+    best_seed = None
+    best_val  = jnp.inf
+
+    obj_valonly = lambda p: obj(p)[0]  # obj returns (val, grad)
+    for sf0 in sf_grid:
+        for lam0 in lam_grid:
+            for eps0 in eps_grid:
+                p_try = jnp.log(jnp.array([sf0, lam0, eps0], dtype=jnp.float64))
+                v = obj_valonly(p_try)
+                if v < best_val:
+                    best_val, best_seed = v, p_try
+
+    # Start BFGS from the best coarse seed
+    p0 = best_seed
+
+    p_star, f_star, g_star, H_star = bfgs_nd(obj, p0, project_fn, max_iter=lbfgs_maxiter, tol=lbfgs_tol)
+    log_sf_star, log_lam_star, log_eps_star = project_fn(p_star)
+    sf_star   = float(jnp.exp(log_sf_star))
+    lam_star  = float(jnp.exp(log_lam_star))
+    epsn_star = float(jnp.exp(log_eps_star))
+
+    # finalize with sources at optimum and return epsn_star for later diagnostics
     Yn, _ = build_mfs_sources(Pn, Nn, rk, scinfo, source_factor=sf_star, verbose=False)
-
     if verbose:
-        print(f"[OPT] δ/source_factor* = {sf_star:.3f}, λ* = {lam_star:.3e}, J* = {float(f_star):.3e}")
+        print(f"[OPT-3D] δ*={sf_star:.3f}, λ*={lam_star:.3e}, ε_n*={epsn_star:.3e}, J*={float(f_star):.3e}")
 
     return dict(
         source_factor=sf_star, lambda_reg=lam_star,
+        eps_n_star=epsn_star,
         a=a, phi_t=phi_t, grad_t=grad_t, phi_p=phi_p, grad_p=grad_p, Yn=Yn,
-        a_hat=a_hat, kind=kind
+        a_hat=a_hat, kind=kind,
+        h_vals=h_vals, h_grads=h_grads
     )
 
-def make_objective_for_delta_lambda(P, N, Pn, Nn, W, rk, scinfo,
-                                    grad_t, grad_p, a, g_raw,
-                                    interior_eps_factor, h_med):
-    eps_factor_obj = jnp.maximum(2e-2, interior_eps_factor)
-    Wsqrt = jnp.sqrt(W)
-    eps_n = jnp.maximum(1e-6, eps_factor_obj * h_med)
-    eps_w = eps_n / scinfo.scale
-    P_in  = P - eps_w * N
+def autotune_outer(P, N, Pn, Nn, W, rk, scinfo,
+                   use_mv=True, verbose=False,
+                   sf_min=1.0, sf_max=6.5,
+                   lbfgs_maxiter=15, lbfgs_tol=1e-8):
+    """
+    Thin wrapper around `autotune` for the refinement block, returning the same dict.
+    """
+    return autotune(
+        P, N, Pn, Nn, W, rk, scinfo,
+        use_mv=use_mv, interior_eps_factor=5e-3,  # keep same default you used earlier
+        verbose=verbose,
+        sf_min=sf_min, sf_max=sf_max,
+        lbfgs_maxiter=lbfgs_maxiter, lbfgs_tol=lbfgs_tol
+    )
 
-    # --- NEW: precompute ring weights for the objective (constant wrt p) ---
-    # Use a modest k to keep it cheap; it does not depend on (sf, λ).
-    W_ring_obj = build_ring_weights(P_in, Pn, k=32)
+# --- NEW: D columns for MV in WORLD units on arbitrary points/normals ---
+@partial(jax.jit, static_argnames=("grad_t_fn","grad_p_fn"))
+def build_D_columns_at_points(Xn_eval, N_eval, scinfo, grad_t_fn, grad_p_fn):
+    """
+    Returns D=(N,2) with D[:,0]=n·grad_t(Xn_eval), D[:,1]=n·grad_p(Xn_eval) in WORLD units.
+    """
+    Gt = grad_t_fn(Xn_eval)   # (N,3) normalized-coord grads
+    Gp = grad_p_fn(Xn_eval)   # (N,3)
+    # multiply by scinfo.scale to convert ∇ in normalized coords to WORLD coords
+    Dt = scinfo.scale * jnp.sum(N_eval * Gt, axis=1)
+    Dp = scinfo.scale * jnp.sum(N_eval * Gp, axis=1)
+    return jnp.stack([Dt, Dp], axis=1)  # (N,2)
+
+# --- NEW: augmented rows [A | H | D] at arbitrary points ---
+@partial(jax.jit, static_argnames=("grad_t_fn","grad_p_fn","h_grads"))
+def build_aug_rows_at_points(Xn_eval, N_eval, Yn, scinfo, grad_t_fn, grad_p_fn, h_grads=None):
+    A_in = build_A_rows_at_points(Xn_eval, N_eval, Yn, scinfo, h_grads=h_grads)   # (N, M_mfs[+K])
+    D_in = build_D_columns_at_points(Xn_eval, N_eval, scinfo, grad_t_fn, grad_p_fn)  # (N,2)
+    return jnp.concatenate([A_in, D_in], axis=1)  # (N, M_mfs[+K]+2)
+
+# --- NEW: flux constraint on augmented matrices (zero RHS) ---
+def make_zero_rhs_flux_constraint(A_like, W_like):
+    """
+    For augmented matrix Â with rows over points and W_like quadrature weights,
+    return (c_vec, d=0) with c_vec = Â^T W 1.
+    """
+    Wv = jnp.asarray(W_like).reshape(-1)
+    A  = jnp.asarray(A_like)
+    if A.ndim != 2 or A.shape[0] != Wv.shape[0]:
+        raise ValueError(f"make_zero_rhs_flux_constraint expects A.shape=(N,M), len(W)=N; got {A.shape}, {Wv.shape[0]}")
+    c_vec = (A.T * Wv[None, :]).sum(axis=1)  # (M,)
+    d_val = jnp.array(0.0, dtype=A.dtype)
+    return c_vec, d_val
+
+# --- NEW: joint solve for x=[alpha; a] with constraints and per-column reg ---
+def solve_alpha_a_with_constraints(A_aug, W, lam, reg_gamma_a=1e-3, constraints=None, verbose=True):
+    """
+    A_aug: (N, M_tot) with columns [MFS (+harmonic) | 2x MV]
+    Regularization: lam on the first (M_tot-2) columns, lam*reg_gamma_a on the last 2 columns.
+    Constraints: list of (c_vec, d_scalar) with c_vec length M_tot.
+    """
+    Nrows, Mtot = A_aug.shape
+    Wv  = jnp.asarray(W).reshape(-1)
+    ATW = A_aug.T * Wv[None, :]
+    # diag reg
+    reg = (lam**2) * jnp.ones((Mtot,), dtype=A_aug.dtype)
+    reg = reg.at[-2:].set((lam*reg_gamma_a)**2)   # gentler reg on 'a'
+    NE  = ATW @ A_aug + jnp.diag(reg)
+    rhs = jnp.zeros((Mtot,), dtype=A_aug.dtype)   # zero RHS now
+
+    if not constraints:
+        L = jnp.linalg.cholesky(NE)
+        y = jsp_linalg.solve_triangular(L, rhs, lower=True)
+        x = jsp_linalg.solve_triangular(L.T, y, lower=False)
+        if verbose:
+            condNE = float(np.linalg.cond(np.asarray(NE)))
+            lw2 = float(jnp.sqrt(jnp.dot(Wv, (A_aug @ x)**2)))
+            print(f"[LS-(α,a)] size={NE.shape}, cond≈{condNE:.3e}, λ={lam:.3e}, ||W^1/2 res||={lw2:.3e}")
+        return x
+
+    # Schur complement for constraints: minimize with C^T x = d
+    Ccols, dlist = [], []
+    for (c_vec, d_k) in constraints:
+        c = jnp.asarray(c_vec).reshape(-1)
+        if c.shape[0] != Mtot:
+            raise ValueError(f"[constraints] length {c.shape[0]} != columns {Mtot}")
+        Ccols.append(c[:, None]); dlist.append(d_k)
+    C = jnp.concatenate(Ccols, axis=1)           # (Mtot, K)
+    d = jnp.asarray(dlist, dtype=A_aug.dtype)    # (K,)
+
+    L = jnp.linalg.cholesky(NE)
+    def solve_NE(b):
+        y = jsp_linalg.solve_triangular(L, b, lower=True)
+        return jsp_linalg.solve_triangular(L.T, y, lower=False)
+
+    z1 = solve_NE(rhs)      # NE^{-1} rhs = 0 → z1 = 0 (kept explicit for clarity)
+    Z  = solve_NE(C)        # NE^{-1} C
+    S  = C.T @ Z            # C^T NE^{-1} C
+    rhsμ = d - (C.T @ z1)   # = d
+    μ = jnp.linalg.solve(S, rhsμ)
+    x = z1 - Z @ μ          # = - Z μ
+
+    if verbose:
+        res = A_aug @ x
+        lw2 = float(jnp.sqrt(jnp.dot(Wv, res**2)))
+        condNE = float(np.linalg.cond(np.asarray(NE)))
+        condS  = float(np.linalg.cond(np.asarray(S)))
+        crel = float(jnp.linalg.norm(C.T @ x - d) / (jnp.linalg.norm(d) + 1e-30))
+        print(f"[LS-(α,a):Schur] NE cond≈{condNE:.3e}, S cond≈{condS:.3e}, λ={lam:.3e}, ||W^1/2 res||={lw2:.3e}, ||C^T x - d||/||d||={crel:.3e}")
+    return x
+
+
+def make_objective_for_sf_lam_eps(P, N, Pn, Nn, W, rk, scinfo,
+                                  grad_t, grad_p, a, g_raw,
+                                  eps_bounds=(2e-3, 5e-2),
+                                  h_grads=None, debug_opt=True):
+
+    # Precompute: normalized X and a ring weight that does NOT depend on eps (cheap, stable)
+    Xn_bdry = (P - scinfo.center) * scinfo.scale
+    # Use boundary quadrature W as a proxy on the ring objective (keeps objective smooth)
+    W_ring_fixed = W
 
     def objective(p):
-        log_sf, log_lam = p
-        sf  = jnp.exp(log_sf)
-        lam = jnp.exp(log_lam)
+        log_sf, log_lam, log_eps = p
+        sf   = jnp.exp(log_sf)
+        lam  = jnp.exp(log_lam)
+        epsn = jnp.exp(log_eps)  # normalized offset (h units)
+        # clamp epsn softly by projecting p (handled outside); here just use epsn directly
 
         Yn, _ = build_mfs_sources(Pn, Nn, rk, scinfo, source_factor=sf, verbose=False)
-        A, _  = build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
-                                      use_mv=True, center_D=True, verbose=False)
 
-        # Boundary quantities (unchanged)
+        # Boundary collocation A
+        A, _ = build_system_matrices(
+            Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
+            use_mv=True, center_D=True, verbose=False, h_grads=h_grads
+        )
         c_bdry, d_bdry = make_flux_constraint(A, W, g_raw)
 
-        # Interior-ring constraint — use the precomputed ring weights
+        # Interior ring: P_in depends smoothly on epsn
+        eps_w = epsn / scinfo.scale
+        P_in  = P - eps_w * N
         Xn_in = (P_in - scinfo.center) * scinfo.scale
-        A_in  = build_A_rows_at_points(Xn_in, N, Yn, scinfo)
-        Gt_in = grad_t(Xn_in); Gp_in = grad_p(Xn_in)
+        A_in  = build_A_rows_at_points(Xn_in, N, Yn, scinfo, h_grads=h_grads)
+        # MV on the ring
+        Gt_in = grad_t(Xn_in)
+        Gp_in = grad_p(Xn_in)
         g_in  = scinfo.scale * jnp.sum(N * (a[0]*Gt_in + a[1]*Gp_in), axis=1)
-        c_int, d_int = make_flux_constraint(A_in, W_ring_obj, g_in)
+        c_int, d_int = make_flux_constraint(A_in, W_ring_fixed, g_in)
 
+        # α solving with both flux constraints
         alpha = solve_alpha_with_rhs_hard_flux_multi(
-            A, W, g_raw, lam=lam, constraints=[(c_int, -d_int,), (c_bdry, -d_bdry)],
-            verbose=False
+            A, W, g_raw, lam=lam, constraints=[(c_int, -d_int), (c_bdry, -d_bdry)], verbose=False
         )
 
-        res_w = Wsqrt * (A @ alpha + g_raw)
-        term_res = jnp.dot(res_w, res_w)
+        # 1) Boundary residual (weighted)
+        res_w = jnp.sqrt(W) * (A @ alpha + g_raw)
+        term_res = res_w @ res_w
 
-        zero_like = lambda Xn: jnp.zeros((Xn.shape[0],), dtype=Xn.dtype)
-        phi_t0, grad_t_fn, phi_p0, grad_p_fn = zero_like, grad_t, zero_like, grad_p
-        phi_fn, grad_fn, _, _, _, _ = build_evaluators_mfs(
-            Pn, Yn, alpha, phi_t0, phi_p0, a, scinfo, grad_t_fn, grad_p_fn
-        )
-        grad_in = grad_fn(P_in)
-        n_dot   = jnp.sum(N * grad_in, axis=1)
-        term_bc = jnp.dot(W, n_dot**2)
+        # 2) Interior BC penalty (n·∇φ on ring)
+        n_dot_in = A_in @ alpha + g_in
+        term_bc  = jnp.dot(W_ring_fixed, n_dot_in**2)
 
-        reg = 1e-6 * (log_sf**2 + log_lam**2)
-        return term_res + term_bc + reg
+        # Tiny reg on logs
+        reg = 1e-6 * (log_sf**2 + log_lam**2 + log_eps**2)
+        total = term_res + term_bc + reg
 
-    return jit(jax.value_and_grad(objective))
+        if debug_opt:
+            jax_debug.print(
+                "[OPT-3D] sf={sf:.3f} lam={lam:.3e} eps_n={eps:.3e}  "
+                "res={res:.3e}  bc={bc:.3e}  total={tot:.3e}",
+                sf=sf, lam=lam, eps=epsn, res=term_res, bc=term_bc, tot=total
+            )
+        return total
+
+    # return value_and_grad
+    return jit(jax.value_and_grad(objective)), eps_bounds
 
 # ----------------------------- I/O ----------------------------- #
 def load_surface_xyz_normals(xyz_csv, nrm_csv, verbose=True):
@@ -478,12 +529,82 @@ def detect_if_angle_is_meaningful(theta, label):
     print(f"[MV] {label}: angular span ~ {span:.3f} rad (~{span*180/np.pi:.1f} deg)")
     return span > (200.0*np.pi/180.0)
 
-def _rho_floor_from_points(Pn, c, E, frac=0.02):
-    # project once and take a robust floor: a few percent of median radius
-    Ploc = (Pn - c) @ E
-    _, rho = cylindrical_angle_and_radius(Ploc[:, :2])
-    rho_med = float(jnp.median(rho))
-    return max(1e-3 * rho_med, frac * rho_med)  # safety + user-tunable
+def order_points_by_knn_chain(P_loop, k=8):
+    """Greedy k-NN chaining to order a near-1D band of points into a polyline."""
+    if len(P_loop) < 3: return P_loop
+    nbrs = NearestNeighbors(n_neighbors=min(k, len(P_loop))).fit(P_loop)
+    visited = np.zeros(len(P_loop), dtype=bool)
+    path = [0]; visited[0] = True
+    for _ in range(1, len(P_loop)):
+        i = path[-1]
+        dists, idxs = nbrs.kneighbors(P_loop[i:i+1], return_distance=True)
+        # pick nearest unvisited
+        for j in idxs[0]:
+            if not visited[j]:
+                path.append(j); visited[j] = True; break
+        else:
+            # fallback: pick any unvisited
+            j = int(np.where(~visited)[0][0])
+            path.append(j); visited[j] = True
+    return P_loop[path]
+
+def estimate_periods_on_cycles(P, N, grad_fn, a_hat, scinfo, n_bins=60):
+    """
+    Build two near-closed paths from the boundary cloud:
+      - Toroidal loop: points near constant azimuth φ_a ≈ φ0 around a_hat
+      - Poloidal loop: points near constant poloidal θ ≈ θ0 (built w.r.t. a_hat frame)
+    Then do midpoint-rule ∮ grad·dl on each ordered polyline.
+    """
+    P_np = np.asarray(P); N_np = np.asarray(N)
+    # Axis-aware angles
+    phi_a, theta, s = angles_for_axis(jnp.asarray(P_np), jnp.asarray(N_np), jnp.asarray(a_hat),
+                                      center=jnp.asarray(scinfo.center))
+    phi_a = np.asarray(phi_a); theta = np.asarray(theta)
+
+    # Choose bins centered near 0 for both angles
+    def select_band(vals, half_width):
+        # unwrap to be stable near 0
+        v = np.unwrap(vals)
+        return np.abs(v - np.median(v)) <= half_width
+
+    # band widths
+    dphi = np.pi / n_bins
+    dth  = np.pi / n_bins
+
+    # Toroidal loop: narrow band in φ_a
+    mask_t = select_band(phi_a, dphi/2)
+    P_t = P_np[mask_t]
+    # Poloidal loop: narrow band in θ
+    mask_p = select_band(theta, dth/2)
+    P_p = P_np[mask_p]
+
+    # Order points into polylines to avoid zig-zags
+    P_t = order_points_by_knn_chain(P_t, k=8)
+    P_p = order_points_by_knn_chain(P_p, k=8)
+
+    def line_integral(P_loop):
+        if len(P_loop) < 4:
+            return 0.0
+        G = np.asarray(grad_fn(jnp.asarray(P_loop)))
+        dP = np.diff(P_loop, axis=0)
+        Gmid = 0.5*(G[1:,:] + G[:-1,:])
+        return float(np.sum(np.einsum('ij,ij->i', Gmid, dP)))
+
+    Pi_t = line_integral(P_t)
+    Pi_p = line_integral(P_p)
+    print(f"[PERIOD] line integrals: toroidal≈{Pi_t:.6e}, poloidal≈{Pi_p:.6e}")
+    return Pi_t, Pi_p
+
+def solve_ap_at_from_periods(Pi_t, Pi_p):
+    """
+    For the multivalued basis grad φ ≈ a_t grad_t + a_p grad_p + single-valued,
+    we lock periods with a 2x2 identity mapping (assumes period_t ~ 2π a_t, period_p ~ 2π a_p).
+    """
+    A = np.array([[2*np.pi, 0.0],[0.0, 2*np.pi]])
+    b = np.array([Pi_t, Pi_p])
+    a_t, a_p = np.linalg.solve(A, b)
+    print(f"[PERIOD] locked (a_t,a_p)=({a_t:.6e},{a_p:.6e}) from periods.")
+    return jnp.array([a_t, a_p], dtype=jnp.float64)
 
 @jit
 def grad_theta_world_from_plane(local_pts, E_plane_cols, rho_floor):
@@ -601,6 +722,19 @@ def multivalued_bases_about_axis(Pn, Nn, a_hat, verbose=True):
 
     return (phi_t, grad_t, phi_p, grad_p)
 
+# --- NEW: a fallback nontrivial multivalued amplitude if everything looks zero-ish ---
+def default_axis_aware_a(a_hat, prefer_toroidal=True):
+    """
+    Pick a deterministic, geometry-aware 'a' so φ_mv is nontrivial even when
+    periods are not prescribed. For tori, set a_t = 1, a_p = 0 by default.
+    For 'mirror' shapes you can flip the preference if desired.
+    """
+    if prefer_toroidal:
+        return jnp.array([1.0, 0.0], dtype=jnp.float64)
+    else:
+        return jnp.array([0.0, 1.0], dtype=jnp.float64)
+
+
 # -------------------------- kNN scales & weights ------------------------ #
 def kNN_geometry_stats(Pn, k=48, verbose=True):
     c, E, _ = best_fit_axis(np.array(Pn), verbose=False)
@@ -617,13 +751,6 @@ def kNN_geometry_stats(Pn, k=48, verbose=True):
         print(f"[QUAD] total area estimate (sum W)≈{float(jnp.sum(W)):.3f}")
     return W, rk
 
-def kNN_weights_for_points(Xn_like, k=32):
-    # Xn_like: points in *normalized* coords whose weights you want
-    # Build weights in the best-fit (u,v) plane using the same PCA as boundary
-    # We re-use best_fit_axis on the *boundary* Pn to get the plane.
-    # (Pass E,c down if you prefer.)
-    return None  # placeholder; we’ll inline below instead
-
 # ----------------------------- Kernels -------------------------- #
 @jit
 def green_G(x, y):
@@ -636,6 +763,37 @@ def grad_green_x(x, y):
     r2 = jnp.sum(r*r, axis=-1)
     r3 = jnp.maximum(1e-30, r2 * jnp.sqrt(r2))
     return - r / (4.0 * jnp.pi * r3[..., None])
+
+# ------------------ Tiny harmonic polynomial pack ------------------ #
+# We use 6 linearly independent trace-free quadratics (all ∇² h_k = 0):
+#   h1 = x*y,  h2 = y*z,  h3 = z*x,
+#   h4 = x^2 - y^2,  h5 = y^2 - z^2,  h6 = z^2 - x^2  (only 2 of these are independent, but
+#   the set of 3 is fine; the pack is kept tiny and stabilized by Tikhonov)
+# We also provide their gradients. Everything is in *normalized* coordinates Xn.
+def get_harmonic_pack():
+    @jit
+    def h_vals(Xn):  # (N,3) -> (N, K=6)
+        x, y, z = Xn[:,0], Xn[:,1], Xn[:,2]
+        return jnp.stack([
+            x*y,          # h1
+            y*z,          # h2
+            z*x,          # h3
+            x*x - y*y,    # h4
+            y*y - z*z,    # h5
+            z*z - x*x,    # h6
+        ], axis=1)
+    @jit
+    def h_grads(Xn):  # (N,3) -> (N,6,3)
+        x, y, z = Xn[:,0], Xn[:,1], Xn[:,2]
+        # gradients per column (K=6)
+        g1 = jnp.stack([y, x, jnp.zeros_like(x)], axis=1)          # ∇(x y)
+        g2 = jnp.stack([jnp.zeros_like(x), z, y], axis=1)          # ∇(y z)
+        g3 = jnp.stack([z, jnp.zeros_like(x), x], axis=1)          # ∇(z x)
+        g4 = jnp.stack([2*x, -2*y, jnp.zeros_like(x)], axis=1)     # ∇(x^2 - y^2)
+        g5 = jnp.stack([jnp.zeros_like(x), 2*y, -2*z], axis=1)     # ∇(y^2 - z^2)
+        g6 = jnp.stack([-2*x, jnp.zeros_like(x), 2*z], axis=1)     # ∇(z^2 - x^2)
+        return jnp.stack([g1, g2, g3, g4, g5, g6], axis=1)         # (N,6,3)
+    return h_vals, h_grads
 
 # ------------------------- MFS source cloud ---------------------- #
 def build_mfs_sources(Pn, Nn, rk, scale_info, source_factor=2.0, verbose=True):
@@ -658,12 +816,18 @@ def build_mfs_sources(Pn, Nn, rk, scale_info, source_factor=2.0, verbose=True):
     return Yn, delta_n_i
 
 # ----------------------------- System build ---------------------- #
-@partial(jit,static_argnames=("grad_t", "grad_p", "use_mv", "center_D", "verbose"))
-def build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo, use_mv=True, center_D=True, verbose=True):
+@partial(jax.jit, static_argnames=("grad_t", "grad_p", "use_mv", "center_D", "verbose", "h_grads"))
+def build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
+                          use_mv=True, center_D=True, verbose=True,
+                          h_grads=None):
     """
     Build collocation matrix for Neumann BC:
       A_ij = n_i · ∇_x G( x_i , y_j ),  x_i = Pn[i], y_j = Yn[j]
-    Returns A (world units). D is not needed in the current solve path.
+    If h_grads is not None, append the K harmonic-gradient columns exactly
+    like build_A_rows_at_points does, so A has shape (N, M+K).
+    Returns:
+      A  : (N, M[+K]) in WORLD units
+      D  : kept for interface compatibility (zeros)
     """
     X = Pn
 
@@ -672,17 +836,25 @@ def build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo, use_mv=True, ce
         grads = vmap(lambda yj: grad_green_x(xi, yj))(Yn)   # (M,3)
         return jnp.dot(grads, ni)                           # (M,)
 
-    A = vmap(row_kernel)(X, Nn)                              # (N, M)
-    A = scinfo.scale * A
+    # Base MFS block (N, M)
+    A_mfs = vmap(row_kernel)(X, Nn)
+    A_mfs = scinfo.scale * A_mfs
+
+    # Optionally append harmonic columns (N, K)
+    if h_grads is not None:
+        G = h_grads(X)                                     # (N, K, 3)  NOTE: X is normalized coords
+        H = jnp.sum(G * Nn[:, None, :], axis=2)            # (N, K)
+        A = jnp.concatenate([A_mfs, scinfo.scale * H], axis=1)
+    else:
+        A = A_mfs
 
     if verbose:
-        # All JAX ops; no numpy, no Python formatting of tracers
-        shape0 = A.shape[0]; shape1 = A.shape[1]
+        n, m = A.shape
         Amin = jnp.min(jnp.abs(A)); Amed = jnp.median(jnp.abs(A)); Amax = jnp.max(jnp.abs(A))
         jax_debug.print(
             "[SYS] A shape=({n},{m}), |A| stats: min={mn:.3e}, median={md:.3e}, max={mx:.3e}",
-            n=shape0, m=shape1, mn=Amin, md=Amed, mx=Amax)
-    # keep old signature but return dummy D to avoid changing callers
+            n=n, m=m, mn=Amin, md=Amed, mx=Amax)
+
     D = jnp.zeros((Pn.shape[0], 2), dtype=jnp.float64)
     return A, D
 
@@ -755,92 +927,222 @@ def solve_alpha_with_rhs_hard_flux_multi(A, W, g_raw, lam=1e-3, constraints=None
         print(f"[LS-α:Schur] NE cond≈{condNE:.3e}, S cond≈{condS:.3e}, λ={lam:.3g}, ||W^0.5 res||={lw2:.3e}")
     return alpha
 
-def augmented_lagrangian_solve(A, W, g_raw, lam, constraints, rho0=1e-2, rho_max=1e3, iters=5, verbose=True):
+def _prefactor_constrained_system(A, W, lam, constraints):
     """
-    Augmented Lagrangian on linear constraints C^T alpha = d:
-      minimize ||W^{1/2}(A alpha + g)||^2 + lam^2||alpha||^2
-              + μ^T(C^T alpha - d) + (ρ/2)||C^T alpha - d||^2
-    We eliminate μ analytically by folding into the RHS with iterative μ-updates.
+    Precompute objects we can reuse when only the RHS changes:
+      NE_base = A^T W A + λ^2 I,  L_base = chol(NE_base),
+      C, Z = NE_base^{-1} C, and G = C^T Z.
     """
-    # pack constraints -> matrix C (M x K) and vector d (K,)
+    Wv  = jnp.asarray(W).reshape(-1)
+    ATW = A.T * Wv[None, :]
+    ATA = ATW @ A
+    NE_base = ATA + (lam**2) * jnp.eye(A.shape[1], dtype=A.dtype)
+    L_base  = jnp.linalg.cholesky(NE_base)
+
+    # Pack constraints into a tall matrix C (M x K) and vector d (K,)
     Ccols, dlist = [], []
-    for (c_vec, d_k) in constraints:
+    for (c_vec, d_k) in (constraints or []):
+        Ccols.append(jnp.asarray(c_vec).reshape(-1, 1))
+        dlist.append(d_k)
+    C = jnp.concatenate(Ccols, axis=1) if Ccols else jnp.zeros((A.shape[1],0), dtype=A.dtype)
+    d = jnp.asarray(dlist, dtype=A.dtype) if dlist else jnp.zeros((0,), dtype=A.dtype)
+
+    # helpers using the factor
+    def solve_base(rhs):
+        y = jsp_linalg.solve_triangular(L_base, rhs, lower=True)
+        return jsp_linalg.solve_triangular(L_base.T, y, lower=False)
+
+    Z = solve_base(C) if C.shape[1] > 0 else C
+    G = C.T @ Z if C.shape[1] > 0 else jnp.zeros((0,0), dtype=A.dtype)
+
+    return dict(L_base=L_base, C=C, d=d, Z=Z, G=G, ATW=ATW)
+
+def fast_constrained_resolve_with_new_g(A, W, g_raw, lam, prefac):
+    """
+    Given the same A, W, λ, constraints, and prefactor (from _prefactor_constrained_system),
+    quickly solve the constrained Tikhonov system for a NEW g_raw (e.g., after MV-LOCK).
+    This is a single Schur solve; no AL iterations.
+    """
+    L_base = prefac["L_base"]; C = prefac["C"]; d = prefac["d"]; Z = prefac["Z"]; G = prefac["G"]; ATW = prefac["ATW"]
+
+    rhs1 = - (ATW @ jnp.asarray(g_raw))
+    # NE^{-1} rhs1
+    y1 = jsp_linalg.solve_triangular(L_base, rhs1, lower=True)
+    z1 = jsp_linalg.solve_triangular(L_base.T, y1, lower=False)
+
+    if C.shape[1] == 0:
+        return z1
+
+    # Schur solve: μ from G μ = d - C^T z1
+    rhsμ = d - (C.T @ z1)
+    μ    = jnp.linalg.solve(G, rhsμ)
+
+    # α = z1 - Z μ
+    return z1 - Z @ μ
+
+def augmented_lagrangian_solve(
+    A, W, g_raw, lam, constraints,
+    rho0=1e-2, rho_max=1e3, iters=5, verbose=True,
+    tol_c=1e-3, tol_res_rel=1e-3
+):
+    # Pack constraints
+    M = A.shape[1]
+    Ccols, dlist = [], []
+    for (c_vec, d_k) in (constraints or []):
+        c_vec = jnp.asarray(c_vec).reshape(-1)
+        if c_vec.shape[0] != M:
+            raise ValueError(
+                f"[constraints] c_vec has length {c_vec.shape[0]} but must match A.shape[1] = {M}. "
+                f"One of the constraints likely passed a transposed A_like into make_flux_constraint."
+            )
         Ccols.append(c_vec[:, None])
         dlist.append(d_k)
-    C = jnp.concatenate(Ccols, axis=1)  # (M,K)
-    d = jnp.asarray(dlist, dtype=A.dtype)
+    C = jnp.concatenate(Ccols, axis=1)  # (M, K)
+    d = jnp.asarray(dlist, dtype=A.dtype)      # (K,)
 
     Wv  = jnp.asarray(W).reshape(-1)
     ATW = A.T * Wv[None, :]
     ATA = ATW @ A
     ATg = ATW @ g_raw
 
-    # initialize
-    K = C.shape[1]
-    mu = jnp.zeros((K,), dtype=A.dtype)
+    # Pre-factor base normal equations
+    NE_base = ATA + (lam**2) * jnp.eye(A.shape[1], dtype=A.dtype)
+    L_base  = jnp.linalg.cholesky(NE_base)
+
+    def solve_base(rhs):
+        y = jsp_linalg.solve_triangular(L_base, rhs, lower=True)
+        return jsp_linalg.solve_triangular(L_base.T, y, lower=False)
+
+    # Precompute Z = NE_base^{-1} C  and the small Gram G = C^T Z
+    Z = solve_base(C)                # (M, K)
+    G = C.T @ Z                      # (K, K)
+
+    mu = jnp.zeros((C.shape[1],), dtype=A.dtype)
     rho = rho0
     alpha = jnp.zeros((A.shape[1],), dtype=A.dtype)
 
+    prev_lw2 = None
     for it in range(iters):
-        # NE(ρ) := A^T W A + lam^2 I + ρ C C^T  (note: C C^T is (M x M), we need in M-space)
-        # Work in α-space via Schur: form NE = ATA + lam^2 I + ρ * (C @ C.T) projected via α
-        # More efficiently: normal eq. with extra term via (C (C^T α)) handled as (ρ C C^T) in M-space:
-        # We augment RHS to include μ and d: rhs = -(ATg) - C (μ + ρ * d)
+        # Target rhs: NE(ρ) α = -ATg - C (mu + ρ d)
         rhs = -ATg - C @ (mu + rho * d)
 
-        NE = ATA + (lam**2) * jnp.eye(A.shape[1], dtype=A.dtype) + rho * (C @ C.T)
+        # Woodbury: (NE_base + ρ C C^T)^{-1} rhs
+        # = solve_base(rhs) - Z * ( (I/ρ + G)^{-1} * (C^T * solve_base(rhs)) ) / 1
+        z1 = solve_base(rhs)                      # (M,)
+        Ct_z1 = C.T @ z1                          # (K,)
+        Sρ = (G + (1.0 / rho) * jnp.eye(G.shape[0], dtype=G.dtype))  # (K,K)
+        y_small = jnp.linalg.solve(Sρ, Ct_z1)     # (K,)
+        alpha = z1 - Z @ y_small                  # (M,)
 
-        # Cholesky solve
-        L = jnp.linalg.cholesky(NE)
-        y = jsp_linalg.solve_triangular(L, rhs, lower=True)
-        alpha = jsp_linalg.solve_triangular(L.T, y, lower=False)
-
-        # constraint residual and multipliers update
+        # Constraint residual and multiplier update
         r = (C.T @ alpha) - d
         mu = mu + rho * r
 
+        # Diagnostics
+        lw2 = float(jnp.sqrt(jnp.dot(Wv, (A @ alpha + g_raw)**2)))
+        crel = float(jnp.linalg.norm(r) / (jnp.linalg.norm(d) + 1e-30))
+
         if verbose:
-            lw2 = float(jnp.sqrt(jnp.dot(Wv, (A @ alpha + g_raw)**2)))
-            crel = float(jnp.linalg.norm(r) / (jnp.linalg.norm(d) + 1e-30))
             print(f"[AL] it={it}  ||W^1/2 res||={lw2:.3e}  ||C^Tα-d||/||d||={crel:.3e}  rho={rho:.2e}")
 
+        # --- Early exit: small constraint violation and diminishing residual improvement ---
+        if crel < tol_c and (prev_lw2 is not None):
+            rel_impr = abs(lw2 - prev_lw2) / (abs(prev_lw2) + 1e-30)
+            if rel_impr < tol_res_rel:
+                if verbose:
+                    print(f"[AL] early-exit: crel={crel:.3e}, Δres/res={rel_impr:.3e}")
+                break
+
+        prev_lw2 = lw2
         rho = min(rho * 10.0, rho_max)
 
     return alpha
 
-@jit
-def build_A_rows_at_points(Xn_eval, N_eval, Yn, scinfo):
+@partial(jax.jit, static_argnames=("h_grads",))
+def build_A_rows_at_points(Xn_eval, N_eval, Yn, scinfo, h_grads=None):
     @jit
     def row_kernel(xi, ni):
         grads = vmap(lambda yj: grad_green_x(xi, yj))(Yn)   # (M,3)
         return jnp.dot(grads, ni)                           # (M,)
-    A_in = vmap(row_kernel)(Xn_eval, N_eval)                # (N,M)
-    return scinfo.scale * A_in                              # to world units
+    A_in = vmap(row_kernel)(Xn_eval, N_eval)                # (N,M_mfs)
+    A_in = scinfo.scale * A_in
+    if h_grads is not None:
+        G = h_grads(Xn_eval)                                # (N,K,3)
+        H = jnp.sum(G * N_eval[:, None, :], axis=2)         # (N,K)
+        A_in = jnp.concatenate([A_in, scinfo.scale * H], axis=1)  # (N, M_mfs+K)
+    return A_in
 
 def make_flux_constraint(A_like, W_like, g_like):
-    # Return (c_vec, d_scalar) with c_vec = A_like^T W_like 1, d = W_like·g_like
+    """
+    Return (c_vec, d_scalar) for flux-compatibility:
+      c_vec = A^T W 1   (shape M,)
+      d     = W·g       (scalar)
+    Robust to A_like being (N,M) or (M,N).
+    """
     Wv = jnp.asarray(W_like).reshape(-1)
-    c_vec = (A_like.T * Wv[None, :]).sum(axis=1)   # (M,)
-    d_val = jnp.dot(Wv, g_like)                    # scalar
-    return c_vec, d_val
+    A  = jnp.asarray(A_like)
+    g  = jnp.asarray(g_like)
+
+    # Case 1: A is (N, M) and len(W) == N  → expected
+    if A.ndim == 2 and A.shape[0] == Wv.shape[0]:
+        c_vec = (A.T * Wv[None, :]).sum(axis=1)       # (M,)
+        d_val = jnp.dot(Wv, g)
+        return c_vec, d_val
+
+    # Case 2: A is (M, N) and len(W) == N  → transposed input; handle gracefully
+    if A.ndim == 2 and A.shape[1] == Wv.shape[0]:
+        c_vec = (A * Wv[None, :]).sum(axis=1)         # (M,)
+        d_val = jnp.dot(Wv, g)
+        return c_vec, d_val
+
+    # Otherwise, shapes are inconsistent; raise a clear error
+    raise ValueError(
+        f"make_flux_constraint: incompatible shapes. "
+        f"A_like shape={A.shape}, len(W_like)={Wv.shape[0]}, len(g_like)={g.shape[0]} "
+        f"(expected len(W)=rows(A) or cols(A))"
+    )
 
 # ----------------- Evaluators & Laplacian(ψ) ------------------- #
-def build_evaluators_mfs(Pn, Yn, alpha, phi_t, phi_p, a, scinfo: ScaleInfo,
-                         grad_t_fn, grad_p_fn):
+def build_evaluators_mfs_plusH(Pn, Yn, alpha_full, phi_t, phi_p, a, scinfo: ScaleInfo,
+                               grad_t_fn, grad_p_fn, h_vals=None, h_grads=None):
     Y = Yn
+    # sizes inferred from closed-over tensors/functions (static wrt trace)
+    M_mfs = Y.shape[0]
+    if h_grads is None:
+        K_harm = 0
+    else:
+        # infer K by calling once on a dummy point (shape-safe and cheap)
+        K_harm = int(h_grads(jnp.zeros((1, 3), dtype=Y.dtype)).shape[1])
+
+    @jax.jit
+    def split_alpha(a_vec):
+        alpha_mfs = jax.lax.dynamic_slice_in_dim(a_vec, 0, M_mfs)
+        beta_h = (jax.lax.dynamic_slice_in_dim(a_vec, M_mfs, K_harm)
+                  if K_harm > 0 else jnp.zeros((0,), dtype=a_vec.dtype))
+        return alpha_mfs, beta_h
 
     @jit
-    def S_alpha_at(xn):
-        Gvals = vmap(lambda y: green_G(xn, y))(Y)
-        return jnp.dot(Gvals, alpha)
+    def S_alpha_at(xn, alpha_mfs, beta_h):
+        Gvals = vmap(lambda y: green_G(xn, y))(Y)                # (M_mfs,)
+        val = jnp.dot(Gvals, alpha_mfs)
+        if K_harm > 0 and h_vals is not None:
+            hv = h_vals(xn[None, :])[0]                          # (K,)
+            val = val + jnp.dot(hv, beta_h)
+        return val
 
     @jit
-    def grad_S_alpha_at(xn):
-        Grads = vmap(lambda y: grad_green_x(xn, y))(Y)  # (M,3)
-        return jnp.sum(Grads * alpha[:, None], axis=0)
+    def grad_S_alpha_at(xn, alpha_mfs, beta_h):
+        Grads = vmap(lambda y: grad_green_x(xn, y))(Y)          # (M_mfs,3)
+        g = jnp.sum(Grads * alpha_mfs[:, None], axis=0)
+        if K_harm > 0 and h_grads is not None:
+            Hg = h_grads(xn[None, :])[0]                        # (K,3)
+            g = g + jnp.dot(beta_h[None, :], Hg).reshape(3)
+        return g
 
-    S_batch  = vmap(S_alpha_at)
-    dS_batch = vmap(grad_S_alpha_at)
+    def S_batch(Xn, alpha_mfs, beta_h):
+        return vmap(lambda x: S_alpha_at(x, alpha_mfs, beta_h))(Xn)
+    def dS_batch(Xn, alpha_mfs, beta_h):
+        return vmap(lambda x: grad_S_alpha_at(x, alpha_mfs, beta_h))(Xn)
 
     @jit
     def phi_mv_world(X):
@@ -855,12 +1157,14 @@ def build_evaluators_mfs(Pn, Yn, alpha, phi_t, phi_p, a, scinfo: ScaleInfo,
     @jit
     def psi_fn_world(X):
         Xn = (X - scinfo.center) * scinfo.scale
-        return S_batch(Xn)
+        alpha_mfs, beta_h = split_alpha(alpha_full)
+        return S_batch(Xn, alpha_mfs, beta_h)
 
     @jit
     def grad_psi_fn_world(X):
         Xn = (X - scinfo.center) * scinfo.scale
-        return (scinfo.scale) * dS_batch(Xn)
+        alpha_mfs, beta_h = split_alpha(alpha_full)
+        return (scinfo.scale) * dS_batch(Xn, alpha_mfs, beta_h)
 
     @jit
     def phi_fn_world(X):
@@ -887,6 +1191,80 @@ def maybe_flip_normals(P, N):
         return -N, True
     print(f"[ORIENT] Normals seem outward (⟨(P-c)·N⟩≈{avg:.3e}).")
     return N, False
+
+# --- NEW: final diagnostics dumper ---
+def print_final_diagnostics(
+    tag, P, N, W, W_ring, scinfo,
+    eps_n, lam, source_factor, a, alpha,
+    grad_fn, lap_psi_fn,
+    A_aug_bdry=None, constraints=None,
+    recompute_W_ring=False, k_nn_for_ring=64, Pn=None,
+    Yn=None, h_grads=None, grad_t_fn=None, grad_p_fn=None, verbose_rebuild=True
+):
+    print(f"\n===== FINAL DIAGNOSTICS: {tag} =====")
+    # ring geometry
+    if recompute_W_ring:
+        W_ring = build_ring_weights(P_in, Pn, k=k_nn_for_ring)
+    eps_w = float(eps_n) / float(np.asarray(scinfo.scale))
+    P_in  = P - eps_w * N
+    grad_on_Gamma   = grad_fn(P)
+    grad_on_ring    = grad_fn(P_in)
+    lap_on_ring     = lap_psi_fn(P_in)
+
+    # magnitudes
+    gΓ  = jnp.linalg.norm(grad_on_Gamma, axis=1)
+    gR  = jnp.linalg.norm(grad_on_ring,  axis=1)
+    n·g = jnp.sum(N * grad_on_ring, axis=1)
+    rn  = jnp.abs(n·g) / jnp.maximum(1e-30, gR)
+
+    # flux neutrality on ring
+    flux = float(jnp.dot(W_ring, n·g))
+    area = float(jnp.sum(W_ring))
+
+    # report
+    vec_stats("[Γ] |∇φ|", gΓ)
+    print(f"[Γ]   dimless 50/90/99 pct(|∇φ|/median(|∇φ|_Γ)): "
+          f"{pct(gΓ/np.median(np.asarray(gΓ)),50):.3f}/"
+          f"{pct(gΓ/np.median(np.asarray(gΓ)),90):.3f}/"
+          f"{pct(gΓ/np.median(np.asarray(gΓ)),99):.3f}")
+    vec_stats("[Γ₋] |∇φ|", gR)
+    vec_stats("[Γ₋] |n·∇φ|/|∇φ|", rn)
+    vec_stats("[Γ₋] |∇²ψ|", jnp.abs(lap_on_ring))
+    print(f"[Γ₋] Flux neutrality: ∫ n·∇φ dS ≈ {flux:.6e} (avg={flux/area:.3e})")
+    print(f"[PARAM] δ~{source_factor:.3f} (median offset), λ={lam:.3e}, ε_n={eps_n:.3e}")
+    print(f"[MV] a_t={float(a[0]):.6e}, a_p={float(a[1]):.6e}, ||α||₂={float(jnp.linalg.norm(alpha)):.3e}")
+
+    # --- Matrix condition check (robust to shape changes) ---
+    if A_aug_bdry is not None:
+        try:
+            Wv  = jnp.asarray(W).reshape(-1)
+            if A_aug_bdry.shape[0] != Wv.shape[0]:
+                # Try to rebuild with CURRENT geometry to match W
+                if (Pn is not None) and (Yn is not None):
+                    A_re = build_A_rows_at_points(Pn, N, Yn, scinfo, h_grads=h_grads)
+                    if verbose_rebuild:
+                        print(f"[MATRIX] Rebuilt A for diagnostics: old rows={A_aug_bdry.shape[0]}, new rows={A_re.shape[0]}")
+                    A_aug_bdry = A_re
+                else:
+                    print("[MATRIX] Skipping condition estimate (shape mismatch and cannot rebuild).")
+                    A_aug_bdry = None
+        except Exception as e:
+            print("[MATRIX] Skipping condition estimate (rebuild failed):", e)
+            A_aug_bdry = None
+
+    if A_aug_bdry is not None:
+        Wv  = jnp.asarray(W).reshape(-1)
+        ATW = A_aug_bdry.T * Wv[None, :]
+        NE  = ATW @ A_aug_bdry + 1e-30*jnp.eye(A_aug_bdry.shape[1])
+        condNE = float(np.linalg.cond(np.asarray(NE)))
+        print(f"[MATRIX] cond(NormalEq)≈{condNE:.3e}")
+
+    if constraints:
+        # check constraint residuals on x=[α;a]
+        # We don't have x here, but you can pass it if you want exact numbers.
+        print(f"[CONSTR] Count={len(constraints)} (Γ, Γ₋, caps).")
+    print("===== END FINAL DIAGNOSTICS =====\n")
+
 
 # -------------------------- Diagnostics/plots -------------------- #
 def _angles_phi_theta(P, N=None, verbose=False):
@@ -1032,6 +1410,7 @@ def plot_geometry_and_solution(P, N, grads_where, title_suffix="", show_normals=
         # TORUS: true cylindrical φ on x-axis
         Pnp = np.asarray(P)
         x_axis_vals = np.arctan2(Pnp[:,1], Pnp[:,0])  # TRUE φ
+        x_axis_vals = np.unwrap(x_axis_vals)
         x_label = "toroidal angle ϕ (rad)"
         # Build θ the same robust way you already do (tokamak-style)
         phi, theta = _angles_phi_theta(P, N)
@@ -1081,6 +1460,10 @@ def plot_boundary_condition_errors(P, N, grad_on_ring):
 
 
 def plot_laplacian_errors_on_interior_band(P, lap_psi_at_interior, eps):
+    P = np.asarray(P)
+    lap = np.asarray(lap_psi_at_interior)
+    assert P.shape[0] == lap.shape[0], \
+        f"plot_laplacian_errors_on_interior_band: |P|={P.shape[0]} vs |lap|={lap.shape[0]}."
     fig = plt.figure(figsize=(12,6))
     ax = fig.add_subplot(1,2,1, projection='3d')
     vmin = pct(jnp.abs(lap_psi_at_interior), 1); vmax = pct(jnp.abs(lap_psi_at_interior), 99)
@@ -1097,7 +1480,8 @@ def plot_laplacian_errors_on_interior_band(P, lap_psi_at_interior, eps):
 
 def build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
                               grad_t, grad_p, a, a_hat,
-                              q=0.02, ds_frac=0.02, k_cap=32, side="low"):
+                              q=0.02, ds_frac=0.02, k_cap=32, side="low",
+                              h_grads=None):
     """
     Build (c_cap, d_cap) for a virtual end-cap perpendicular to a_hat.
     - side: "low" or "high": chooses s-quantile q or 1-q
@@ -1139,7 +1523,9 @@ def build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
 
     # collocation on the cap (use normalized coords for grad_t/grad_p)
     Xn_cap = (P_cap - scinfo.center) * scinfo.scale
-    A_cap = build_A_rows_at_points(Xn_cap, N_cap, Yn, scinfo)
+
+    # ⟵ IMPORTANT: include harmonic columns so A_cap has the same width as A
+    A_cap = build_A_rows_at_points(Xn_cap, N_cap, Yn, scinfo, h_grads=h_grads)
 
     # MV contribution on the cap
     Gt_cap = grad_t(Xn_cap)
@@ -1154,11 +1540,11 @@ def build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
 # ------------------------------- main ------------------------------- #
 def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
          use_mv=True, k_nn=48,
-         mv_weight=0.5,               # regularization weight for [a_t,a_p]
          interior_eps_factor=5e-3,  # ε ~ interior offset for evaluation, in *normalized* h units
          verbose=True, show_normals=False,
          toroidal_flux=None,          # prescribe Φ_t (sets a_t = Φ_t/(2π)) if not None
-         sf_min=1.0, sf_max=6.5, lbfgs_maxiter=30, lbfgs_tol=1e-8
+         sf_min=1.0, sf_max=6.5, lbfgs_maxiter=30, lbfgs_tol=1e-8, seed=None, lbfgs_maxiter_final=30,
+         reg_gamma_a=1e-2
         ):
 
     # Load & orient
@@ -1176,113 +1562,143 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     print(f"[SCALE] median local spacing h_med≈{h_med:.4g} (normalized units)")
     
     # --- Auto-tune ---
-    best = autotune(P, N, Pn, Nn, W, rk, scinfo, use_mv=use_mv, mv_weight=mv_weight,
-                    interior_eps_factor=interior_eps_factor, verbose=True,
-                    sf_min=sf_min, sf_max=sf_max,
-                    lbfgs_maxiter=lbfgs_maxiter, lbfgs_tol=lbfgs_tol)
+    best = autotune(P, N, Pn, Nn, W, rk, scinfo, interior_eps_factor=interior_eps_factor,
+                          use_mv=use_mv,
+                          verbose=True, sf_min=sf_min, sf_max=sf_max,
+                          lbfgs_maxiter=lbfgs_maxiter, lbfgs_tol=lbfgs_tol)
+    eps_n = best["eps_n_star"]
     source_factor_opt = best["source_factor"]
     lambda_reg_opt    = best["lambda_reg"]
+    # interior_eps_factor    = best["interior_eps_factor"]
     # Reuse pre-built things to avoid recompute:
     phi_t, grad_t, phi_p, grad_p, Yn, kind = best["phi_t"], best["grad_t"], best["phi_p"], best["grad_p"], best["Yn"], best["kind"]
     delta_n = float(np.median(np.linalg.norm(np.asarray(Yn) - np.asarray(Pn), axis=1)))
 
-    A, D = build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
-                                 use_mv=use_mv, center_D=True, verbose=verbose)
+    # include harmonic pack everywhere
+    h_vals, h_grads = best["h_vals"], best["h_grads"]
 
-    if use_mv:
-        grad_t_bdry, grad_p_bdry = grad_t(Pn), grad_p(Pn)
-        a, D_raw, D0 = fit_mv_coeffs_minimize_rhs(Nn, W, grad_t_bdry, grad_p_bdry, verbose=verbose)
-        g_raw = scinfo.scale * jnp.sum(Nn * (a[0]*grad_t_bdry + a[1]*grad_p_bdry), axis=1)
-    else:
-        a = jnp.zeros((2,), dtype=jnp.float64)
-        g_raw = jnp.zeros((Pn.shape[0],), dtype=jnp.float64)
+    # --- BOUNDARY: use MFS(+H) only; MV goes to RHS g_raw ---
+    A_bdry, _ = build_system_matrices(
+        Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
+        use_mv=False, center_D=False, verbose=verbose, h_grads=h_grads
+    )
 
-    # --- OVERRIDE a_t if a toroidal flux is prescribed ---
-    if use_mv and (toroidal_flux is not None):
-        a_t_fixed = float(toroidal_flux) / (2.0 * np.pi)
-        a = jnp.array([a_t_fixed, 0.0], dtype=jnp.float64)
-        if verbose:
-            print(f"[MV-FIX] Prescribing toroidal flux Φ_t={toroidal_flux:.6g} ⇒ a_t={a_t_fixed:.6g}; setting a_p=0.")
-        # Rebuild g_raw with fixed a
-        grad_t_bdry = grad_t(Pn)
-        grad_p_bdry = grad_p(Pn)
-        g_raw = scinfo.scale * jnp.sum(Nn * (a[0]*grad_t_bdry + a[1]*grad_p_bdry), axis=1)
+    # --- Choose a nontrivial 'a' ---
+    a = best["a"]
+    if (jnp.linalg.norm(a) < 1e-12):
+        # If the SVD-based fit came out ~zero, pick a deterministic non-zero default
+        a = default_axis_aware_a(best["a_hat"], prefer_toroidal=(kind=="torus"))
 
-    # === Prepare constraints ===
-    # Boundary constraint:
-    c_bdry, d_bdry = make_flux_constraint(A, W, g_raw)
+    # Build g_raw on the boundary for this 'a'
+    grad_t_bdry = grad_t(Pn)
+    grad_p_bdry = grad_p(Pn)
+    g_raw = scinfo.scale * jnp.sum(Nn * (a[0]*grad_t_bdry + a[1]*grad_p_bdry), axis=1)
 
-    # Interior ring for *constraint* (same ring you use for diagnostics)
-    eps_n = max(1e-6, interior_eps_factor * h_med)    # normalized
-    eps_w = eps_n / scinfo.scale
+    # --- Interior ring Γ₋ (at tuned eps): MFS(+H) rows only ---
+    eps_w = float(eps_n) / float(np.asarray(scinfo.scale))
     P_in  = P - eps_w * N
     Xn_in = (P_in - scinfo.center) * scinfo.scale
-    A_in  = build_A_rows_at_points(Xn_in, N, Yn, scinfo)
+    A_in  = build_A_rows_at_points(Xn_in, N, Yn, scinfo, h_grads=h_grads)
 
-    # g_in from MV on interior:
-    # OPTIONAL speed path: reuse boundary normals for ring; ϕ̂_tan, θ̂ remain consistent for tiny offsets
-    use_fast_ring = (kind == "torus")  # mirrors need accurate θ̂
+    # MV RHS on the ring
     Gt_in = grad_t(Xn_in)
-    if use_fast_ring:
-        # Build poloidal direction with boundary normals to avoid nearest-neighbor search
-        x, y = Xn_in[:, 0], Xn_in[:, 1]
-        r2   = jnp.maximum(1e-30, x*x + y*y)
-        phi_hat   = jnp.stack([-y / jnp.sqrt(r2), x / jnp.sqrt(r2), jnp.zeros_like(x)], axis=1)
-        phi_tan   = phi_hat - jnp.sum(phi_hat * N, axis=1, keepdims=True) * N
-        phi_tan   = phi_tan / jnp.maximum(1e-30, jnp.linalg.norm(phi_tan, axis=1, keepdims=True))
-        theta_hat = jnp.cross(N, phi_tan)
-        theta_hat = theta_hat / jnp.maximum(1e-30, jnp.linalg.norm(theta_hat, axis=1, keepdims=True))
-        Gp_in = theta_hat
-    else:
-        Gp_in = grad_p(Xn_in)
-
+    Gp_in = grad_p(Xn_in)
     g_in  = scinfo.scale * jnp.sum(N * (a[0]*Gt_in + a[1]*Gp_in), axis=1)
 
-    # Build ring weights once and use them for the constraint
+    # --- Flux constraints on Γ and Γ₋ with MV RHS included ---
     W_ring = build_ring_weights(P_in, Pn, k=k_nn)
-    c_int, d_int = make_flux_constraint(A_in, W_ring, g_in)
+    c_bdry, d_bdry = make_flux_constraint(A_bdry, W, g_raw)
+    c_int,  d_int  = make_flux_constraint(A_in,   W_ring, g_in)
 
-    # --- Add two virtual end-cap flux constraints (close the open sleeve) ---
+    # --- Optional end-caps: make caps augmented as well (H + D) ---
+    cap_constraints = []
     try:
-        c_cap_low,  d_cap_low  = build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
-                                                        grad_t, grad_p, a, best["a_hat"],
-                                                        q=0.02, ds_frac=0.02, k_cap=k_nn, side="low")
-        c_cap_high, d_cap_high = build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
-                                                        grad_t, grad_p, a, best["a_hat"],
-                                                        q=0.02, ds_frac=0.02, k_cap=k_nn, side="high")
-        cap_constraints = [(c_cap_low,  -d_cap_low),
-                        (c_cap_high, -d_cap_high)]
+        # Use previous cap selection logic but build augmented rows there:
+        def cap_aug(side):
+            # select cap points/normals + W_cap exactly as build_cap_flux_constraint
+            a_hat = best["a_hat"]
+            X = jnp.asarray(P)
+            a = jnp.asarray(a_hat) / jnp.maximum(1e-30, jnp.linalg.norm(a_hat))
+            c0 = jnp.asarray(scinfo.center)
+            s = jnp.sum((X - c0[None,:]) * a[None,:], axis=1)
+            s_min, s_max = float(jnp.min(s)), float(jnp.max(s))
+            s_span = max(1e-9, s_max - s_min)
+            s0 = np.quantile(np.asarray(s), 0.02 if side=="low" else 0.98)
+            ds = 0.02 * s_span
+            mask = np.abs(np.asarray(s) - s0) <= ds
+            P_cap = X[mask, :]
+            N_cap = ( -a if side=="low" else a )[None,:].repeat(P_cap.shape[0], axis=0)
+
+            # weights in plane ⟂ a_hat via kNN (same as before)
+            e1_np, e2_np = _orthonormal_complement(np.array(a_hat))
+            e1 = jnp.asarray(e1_np); e2 = jnp.asarray(e2_np)
+            Xc = P_cap - c0[None, :]
+            u1 = np.asarray(jnp.sum(Xc * e1[None,:], axis=1))
+            u2 = np.asarray(jnp.sum(Xc * e2[None,:], axis=1))
+            UV = np.column_stack([u1, u2])
+            k_eff = min(k_nn+1, len(UV))
+            nbrs = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree").fit(UV)
+            dists, _ = nbrs.kneighbors(UV)
+            rk_cap = dists[:, -1]
+            W_cap = jnp.asarray(np.pi * rk_cap**2, dtype=jnp.float64)
+
+            Xn_cap = (P_cap - scinfo.center) * scinfo.scale
+            A_cap = build_A_rows_at_points(Xn_cap, N_cap, Yn, scinfo, h_grads=h_grads)
+            Gt_cap = grad_t(Xn_cap)
+            Gp_cap = grad_p(Xn_cap)
+            g_cap  = scinfo.scale * jnp.sum(N_cap * (a[0]*Gt_cap + a[1]*Gp_cap), axis=1)
+            c_cap, d_cap = make_flux_constraint(A_cap, W_cap, g_cap)
+            return (c_cap, d_cap)
+
+        c_cap_low,  d_cap_low  = cap_aug("low")
+        c_cap_high, d_cap_high = cap_aug("high")
+        cap_constraints = [(c_cap_low, d_cap_low), (c_cap_high, d_cap_high)]
     except Exception as e:
-        print("[WARN] Cap constraints failed; continuing without them:", e)
+        print("[WARN] Cap constraints (augmented) failed; continuing without them:", e)
         cap_constraints = []
 
-    # Choose your policy:
-    # 1) Most robust in practice: enforce on Γ₋ only
-    # constraints = [(c_int, -d_int)]
-    # 2) Enforce on both Γ and Γ₋ (two constraints):
-    # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)]
-    # 3) Enforce on Γ, Γ₋, and end-caps (four constraints):
-    constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints  # <-- NEW
+    # --- Build full constraint set (Γ, Γ₋, caps) ---
+    constraints = [(c_bdry, d_bdry), (c_int, d_int)] + cap_constraints
 
-    alpha = augmented_lagrangian_solve(
-        A, W, g_raw, lam=lambda_reg_opt, constraints=constraints,
-        rho0=1e2, rho_max=1e4, iters=6, verbose=verbose
+    # --- SOLVE α ONLY with hard flux constraints and non-zero RHS ---
+    alpha = solve_alpha_with_rhs_hard_flux_multi(
+        A_bdry, W, g_raw, lam=lambda_reg_opt, constraints=constraints, verbose=verbose
     )
-    
+    print(f"[SOL-α] ||alpha||₂={float(jnp.linalg.norm(alpha)):.3e}, a_t={float(a[0]):.6g}, a_p={float(a[1]):.6g}")    
     print(f"[SOL] a_t={float(a[0]):.6g}, a_p={float(a[1]):.6g}, ||alpha||₂={float(jnp.linalg.norm(alpha)):.3e}")
 
-    phi_fn, grad_fn, psi_fn, grad_psi_fn, lap_psi_fn, _ = build_evaluators_mfs(
-        Pn, Yn, alpha, phi_t, phi_p, a, scinfo, grad_t, grad_p
+    phi_fn, grad_fn, psi_fn, grad_psi_fn, lap_psi_fn, _ = build_evaluators_mfs_plusH(
+        Pn, Yn, alpha, phi_t, phi_p, a, scinfo, grad_t, grad_p,
+        h_vals=h_vals, h_grads=h_grads
     )
+    
+    if use_mv and (toroidal_flux is None):
+        # If the estimated periods are ~zero (degenerate selection), keep the default 'a'
+        Pi_t, Pi_p = estimate_periods_on_cycles(P, N, lambda X: grad_fn(X), best["a_hat"], scinfo)
+        if (abs(Pi_t) > 1e-8) or (abs(Pi_p) > 1e-8):
+            a_locked = solve_ap_at_from_periods(Pi_t, Pi_p)
+            a = a_locked
+            grad_t_bdry = grad_t(Pn); grad_p_bdry = grad_p(Pn)
+            g_raw = scinfo.scale * jnp.sum(Nn * (a[0]*grad_t_bdry + a[1]*grad_p_bdry), axis=1)
+            prefac = _prefactor_constrained_system(A_bdry, W, lambda_reg_opt, constraints)
+            alpha  = fast_constrained_resolve_with_new_g(A_bdry, W, g_raw, lambda_reg_opt, prefac)
+            # rebuild evaluators
+            phi_fn, grad_fn, psi_fn, grad_psi_fn, lap_psi_fn, _ = build_evaluators_mfs_plusH(
+                Pn, Yn, alpha, phi_t, phi_p, a, scinfo, grad_t, grad_p,
+                h_vals=h_vals, h_grads=h_grads
+            )
+            print(f"[MV-LOCK] Period lock applied. a_t={float(a[0]):.6e}, a_p={float(a[1]):.6e}")
+        else:
+            print("[MV-LOCK] Periods ~0; kept default nontrivial 'a'.")
+
 
     # === Diagnostics on Γ (illustrative; gradients may still be large due to proximity to sources) ===
     grad_on_Gamma = grad_fn(P)
     vec_stats("[EVAL Γ] |∇φ|", jnp.linalg.norm(grad_on_Gamma, axis=1))
 
-    # === Diagnostics on Γ₋ (interior offset): reliable ===
-    eps_n = max(1e-6, interior_eps_factor * h_med)  # normalized offset inward
-    eps_w = eps_n / scinfo.scale                     # world offset
-    P_in = P - eps_w * N
+    # === Diagnostics on Γ₋ (interior offset): use tuned eps ===
+    eps_w = float(eps_n) / float(np.asarray(scinfo.scale))
+    P_in  = P - eps_w * N
     print(f"[DIAG] Using interior-offset ring Γ₋ with eps_n={eps_n:.3g} (normalized), eps_world={eps_w:.3g}.")
 
     grad_on_ring = grad_fn(P_in)
@@ -1290,16 +1706,76 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     vec_stats("[EVAL Γ₋] |∇φ|", grad_mag_ring)
     
     n_dot_grad_ring = jnp.sum(N * grad_on_ring, axis=1)
-    grad_mag_ring   = jnp.linalg.norm(grad_on_ring, axis=1)
     rn = jnp.abs(n_dot_grad_ring) / jnp.maximum(1e-30, grad_mag_ring)
     vec_stats("[EVAL Γ₋] normalized BC |n·∇φ|/|∇φ|", rn)
 
     # Flux neutrality on Γ₋ (should be ~0)
     # reuse the ring weights from the constraint stage
-    n_dot_grad_ring = jnp.sum(N * grad_on_ring, axis=1)
     flux = float(jnp.dot(W_ring, n_dot_grad_ring))
     area_ring = float(jnp.sum(W_ring))
     print(f"[CHK] Flux neutrality on Γ₋: ∫ n·∇φ dS ≈ {flux:.6e}  (avg={flux/area_ring:.3e})")
+    d = jnp.linalg.norm(grad_fn(P) - grad_fn(P - (eps_n / scinfo.scale) * N)) / (jnp.linalg.norm(grad_fn(P)) + 1e-30)
+    print("[CHK] rel change of grad between Γ and Γ_-:", float(d))
+    
+    # === Adaptive up-sampling of boundary where BC error is high ===
+    rn = jnp.abs(jnp.sum(N * grad_on_ring, axis=1)) / jnp.maximum(1e-30, jnp.linalg.norm(grad_on_ring, axis=1))
+    thresh = float(np.percentile(np.asarray(rn), 90))
+    mask_refine = np.asarray(rn) > thresh
+    print(f"[ADAPT] refining {mask_refine.sum()} / {len(mask_refine)} boundary points with high BC error (>p90).")
+    if mask_refine.sum() > 0:
+        # simple duplication + small jitter in tangent plane (keeps normals)
+        Pref = np.asarray(P)[mask_refine]
+        Nref = np.asarray(N)[mask_refine]
+        # jitter in tangent plane to avoid duplicates
+        rng = np.random.default_rng(seed)
+        jitter = rng.normal(scale=0.01*np.median(np.linalg.norm(P,axis=1)), size=Pref.shape)
+        jitter -= (np.sum(jitter*Nref,axis=1,keepdims=True))*Nref  # project tangent
+        Pref2 = Pref + 0.2*jitter
+        Nref2 = Nref  # reuse normals
+        P_aug = jnp.asarray(np.vstack([P, Pref2]))
+        N_aug = jnp.asarray(np.vstack([N, Nref2]))
+        # rebuild everything quick:
+        Pn_aug, scinfo_aug = normalize_geometry(P_aug, verbose=False)
+        W_aug, rk_aug = kNN_geometry_stats(Pn_aug, k=k_nn, verbose=False)
+        best_aug = autotune_outer(P_aug, N_aug, Pn_aug, N_aug, W_aug, rk_aug, scinfo_aug,
+                                  use_mv=use_mv, verbose=False,
+                                  sf_min=sf_min, sf_max=sf_max,
+                                  lbfgs_maxiter=lbfgs_maxiter_final, lbfgs_tol=lbfgs_tol)
+        Yn_aug, _ = build_mfs_sources(Pn_aug, N_aug, rk_aug, scinfo_aug, source_factor=best_aug["source_factor"], verbose=False)
+        A_aug, _ = build_system_matrices(
+            Pn_aug, N_aug, Yn_aug, W_aug,
+            best_aug["grad_t"], best_aug["grad_p"], scinfo_aug,
+            use_mv=True, center_D=True, verbose=False,
+            h_grads=best_aug["h_grads"]
+        )
+        gt_b = best_aug["grad_t"](Pn_aug); gp_b = best_aug["grad_p"](Pn_aug)
+        a_aug = best_aug["a"]
+        g_aug = scinfo_aug.scale * jnp.sum(N_aug * (a_aug[0]*gt_b + a_aug[1]*gp_b), axis=1)
+        alpha_aug = solve_alpha_with_rhs(A_aug, W_aug, g_aug, lam=best_aug["lambda_reg"], verbose=True)
+        print("[ADAPT] Re-solve done on augmented boundary.")
+        # overwrite current solution objects if you want to proceed with augmented solve
+        P, N, Pn, scinfo, W, rk, Yn = P_aug, N_aug, Pn_aug, scinfo_aug, W_aug, rk_aug, Yn_aug
+        phi_fn, grad_fn, psi_fn, grad_psi_fn, lap_psi_fn, _ = build_evaluators_mfs_plusH(
+            Pn, Yn, alpha_aug,
+            best_aug["phi_t"], best_aug["phi_p"], a_aug, scinfo,
+            best_aug["grad_t"], best_aug["grad_p"],
+            h_vals=best_aug["h_vals"], h_grads=best_aug["h_grads"]
+        )
+        alpha = alpha_aug
+        # overwrite current solution objects
+        P, N, Pn, scinfo, W, rk, Yn = P_aug, N_aug, Pn_aug, scinfo_aug, W_aug, rk_aug, Yn_aug
+
+        # keep h_med consistent with the new boundary
+        h_med = float(np.median(np.asarray(rk)))
+
+        # use *optimized* eps from the new autotune
+        eps_n = float(best_aug["eps_n_star"])
+        eps_w = eps_n / float(np.asarray(scinfo.scale))
+        P_in  = P - eps_w * N
+
+        # recompute diagnostics on the new ring
+        grad_on_ring = grad_fn(P_in)
+        lap_in       = lap_psi_fn(P_in)
 
     def grad_cyl_about_axis(P, a_hat):
         # ∇ϕ_a = (a × r_perp)/|r_perp|^2 with r_perp = (X - c) - ((X - c)·a)a
@@ -1319,10 +1795,28 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     print("median cos(angle(grad_t, axis-aware cylindrical)) ≈", np.median(c))
 
     # Laplacian(ψ) near boundary (independent check)
-    lap_in = lap_psi_fn(P_in)
+    eps_w = float(eps_n) / float(np.asarray(scinfo.scale))
+    P_in  = P - eps_w * N
+
+    # (RE)build ring weights to match the CURRENT P_in
+    W_ring = build_ring_weights(P_in, Pn, k=k_nn)
+
+    # now safe to run diagnostics
+    grad_on_ring = grad_fn(P_in)
+    lap_in       = lap_psi_fn(P_in)
+
     vec_stats("[LAP Γ₋] |∇²ψ|", jnp.abs(lap_in))
 
-    # Plots (all on Γ₋)
+    print_final_diagnostics(
+        tag="post-solve",
+        P=P, N=N, W=W, W_ring=W_ring, scinfo=scinfo,
+        eps_n=eps_n, lam=lambda_reg_opt, source_factor=source_factor_opt,
+        a=a, alpha=alpha, grad_fn=grad_fn, lap_psi_fn=lap_psi_fn,
+        A_aug_bdry=A_bdry, constraints=constraints, recompute_W_ring=False,
+        Pn=Pn, Yn=Yn, h_grads=h_grads, grad_t_fn=grad_t, grad_p_fn=grad_p
+    )
+
+
     plot_geometry_and_solution(P, N, grad_on_ring, title_suffix="",
                            show_normals=show_normals, kind=kind, a_hat=best.get("a_hat", None))
     plot_boundary_condition_errors(P, N, grad_on_ring)
@@ -1359,15 +1853,19 @@ if __name__ == "__main__":
     ap.add_argument("--lbfgs-maxiter", type=int, default=5, help="Max iterations for L-BFGS")
     ap.add_argument("--lbfgs-tol", type=float, default=1e-8, help="Tolerance for L-BFGS")
     ap.add_argument("--k-nn", type=int, default=64) # this sets the k for kNN weights & scales (computational cost)
-    ap.add_argument("--use-mv", action="store_true")
-    ap.add_argument("--mv-weight", type=float, default=0.5)
+    ap.add_argument("--no-mv",  dest="use_mv", action="store_false", help="Disable multivalued harmonic field")
     ap.add_argument("--interior-eps-factor", type=float, default=5e-3)
-    ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--show-normals", action="store_true")
+    ap.add_argument("--verbose", action="store_true", default=True, help="Enable verbose output")
+    ap.add_argument("--show-normals", action="store_true", help="Show surface normals in plots")
     ap.add_argument("--toroidal-flux", type=float, default=None,
                     help="If set, prescribes the toroidal flux Φ_t (sets a_t = Φ_t/(2π))")
     ap.add_argument("--mfs-out", default=None,
                     help="Write portable MFS solution to this .npz (center,scale,Yn,alpha,a,a_hat,P,N,kind)")
+    ap.add_argument("--seed", type=int, default=None, help="Random seed for refinement jitter")
+    ap.add_argument("--lbfgs-maxiter-final", type=int, default=10,
+                    help="Max iterations for L-BFGS on final solve after refinement")
+    ap.add_argument("--reg-gamma-a", type=float, default=1e-2,
+                    help="Relative reg on a: uses (λ*reg_gamma_a)^2 on the last 2 columns")
     args = ap.parse_args()
 
     if args.mfs_out == None:
@@ -1375,14 +1873,15 @@ if __name__ == "__main__":
 
     out = main(
         xyz_csv=args.xyz, nrm_csv=args.normals,
-        use_mv=args.use_mv or True, k_nn=args.k_nn,
-        mv_weight=args.mv_weight,
+        use_mv=args.use_mv, k_nn=args.k_nn,
         interior_eps_factor=args.interior_eps_factor,
-        verbose=args.verbose or True,
+        verbose=args.verbose,
         show_normals=args.show_normals,
         toroidal_flux=args.toroidal_flux,
         sf_min=args.sf_min, sf_max=args.sf_max,
-        lbfgs_maxiter=args.lbfgs_maxiter, lbfgs_tol=args.lbfgs_tol
+        lbfgs_maxiter=args.lbfgs_maxiter, lbfgs_tol=args.lbfgs_tol,
+        seed=args.seed, lbfgs_maxiter_final=args.lbfgs_maxiter_final,
+        reg_gamma_a=args.reg_gamma_a
     )
 
     # --- SAVE a portable checkpoint for the tracer ---
