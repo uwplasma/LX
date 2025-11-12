@@ -364,27 +364,53 @@ def _matvec_full(u, nx, ny, nz, dx, dy, dz, inside_3, D3):
     divF[~inside_3] = 0.0
     return (-divF).ravel(order="C")
 
-def apply_symmetric_fci(u, fci):
-    # u: (N,)
-    up = np.sum(u[fci["idxp"]] * fci["wp"], axis=1)  # W_+ u
-    um = np.sum(u[fci["idxm"]] * fci["wm"], axis=1)  # W_- u
+def apply_symmetric_fci_full(u, fci, alpha_par=1.0):
+    idxp, wp, in_p = fci["idxp"], fci["wp"], fci["in_p"]
+    idxm, wm, in_m = fci["idxm"], fci["wm"], fci["in_m"]
+    step = np.maximum(1e-30, fci["step"])
+
+    up = np.sum(u[idxp] * wp, axis=1); up = np.where(in_p, up, u)
+    um = np.sum(u[idxm] * wm, axis=1); um = np.where(in_m, um, u)
+
     r  = np.zeros_like(u)
-
-    # (W_+ - I)^T (W_+ - I) u
-    # y = (W_+ - I) u = up - u
+    # (W+ - I) part
     y = up - u
-    # scatter-add W_+^T y
-    np.add.at(r, fci["idxp"].ravel(), (fci["wp"].ravel() * np.repeat(y, 8)))
-    r -= y  # the "- I" transpose part
-
-    # (W_- - I)^T (W_- - I) u
+    np.add.at(r, idxp.ravel(), (wp.ravel() * np.repeat(y, 8)))
+    r -= y
+    # (W- - I) part
     y = um - u
-    np.add.at(r, fci["idxm"].ravel(), (fci["wm"].ravel() * np.repeat(y, 8)))
+    np.add.at(r, idxm.ravel(), (wm.ravel() * np.repeat(y, 8)))
     r -= y
 
-    return r / (fci["step"]**2)
+    return alpha_par * (r / (step**2))
 
-def make_linear_operator(nx, ny, nz, dx, dy, dz, inside, Dperp, fixed_mask, fixed_val, fci=None):
+def smooth_vec3_box(nx, ny, nz, V, passes=1):
+    """
+    3D 6-neighbor box smoother for a vector field V of shape (N,3) laid out as (nx,ny,nz).
+    Returns smoothed and renormalized field (zero where original magnitude ~0).
+    """
+    V3 = V.reshape(nx, ny, nz, 3).copy()
+    for _ in range(max(0, passes)):
+        W = np.zeros_like(V3)
+        C = np.ones((nx,ny,nz,1))  # center weight 1
+        # 6-neighbors (no diagonals)
+        W[1:,:,:]   += V3[:-1,:,:];   C[1:,:,:]   += 1
+        W[:-1,:,:]  += V3[1:,:,:];    C[:-1,:,:]  += 1
+        W[:,1:,:]   += V3[:,:-1,:];   C[:,1:,:]   += 1
+        W[:,:-1,:]  += V3[:,1:,:];    C[:,:-1,:]  += 1
+        W[:,:,1:]   += V3[:,:,:-1];   C[:,:,1:]   += 1
+        W[:,:,:-1]  += V3[:,:,1:];    C[:,:,:-1]  += 1
+        V3 = (V3 + W) / np.maximum(C, 1.0)
+
+    Vflat = V3.reshape(-1,3)
+    nrm = np.linalg.norm(Vflat, axis=1, keepdims=True)
+    good = (nrm[:,0] > 1e-12)
+    Vout = np.zeros_like(Vflat)
+    Vout[good] = Vflat[good] / nrm[good]
+    return Vout
+
+
+def make_linear_operator(nx, ny, nz, dx, dy, dz, inside, Dperp, fixed_mask, fixed_val, fci=None, alpha_par=1.0):
     """
     Build a LinearOperator A_full such that A_full @ u_full returns
     the residual of the stamped system:
@@ -395,25 +421,23 @@ def make_linear_operator(nx, ny, nz, dx, dy, dz, inside, Dperp, fixed_mask, fixe
     inside_3 = inside.reshape(nx,ny,nz)
     # D3 = Dfield.reshape(nx,ny,nz,3,3)
     D3 = Dperp.reshape(nx,ny,nz,3,3)
-
-    fixed_mask = fixed_mask.astype(bool)
-    rows_fixed = np.where(fixed_mask)[0] 
+    rows_fixed = np.where(fixed_mask)[0]
+    inside_rows = np.where(inside.ravel(order="C"))[0]  # flat indices of interior
 
     def matvec(u):
         # ⊥ part (matrix-free face flux with D_perp)
         out = _matvec_full(u, nx, ny, nz, dx, dy, dz, inside_3, D3)
         # ∥ part via FCI (discrete 1D Laplacian along field lines)
         if fci is not None:
-            # gather trilinear interpolants at footpoints
-            # (N,8) -> (N,), u is (N,)
-            up = np.sum(u[fci["idxp"]] * fci["wp"], axis=1)
-            um = np.sum(u[fci["idxm"]] * fci["wm"], axis=1)
-            # out += (up - 2.0*u + um) / (fci["step"]**2)
-            out += apply_symmetric_fci(u, fci)
+            r_par_full = apply_symmetric_fci_full(u, fci, alpha_par=alpha_par)
+            out += r_par_full
             
-        # Dirichlet stamping on fixed rows: u - fixed_val
-        out[rows_fixed] = u[rows_fixed] - fixed_val[rows_fixed]   # NEW
-        return out                                                # NEW
+        # Dirichlet stamping last (overrides any accumulation on fixed rows)
+        out[rows_fixed] = u[rows_fixed] - fixed_val[rows_fixed]
+
+        # safety: zero outside-of-domain rows
+        out[~inside.ravel(order="C")] = 0.0
+        return out
 
     N = nx*ny*nz
     return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
@@ -431,43 +455,54 @@ def _trilinear_weights_indices(Xp, xs, ys, zs, nx, ny, nz):
        - w8  : (N,8) weights that sum to 1 for each row
     Points outside the bbox are clamped to nearest cell for stability."""
     x, y, z = Xp[:,0], Xp[:,1], Xp[:,2]
-    i = _search_indices(x, xs)
-    j = _search_indices(y, ys)
-    k = _search_indices(z, zs)
+    i = _search_indices(x, xs); j = _search_indices(y, ys); k = _search_indices(z, zs)
     x0, x1 = xs[i], xs[i+1]; y0, y1 = ys[j], ys[j+1]; z0, z1 = zs[k], zs[k+1]
-    # barycentric coords in each cell
     with np.errstate(divide="ignore", invalid="ignore"):
         fx = (x - x0) / np.maximum(x1 - x0, 1e-30)
         fy = (y - y0) / np.maximum(y1 - y0, 1e-30)
         fz = (z - z0) / np.maximum(z1 - z0, 1e-30)
     fx = np.clip(fx, 0.0, 1.0); fy = np.clip(fy, 0.0, 1.0); fz = np.clip(fz, 0.0, 1.0)
-    # 8 corners, C-order flat index: p = i + nx*(j + ny*k)
     def flat(ii, jj, kk): return (ii + nx*(jj + ny*kk)).astype(np.int64)
-    i0, j0, k0 = i, j, k
-    i1, j1, k1 = i+1, j+1, k+1
-    idx000 = flat(i0, j0, k0); idx100 = flat(i1, j0, k0)
-    idx010 = flat(i0, j1, k0); idx110 = flat(i1, j1, k0)
-    idx001 = flat(i0, j0, k1); idx101 = flat(i1, j0, k1)
-    idx011 = flat(i0, j1, k1); idx111 = flat(i1, j1, k1)
-    idx8 = np.stack([idx000, idx100, idx010, idx110, idx001, idx101, idx011, idx111], axis=1)
-    wx0, wx1 = (1.0 - fx), fx
-    wy0, wy1 = (1.0 - fy), fy
-    wz0, wz1 = (1.0 - fz), fz
-    w000 = wx0*wy0*wz0; w100 = wx1*wy0*wz0
-    w010 = wx0*wy1*wz0; w110 = wx1*wy1*wz0
-    w001 = wx0*wy0*wz1; w101 = wx1*wy0*wz1
-    w011 = wx0*wy1*wz1; w111 = wx1*wy1*wz1
-    w8 = np.stack([w000, w100, w010, w110, w001, w101, w011, w111], axis=1)
+    i0, j0, k0 = i, j, k; i1, j1, k1 = i+1, j+1, k+1
+    idx8 = np.stack([flat(i0,j0,k0), flat(i1,j0,k0), flat(i0,j1,k0), flat(i1,j1,k0),
+                     flat(i0,j0,k1), flat(i1,j0,k1), flat(i0,j1,k1), flat(i1,j1,k1)], axis=1)
+    wx0, wx1 = (1.0 - fx), fx; wy0, wy1 = (1.0 - fy), fy; wz0, wz1 = (1.0 - fz), fz
+    w8 = np.stack([wx0*wy0*wz0, wx1*wy0*wz0, wx0*wy1*wz0, wx1*wy1*wz0,
+                   wx0*wy0*wz1, wx1*wy0*wz1, wx0*wy1*wz1, wx1*wy1*wz1], axis=1)
     return idx8, w8
 
-def precompute_fci(xs, ys, zs, Xq, t_hat, step):
-    """Precompute FCI footpoint interpolation for ± step along t_hat."""
-    Xplus  = Xq + step * t_hat
-    Xminus = Xq - step * t_hat
+def precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, inside_bool):
+    """
+    Per-node +/- footpoints with per-node step length:
+      X± = Xq ± step_vec * t_hat
+    Returns dict with (idx,w) for ±, the per-node 'step_vec', and masks that say
+    whether each footpoint stayed inside (so we can null its contribution).
+    """
+    step_vec = np.asarray(step_vec).reshape(-1, 1)
+    th = np.asarray(t_hat)
+    Xplus  = Xq + step_vec * th
+    Xminus = Xq - step_vec * th
+
     nx, ny, nz = len(xs), len(ys), len(zs)
     idxp, wp = _trilinear_weights_indices(Xplus,  xs, ys, zs, nx, ny, nz)
     idxm, wm = _trilinear_weights_indices(Xminus, xs, ys, zs, nx, ny, nz)
-    return dict(idxp=idxp, wp=wp, idxm=idxm, wm=wm, step=float(step))
+
+    # mark footpoints that land outside the computational bbox or outside interior
+    # (nearest-cell trilinear ensures "in bbox", but they may be outside 'inside' set)
+    inside_3 = inside_bool.reshape(nx, ny, nz)
+    # Center-cell inside test: pick the (i,j,k) lower corner and test that voxel's center
+    def center_inside(idx8):
+        i = idx8[:,0] % nx
+        j = (idx8[:,0] // nx) % ny
+        k = idx8[:,0] // (nx*ny)
+        # center voxel index = (i,j,k); if that cell center is inside, accept
+        return inside_3.ravel(order="C")[i + nx*(j + ny*k)]
+
+    in_p = center_inside(idxp)
+    in_m = center_inside(idxm)
+
+    return dict(idxp=idxp, wp=wp, idxm=idxm, wm=wm, step=step_vec.flatten(),
+                in_p=in_p, in_m=in_m)
 
 def diffusion_tensor_perp(gradphi, eps, delta=1e-2):
     """D_perp = eps*(I - t t^T) + delta*I."""
@@ -735,7 +770,7 @@ def rz_box_for_phi(P, phi0, pad=0.05):
 # ------------------------------- Main flow ------------------------------- #
 def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band_radius=0.0,
          cg_tol=1e-8, cg_maxit=2000, verbose=True, plot=True, psi0=0.3, nfp=2, psi_levels="",
-         save_figures=True, fci_step_cells=1.0):
+         save_figures=True, fci_step_cells=1.0, alpha_par=1.0):
 
     pinfo(f"Loading MFS checkpoint: {npz_file}")
     dat = np.load(npz_file, allow_pickle=True)
@@ -886,6 +921,18 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     # Split tensor: D_perp only (parallel handled by FCI)
     D_perp = diffusion_tensor_perp(G, eps=eps, delta=1e-2)
     
+    # report tiny-gradient fraction
+    tiny = (gnorm[:,0] <= 1e-10)
+    pinfo(f"[∇φ] tiny-norm fraction = {100.0*tiny.mean():.2f}%  (<=1e-10)")
+
+    # OPTIONAL smoothing passes on t̂ to suppress noise-driven cross diffusion
+    smooth_passes = 1  # try 1–2; set to 0 to disable
+    if smooth_passes > 0:
+        t_hat_sm = smooth_vec3_box(nx, ny, nz, t_hat, passes=smooth_passes)
+        # where grad was tiny, keep zeros; elsewhere use the smoothed dir
+        t_hat[~tiny] = t_hat_sm[~tiny]
+        pinfo(f"[t̂] smoothed with {smooth_passes} pass(es)")
+    
     # Fallback: build an axis band from low-|∇φ| skeleton if empty
     if not np.any(axis_band):
         pinfo("[AXIS] collapse-based axis band empty; using low-|∇φ| fallback.")
@@ -962,10 +1009,50 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
 
     pinfo("Building matrix-free LinearOperator ...")
     # A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D, fixed, val)
-    # FCI precompute (use only where we have a valid t-hat; elsewhere it collapses to center)
-    step_len = float(fci_step_cells) * min(dx, dy, dz)
-    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_len)
-    A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val, fci=fci)
+    # per-node "voxel length" along t-hat (Pythagorean in grid coords)
+    hx = dx*np.abs(t_hat[:,0]); hy = dy*np.abs(t_hat[:,1]); hz = dz*np.abs(t_hat[:,2])
+    h_par = np.maximum(1e-12, np.sqrt(hx*hx + hy*hy + hz*hz))
+    # user knob; keep ~1 cell along field by default
+    step_cells = float(fci_step_cells)
+    def build_fci_with(step_cells_try):
+        step_vec_try = np.maximum(1e-12, step_cells_try * np.sqrt((dx*np.abs(t_hat[:,0]))**2 +
+                                                                   (dy*np.abs(t_hat[:,1]))**2 +
+                                                                   (dz*np.abs(t_hat[:,2]))**2))
+        return precompute_fci(xs, ys, zs, Xq, t_hat, step_vec_try,
+                              inside & (~band) & (~axis_band)), step_vec_try
+
+    target_valid = 0.60  # 60% of nodes with valid +/- footpoints
+    for attempt in range(8):
+        fci, step_vec = build_fci_with(step_cells)
+        valrate = 0.5*(np.mean(fci["in_p"]) + np.mean(fci["in_m"]))
+        pinfo(f"[FCI] step_cells={step_cells:.3f} → valid ± average={100*valrate:.1f}%")
+        if valrate >= target_valid or step_cells < 0.05:
+            break
+        step_cells *= 0.6  # shrink and retry
+
+    # FCI precompute (masked) using INSIDE to prevent cross-boundary leakage
+    effective_inside = inside & (~band) & (~axis_band)
+    # pass effective_inside to precompute_fci instead of inside
+    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, effective_inside)
+    pinfo(f"[FCI] step_cells={step_cells:.2f}; "
+        f"median step={np.median(step_vec):.3e}  min/max={step_vec.min():.3e}/{step_vec.max():.3e}")
+    pinfo(f"[FCI] valid +footpoints: {100.0*np.mean(fci['in_p']):.1f}%   "
+        f"valid -footpoints: {100.0*np.mean(fci['in_m']):.1f}%")
+    
+    # Cheap leakage probe: how often are the +/− footpoints crossing the boundary band?
+    in_band = band
+    cross_p = np.any(in_band[fci["idxp"]], axis=1)  # any of the 8 corners lies in band
+    cross_m = np.any(in_band[fci["idxm"]], axis=1)
+    pinfo(f"[FCI] crosses boundary band: + {100.0*np.mean(cross_p):.1f}% , - {100.0*np.mean(cross_m):.1f}%")
+
+    # Report alignment per-decile (after solve we do a histogram already, this is pre-solve geometry)
+    gcos = np.abs( (t_hat * (G/np.maximum(gnorm,1e-30))).sum(axis=1) )
+    gcos = gcos[inside]
+    for p in (50, 75, 90, 95, 99):
+        print(f"[pre] |t̂·ĝ| perc {p:2d}: {np.percentile(gcos, p):.3e}")
+    
+    A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val,
+                              fci=fci, alpha_par=alpha_par)
     
     def Afree_matvec(x_f):
         x_full = np.array(val, copy=True); x_full[free] = x_f
@@ -1007,13 +1094,20 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
 
     # consistency of CSR vs matvec on the same vector
     # 2) CSR vs matvec: compare linear parts (no RHS)
-    # A_ff_csr, _, _ = build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, D, val)
-    # Preconditioner on ⊥ block only
     A_ff_csr, _, _ = build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, D_perp, val)
+    # Preconditioner on ⊥ block only
+    A_full_no_fci = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val, fci=None)
+    def Afree_linear_matvec_no_fci(x_f):
+        x_full = np.zeros_like(val)
+        x_full[free] = x_f
+        r_full = A_full_no_fci @ x_full
+        return r_full[free]
+    A_free_no_fci = LinearOperator((fidx.size, fidx.size), matvec=Afree_linear_matvec_no_fci,
+                                rmatvec=Afree_linear_matvec_no_fci, dtype=float)
     psi_test = np.random.default_rng(2).standard_normal(fidx.size)
-    Apsi_matvec = A_free @ psi_test
-    Apsi_csr    = A_ff_csr @ psi_test
-    print("||A_matvec - A_csr|| / ||A||:", np.linalg.norm(Apsi_matvec - Apsi_csr) / max(1e-16, np.linalg.norm(Apsi_csr)))
+    print("||A_no_fci_matvec - A_csr|| / ||A_csr|| =",
+        np.linalg.norm((A_free_no_fci @ psi_test) - (A_ff_csr @ psi_test)) /
+        max(1e-16, np.linalg.norm(A_ff_csr @ psi_test)))
 
     # Check SPD-ish numerics
     eig_diag = np.min(np.stack([Dxx, Dyy, Dzz], axis=-1), axis=-1)
@@ -1042,54 +1136,55 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     # Preconditioner: AMG built on a cheap isotropic Laplacian over free nodes (setup once)
     try:
         pinfo("[PCG] Building AMG on the true anisotropic operator (free rows) ...")
-        A_ff_csr, b_free_csr, fidx_csr = build_aniso_csr_free(
-            nx, ny, nz, dx, dy, dz, inside, fixed, D_perp, val
-        )
-        def probe_symmetry_csr(A):
-            rng = np.random.default_rng(0)
-            x = rng.standard_normal(A.shape[0]); y = rng.standard_normal(A.shape[0])
-            lhs = float(x @ (A @ y))
-            rhs = float((A @ x) @ y)
-            den = max(1e-16, abs(lhs) + abs(rhs))
-            return abs(lhs - rhs)/den
-        pinfo(f"[A_ff_csr symmetry probe] {probe_symmetry_csr(A_ff_csr):.3e}")
-        diag_par = 2.0 / (fci["step"]**2) * np.ones(A_ff_csr.shape[0])
-        A_ff_csr_plus = A_ff_csr + spdiags(diag_par, 0, A_ff_csr.shape[0], A_ff_csr.shape[1])
-        ml = smoothed_aggregation_solver(
-            A_ff_csr_plus,
-            symmetry='symmetric',
-            strength=('symmetric', {'theta': 0.04}),
-            smooth=('energy', {'krylov': 'cg', 'degree': 2}),
-            presmoother=('gauss_seidel', {'sweep': 'symmetric'}),
-            postsmoother=('gauss_seidel', {'sweep': 'symmetric'}),
-            max_coarse=400,
-            aggregate='standard',
-            improve_candidates=None,
-            B=np.ones((A_ff_csr.shape[0], 1))
-        )
-        M_amg = ml.aspreconditioner(cycle='W')
 
-        dfine = np.maximum(1e-12, np.asarray(ml.levels[0].A.diagonal()))
-        Dm12  = 1.0 / np.sqrt(dfine)
+        # --- Ensure CSR float64 and strictly positive diagonal
+        A_ff_csr = A_ff_csr.astype(np.float64).tocsr(copy=True)
+        d = A_ff_csr.diagonal().copy()
+        neg_or_zero = d <= 0.0
+        if np.any(neg_or_zero):
+            A_ff_csr = A_ff_csr + coo_matrix(( (1e-12 - d[neg_or_zero]),
+                                               (np.where(neg_or_zero)[0],
+                                                np.where(neg_or_zero)[0]) ),
+                                              shape=A_ff_csr.shape).tocsr()
 
+        # --- Add simple ∥ diagonal to better match A_free (still SPD & symmetric)
+        step_free = np.maximum(1e-30, fci["step"][free])  # (n_free,)
+        diag_par  = 2.0 / (step_free**2)
+        A_ff_csr_plus = A_ff_csr.copy()
+        A_ff_csr_plus.setdiag(A_ff_csr_plus.diagonal() + diag_par)
+
+        # --- Prefer SA; if it fails anywhere, try RS; else Jacobi
+        ml = None
+        try:
+            from pyamg import smoothed_aggregation_solver as SA
+            ml = SA(A_ff_csr_plus, max_levels=20, max_coarse=200)
+            which = "SA"
+        except Exception as e1:
+            pinfo(f"[PCG] SA failed: {e1}  → trying Ruge–Stüben")
+            from pyamg import ruge_stuben_solver as RS
+            ml = RS(A_ff_csr_plus, max_levels=20, max_coarse=200)
+            which = "RS"
+
+        M_par = ml.aspreconditioner()
+
+        # Symmetric Jacobi scaling around AMG
+        Dfine = np.maximum(1e-12, np.asarray(ml.levels[0].A.diagonal()))
+        Dm12  = 1.0/np.sqrt(Dfine)
         def M_apply(x):
             y = Dm12 * x
-            y = M_amg @ y
+            y = M_par @ y
             y = Dm12 * y
             return y
 
-        # Wrap as LinearOperator
         M = LinearOperator((b_free.size, b_free.size), matvec=M_apply, rmatvec=M_apply, dtype=float)
-
-        # ---------- sanity probe ----------
-        vtest = np.random.default_rng(0).standard_normal(b_free.size)
-        ytest = M @ vtest
+        # Sanity check
+        ytest = M @ np.ones_like(b_free)
         if not np.all(np.isfinite(ytest)):
-            raise RuntimeError("AMG preconditioner produced non-finite values; falling back.")
-        pinfo("[PCG] AMG preconditioner ready (finite check OK)")
+            raise RuntimeError("AMG preconditioner produced non-finite values.")
+        pinfo(f"[PCG] {which} AMG preconditioner ready")
     except Exception as e:
         pinfo(f"[PCG] Using Jacobi preconditioner ({e})")
-        diag_approx = np.maximum(1e-8, np.ones_like(b_free))  # crude but safe
+        diag_approx = np.maximum(1e-8, np.ones_like(b_free))
         def M_apply(x): return x / diag_approx
         M = LinearOperator((b_free.size, b_free.size), matvec=M_apply, rmatvec=M_apply, dtype=float)
         
@@ -1101,7 +1196,25 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     
     pinfo("CG solve (matrix-free, SPD) ...")
     t0 = time.time()
-    psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M, x0=x0_f)
+    
+    # psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M, x0=x0_f)
+    psi_f = None
+    for e in eps_schedule(eps):            # e.g. [0.3, 0.12, final]
+        D_perp = diffusion_tensor_perp(G, eps=e, delta=1e-2)
+        # rebuild A_full / A_free with this D_perp
+        A_full  = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val, fci=fci)
+        def Afree_linear_matvec(x_f):
+            x_full = np.zeros_like(val); x_full[free] = x_f
+            return (A_full @ x_full)[free]
+        A_free = LinearOperator((fidx.size, fidx.size), matvec=Afree_linear_matvec, rmatvec=Afree_linear_matvec, dtype=float)
+        # RHS stays the same (depends only on fixed stamping)
+        if psi_f is None:
+            x0_f = M @ b_free if 'M' in locals() else np.zeros_like(b_free)
+        else:
+            x0_f = psi_f                         # warm start from last stage
+        psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M, x0=x0_f)
+
+    
     if (not np.all(np.isfinite(psi_f))) or (info > 0):
         pinfo(f"[CG] status={info}. Retrying CG with Jacobi (symmetric) preconditioner.")
         # symmetric Jacobi:
@@ -1255,6 +1368,28 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         par_core = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz)  # same shape
         with np.errstate(divide='ignore', invalid='ignore'):
             q = np.abs(par_core) / np.maximum(grad_mag, 1e-14)
+            
+        qv = np.abs(par_core)[mask_mid].ravel() / np.maximum(grad_mag[mask_mid].ravel(), 1e-14)
+        for p in (50, 75, 90, 95, 99):
+            print(f"q perc {p:2d}: {np.percentile(qv, p):.3e}")
+            
+    # Per-shell (R bins) median of alignment in the core
+    Rmid3 = np.sqrt(XX[1:-1,1:-1,1:-1]**2 + YY[1:-1,1:-1,1:-1]**2)              # keep 3-D
+    rm    = Rmid3[mask_mid]                                                     # → 1-D
+    qcore = q[mask_mid]                                                         # → 1-D
+    if qcore.size:
+        bins = np.quantile(rm, [0.0, 0.25, 0.5, 0.75, 1.0])
+        for b0, b1 in zip(bins[:-1], bins[1:]):
+            sel = (rm >= b0) & (rm < b1)
+            if sel.any():
+                print(f"[core] R∈[{b0:.3f},{b1:.3f})  median(q)={np.median(qcore[sel]):.3e}  n={sel.sum()}")
+    if qcore.size:
+        bins = np.quantile(rm, [0.0, 0.25, 0.5, 0.75, 1.0])
+        for b0, b1 in zip(bins[:-1], bins[1:]):
+            sel = (rm>=b0) & (rm<b1)
+            if sel.any():
+                print(f"[core] R∈[{b0:.3f},{b1:.3f})  median(q)={np.median(qcore[sel]):.3e}  n={sel.sum()}")
+            
         # sample only meaningful interior (mask_mid)
         qv = q[mask_mid].ravel()
         ax2.hist(qv, bins=60, alpha=0.8)
@@ -1372,6 +1507,9 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
             figrz.savefig("solve_flux_maps_RZ_planes.png", dpi=150)
         
         plt.show()
+        
+        if save_figures:
+            np.savez("flux_solution.npz", psi=psi, xs=xs, ys=ys, zs=zs, inside=inside)
 
     return dict(psi=psi, grid=(xs,ys,zs), inside=inside, quality=dict(parallel_dot_grad=par, residual=r_full))
 
@@ -1394,11 +1532,12 @@ if __name__ == "__main__":
     ap.add_argument("--psi-levels", type=str, default="0.1,0.3,0.5,0.8",
                     help="comma-separated normalized levels for iso-surface cuts (e.g. '0.2,0.5,0.8'). If empty, use --psi0 only.")
     ap.add_argument("--save-figures", action="store_true", default=True, help="save figures instead of showing interactively")
-    ap.add_argument("--fci-step-cells", type=float, default=1.0,
+    ap.add_argument("--fci-step-cells", type=float, default=0.4,
                     help="FCI step length along t̂ in multiples of the smallest voxel size")
+    ap.add_argument("--alpha-par", type=float, default=1.0, help="scale factor multiplying the parallel (FCI) operator")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
                axis_seed_count=args.axis_seed_count, axis_band_radius=args.axis_band_radius,
                cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, plot=(not args.no_plot), psi0=args.psi0,
                nfp=args.nfp, psi_levels=args.psi_levels, save_figures=args.save_figures,
-               fci_step_cells=args.fci_step_cells)
+               fci_step_cells=args.fci_step_cells, alpha_par=args.alpha_par)
