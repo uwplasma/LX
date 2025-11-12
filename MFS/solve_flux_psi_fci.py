@@ -1634,10 +1634,10 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("npz", nargs="?", default="wout_precise_QH_solution.npz",
+    ap.add_argument("npz", nargs="?", default="wout_precise_QA_solution.npz",
                     help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
-    ap.add_argument("--N", type=int, default=48, help="grid resolution per axis")
+    ap.add_argument("--N", type=int, default=32, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=0.12, help="perpendicular diffusion coefficient (smaller ⇒ more field-aligned)")
     ap.add_argument("--band-h", type=float, default=0.25, help="boundary band thickness multiplier")
     ap.add_argument("--cg-maxit", type=int, default=1000)
