@@ -15,6 +15,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from jax import jit, vmap
+from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 
 # ----------------------------- Utilities ----------------------------- #
@@ -757,7 +758,8 @@ def build_initials(sol, num_surfaces, modes, base_radius, base_height):
     print(f"[SEED] a1_min (tightest) ≈ {a1_min:.4f}; R0_mean ≈ {R0_mean:.6f}")
     return surfaces, x0
 
-def plot_poincare_multi(surfaces, coeffs_blocks, sol, nfp=2, nphi=4, ntheta=360, title="Global flux-surface fit"):
+def plot_poincare_multi(surfaces, coeffs_blocks, sol, nfp=2, nphi=4,
+                        ntheta=360, title="Global flux-surface fit", show=False):
     # cuts: 0 .. 2π/nfp
     phi_list = jnp.linspace(0.0, 2.0*jnp.pi/nfp, nphi, endpoint=False)
     theta = jnp.linspace(0.0, 2.0*jnp.pi, ntheta)
@@ -779,13 +781,13 @@ def plot_poincare_multi(surfaces, coeffs_blocks, sol, nfp=2, nphi=4, ntheta=360,
     ax.set_xlabel("R"); ax.set_ylabel("Z"); ax.set_aspect('equal','box')
     ax.set_title(title + f"  (cuts: {nphi} in [0, 2π/{nfp}])")
 
-    # magnetic axis direction + boundary slice near first cut (as before)
+    # symmetry axis direction + boundary slice near first cut (as before)
     center = np.asarray(sol["center"])
     a_hat  = np.asarray(sol["a_hat"], dtype=float)
     a_hat  = a_hat / np.linalg.norm(a_hat)
     t = np.linspace(-2.0, 2.0, 5)
     axis_pts = center[None,:] + t[:,None] * a_hat[None,:]
-    ax.plot(np.sqrt(axis_pts[:,0]**2 + axis_pts[:,1]**2), axis_pts[:,2], 'k-', lw=1.2, alpha=0.6, label="axis (dir)")
+    ax.plot(np.sqrt(axis_pts[:,0]**2 + axis_pts[:,1]**2), axis_pts[:,2], 'k-', lw=1.2, alpha=0.6, label="symmetry axis (dir)")
 
     # === plot boundary at each φ in phi_list ===
     # --- robust boundary cuts: take K nearest-by-angle, then project exactly ---
@@ -838,7 +840,66 @@ def plot_poincare_multi(surfaces, coeffs_blocks, sol, nfp=2, nphi=4, ntheta=360,
     pad_z = 0.07*(z_hi - z_lo + 1e-6)
     ax.set_xlim(r_lo - pad_r, r_hi + pad_r)
     ax.set_ylim(z_lo - pad_z, z_hi + pad_z)
-    ax.legend(); plt.tight_layout(); plt.show()
+    ax.legend(); plt.tight_layout()
+    
+    if show:
+        plt.show()
+        
+def plot_3d_surfaces(surfaces, coeffs_blocks, sol, ntheta=32, nphi=128, alpha=0.4, show=False):
+    # 3D plot of surfaces + boundary
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot each surface
+    theta_3d = jnp.linspace(0.0, 2.0*jnp.pi, ntheta,)
+    phi_3d   = jnp.linspace(0.0, 2.0*jnp.pi, nphi,)
+    TH_3d, PH_3d = jnp.meshgrid(theta_3d, phi_3d, indexing="ij")
+    
+    colors_3d = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7'])
+    
+    for k, surf in enumerate(surfaces):
+        c = coeffs_blocks[k]
+        pts_3d = surf.cartesian(c, TH_3d, PH_3d)
+        X = np.asarray(pts_3d[..., 0])
+        Y = np.asarray(pts_3d[..., 1])
+        Z = np.asarray(pts_3d[..., 2])
+        
+        col = colors_3d[k % len(colors_3d)]
+        ax.plot_surface(X, Y, Z, alpha=alpha, color=col, edgecolor='none')
+        ax.plot_wireframe(X, Y, Z, alpha=alpha, color=col, linewidth=0.5, rstride=4, cstride=8)
+    
+    # Plot boundary points
+    P_boundary = np.asarray(sol["P"])
+    ax.scatter(P_boundary[:, 0], P_boundary[:, 1], P_boundary[:, 2], 
+                c='black', s=1, alpha=0.5, label='Boundary')
+    
+    # Plot symmetry axis
+    center = np.asarray(sol["center"])
+    a_hat  = np.asarray(sol["a_hat"], dtype=float)
+    a_hat  = a_hat / np.linalg.norm(a_hat)
+    zmin = np.min(P_boundary[:, 2])
+    zmax = np.max(P_boundary[:, 2])
+    a_hat_z = a_hat[2]
+    if abs(a_hat_z) > 1e-12:
+        t_min = (zmin - center[2]) / a_hat_z
+        t_max = (zmax - center[2]) / a_hat_z
+    else:
+        t_min, t_max = -0.5*(zmax - zmin), 0.5*(zmax - zmin)
+    t_axis = np.linspace(t_min, t_max, 20)
+    axis_pts = center[None,:] + t_axis[:,None] * a_hat[None,:]
+    ax.plot(axis_pts[:,0], axis_pts[:,1], axis_pts[:,2], 
+            'r-', linewidth=2, label='symmetry axis')
+    
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('3D Flux Surfaces with Boundary')
+    ax.legend()
+    ax.set_box_aspect([1,1,1])
+    plt.tight_layout()
+    
+    if show:
+        plt.show()
 
 # ------------------------------ Main ---------------------------------- #
 
@@ -846,10 +907,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--solution", type=str, default="wout_precise_QA_solution.npz")
     ap.add_argument("--num-surfaces", type=int, default=2)
-    ap.add_argument("--mmax", type=int, default=2)
-    ap.add_argument("--nmax", type=int, default=2)
-    ap.add_argument("--grid-theta", type=int, default=12)
-    ap.add_argument("--grid-phi", type=int, default=32)
+    ap.add_argument("--mmax", type=int, default=4)
+    ap.add_argument("--nmax", type=int, default=4)
+    ap.add_argument("--grid-theta", type=int, default=8)
+    ap.add_argument("--grid-phi", type=int, default=26)
     ap.add_argument("--max-iter", type=int, default=2)
     ap.add_argument("--verbose", action="store_true", default=True)
     ap.add_argument("--nfp", type=int, default=2)
@@ -942,19 +1003,6 @@ def main():
             preserve=preserve_kind, targets=targets)
         return residual_fn(z_proj)
     
-    print("[PLOT] Seed Poincaré...")
-    coeffs_blocks_seed = []
-    idx = 0
-    for s in surfaces:
-        n = s.M_R + s.M_Z
-        coeffs_blocks_seed.append(x0[idx:idx+n]); idx += n
-
-    plot_poincare_multi(
-        surfaces, coeffs_blocks_seed, sol,
-        nfp=args.nfp, nphi=args.poincare_nphi, ntheta=400,
-        title="Global flux-surface fit (SEED)"
-    )
-
     print("[LM] starting...")
     residual_with_proj = jax.jit(residual_with_proj)
     x_opt = levenberg_marquardt(residual_with_proj, x0, ridge=1e-8, mu0=1e-2,
@@ -975,11 +1023,21 @@ def main():
         n = s.M_R + s.M_Z
         coeffs_blocks.append(x_opt[idx:idx+n]); idx += n
 
-    print("[PLOT] Plotting Poincaré...")
+    print("[PLOT] Seed Poincaré...")
+    coeffs_blocks_seed = []; idx = 0
+    for s in surfaces: coeffs_blocks_seed.append(x0[idx:idx+s.M_R + s.M_Z]); idx += s.M_R + s.M_Z
+    plot_poincare_multi(
+        surfaces, coeffs_blocks_seed, sol,
+        nfp=args.nfp, nphi=args.poincare_nphi, ntheta=100,
+        title="Global flux-surface fit (SEED)", show=False)
+    print("[PLOT] Poincaré.")
     plot_poincare_multi(surfaces, coeffs_blocks, sol,
-                        nfp=args.nfp, nphi=args.poincare_nphi, ntheta=400,
-                        title="Global flux-surface fit")
+                        nfp=args.nfp, nphi=args.poincare_nphi, ntheta=100,
+                        title="Global flux-surface fit", show=False)
+    print("[PLOT] 3D surfaces.")
+    plot_3d_surfaces(surfaces, coeffs_blocks, sol, show=False)
     print("[DONE]")
+    plt.show()
 
 if __name__ == "__main__":
     main()

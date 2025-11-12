@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Global field-aligned flux function ψ via anisotropic diffusion:
-    div( D(x) ∇ψ ) = 0,  D = P_perp + eps * P_par,  t = grad φ / |grad φ|
+    div( D(x) ∇ψ ) = 0,  D = eps P_perp + 1·P_par,  t = grad φ / |grad φ|
 BCs: ψ=1 on Γ (thin boundary band), ψ=0 on axis band (detected by short gradient-flow collapse).
 This makes ψ ~ constant along grad φ while diffusing across it → nested level sets.
 
@@ -12,25 +12,39 @@ Refs (theory & numerics):
 """
 
 from __future__ import annotations
-import argparse, time, sys, math, os
+import argparse, time
 import numpy as np
 import jax; jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from jax import jit, vmap, jacrev
+from jax import jit, vmap
 from dataclasses import dataclass
 from sklearn.neighbors import NearestNeighbors
-from scipy.sparse import coo_matrix, csr_matrix
-from scipy.sparse.linalg import cg
+from scipy.sparse import coo_matrix, diags as spdiags
 import matplotlib.pyplot as plt
 from skimage.measure import marching_cubes
-from scipy.sparse.linalg import spilu, LinearOperator
+from scipy.sparse.linalg import LinearOperator, cg, minres, gmres
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from pyamg import smoothed_aggregation_solver
+from sklearn.cluster import DBSCAN
+from scipy.interpolate import RegularGridInterpolator as RGI
 
 # ---------------------------- Debug utils ---------------------------- #
 def pct(a, p): return float(np.percentile(np.asarray(a), p))
 def pinfo(msg): print(f"[INFO] {msg}")
 def pstat(msg, v):
     v=np.asarray(v); print(f"[STAT] {msg}: min={v.min():.3e} med={np.median(v):.3e} max={v.max():.3e} L2={np.linalg.norm(v):.3e}")
+
+def probe_symmetry(A, n=3, seed=0):
+    rng = np.random.default_rng(seed)
+    rels = []
+    for _ in range(n):
+        x = rng.standard_normal(A.shape[0])
+        y = rng.standard_normal(A.shape[0])
+        Ax, Ay = A @ x, A @ y
+        num = float(x @ Ay - Ax @ y)
+        denom = float(max(1e-16, abs(x @ Ay) + abs(Ax @ y)))
+        rels.append(abs(num)/denom)
+    return max(rels)
 
 # ------------------- Green's function & gradient (JAX) ------------------- #
 @jit
@@ -142,13 +156,13 @@ def inside_mask_from_surface(P_surf, N_surf, Xq):
 
 
 # ---------------------- Axis seeds by gradient collapse ------------------- #
-def collapse_to_axis(grad_phi, X0, step=0.02, iters=400, tol=1e-6):
+def collapse_to_axis(grad_phi, X0, step=0.02, iters=400, tol=1e-6, dir_sign=+1.0):
     X = jnp.asarray(X0, dtype=jnp.float64)
     @jit
     def one_step(X):
         g = grad_phi(X[None, :])[0]
         n = jnp.linalg.norm(g) + 1e-30
-        return X + step * (g / n)
+        return X - step * dir_sign * (g / n)
     # do the fixed-iteration loop in Python; it's fine since one_step is jitted
     for _ in range(iters):
         X_new = one_step(X)
@@ -163,256 +177,343 @@ def axis_band_mask(P_axis, Xq, rad):
     return (d[:,0] < rad)
 
 # ------------------------- Diffusion tensor and stencil ------------------- #
-def diffusion_tensor(gradphi, eps):
-    # gradphi: (N,3)
-    n = np.linalg.norm(gradphi, axis=-1, keepdims=True)        # (N,1)
-    # t = gradphi / n when n>thr, else 0; this makes D=I in low-|∇φ| regions
-    t = np.divide(gradphi, n, out=np.zeros_like(gradphi), where=n > 1e-10)
-    tt = t[..., :, None] * t[..., None, :]                     # (N,3,3)
-    I  = np.eye(3)[None, :, :]                                 # (1,3,3) -> broadcast
-    D  = (I - tt) + eps * tt
+def diffusion_tensor(gradphi, eps, delta=1e-2):
+    """
+    Build D = R diag(1, eps, eps) R^T + delta I, where the first column of R is t̂.
+    This is equivalent to eps*(I - t̂t̂^T) + t̂t̂^T + delta I but constructed via a
+    numerically stable local frame (t̂, b̂1, b̂2).
+    """
+    I = np.eye(3)[None, :, :]
+    n = np.linalg.norm(gradphi, axis=-1, keepdims=True)
+    t = np.divide(gradphi, n, out=np.zeros_like(gradphi), where=n > 1e-12)  # (N,3)
+
+    # Build b1 robustly: pick an anchor not collinear with t
+    # anchor = e_x unless |t_x| is too large, then use e_y
+    ax = np.abs(t[..., 0]) > 0.70710678
+    anchor = np.zeros_like(t)
+    anchor[~ax, 0] = 1.0  # use ex
+    anchor[ ax, 1] = 1.0  # use ey
+    b1 = np.cross(t, anchor)                                    # (N,3)
+    nb1 = np.linalg.norm(b1, axis=-1, keepdims=True)
+    ok = nb1[:, 0] > 1e-15
+    b1[ok] /= nb1[ok]
+    b1[~ok] = 0.0
+    b2 = np.cross(t, b1)
+
+    # Orthonormal basis matrix R = [t, b1, b2]
+    R = np.stack([t, b1, b2], axis=-1)                          # (N,3,3)
+    # Efficient diag construction (no shape shenanigans):
+    Lam = np.zeros((1, 3, 3), dtype=float)
+    Lam[..., 0, 0] = 1.0
+    Lam[..., 1, 1] = float(eps)
+    Lam[..., 2, 2] = float(eps)
+
+    D = R @ Lam @ np.swapaxes(R, -1, -2) + delta * I            # (N,3,3)
     return D
 
-def build_sparse_operator(nx, ny, nz, dx, dy, dz, inside, Dfield):
-    """
-    27-point finite-volume stencil for ∇·(D ∇ψ) on a uniform grid.
-    Dfield[k,j,i] is the 3x3 tensor at cell centers (we store as Dfield[p,3,3]).
-    We assemble using:
-      - face-centered <D_ii> by averaging adjacent cell tensors,
-      - edge/quad-centered <D_ij> (i≠j) by averaging the 4 adjacent cell tensors,
-    and the standard cross-derivative 4-point stencil per mixed term.
+# ===================== Matrix-free operator & simple AMG PC =====================
 
-    Notes:
-      * We only couple nodes where 'inside' is True. Outside remains identity rows (Dirichlet stamped later).
-      * Result is symmetric (we add both (p,q) and (q,p) contributions).
-    """
-    def idx3(i, j, k): return (k*ny + j)*nx + i
+def _harmonic(a, b, eps=1e-30):
+    return 2.0 * a * b / np.maximum(a + b, eps)
 
-    N = nx * ny * nz
+def _face_T(D3, dx, dy, dz):
+    """
+    Two-point flux transmissibility using the face-normal component n·D·n.
+    For axis-aligned faces, n is e_x, e_y, or e_z, hence this equals the
+    corresponding diagonal entry of D in world coords.
+    """
+    Dxx = D3[..., 0, 0]; Dyy = D3[..., 1, 1]; Dzz = D3[..., 2, 2]
+
+    # x-faces between i-1 and i  -> shape (nx-1,ny,nz)
+    kx = _harmonic(Dxx[1:, :, :], Dxx[:-1, :, :]) / (dx*dx)
+
+    # y-faces between j-1 and j  -> shape (nx,ny-1,nz)
+    ky = _harmonic(Dyy[:, 1:, :], Dyy[:, :-1, :]) / (dy*dy)
+
+    # z-faces between k-1 and k  -> shape (nx,ny,nz-1)
+    kz = _harmonic(Dzz[:, :, 1:], Dzz[:, :, :-1]) / (dz*dz)
+
+    return kx, ky, kz
+
+def build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, Dfield, val):
+    inside_3 = inside.reshape(nx,ny,nz)
+    fixed_1d = fixed.ravel(order="C")
+    val_1d   = val.ravel(order="C")
+    D3 = Dfield.reshape(nx,ny,nz,3,3)
+
+    Tx, Ty, Tz = _face_T(D3, dx, dy, dz)  # harmonic face coeffs
+
+    idx = np.arange(nx*ny*nz).reshape(nx,ny,nz)
     rows, cols, vals = [], [], []
+    b = np.zeros(nx*ny*nz, dtype=float)
 
-    # convenience: reshape flat arrays to 3D
-    inside_3 = inside.reshape(nx, ny, nz)
-    D3 = Dfield.reshape(nx, ny, nz, 3, 3)
+    def add(rc, cc, vv):
+        rows.append(rc); cols.append(cc); vals.append(vv)
 
-    hx, hy, hz = dx, dy, dz
-    hx2, hy2, hz2 = dx*dx, dy*dy, dz*dz
-    inv_hx2, inv_hy2, inv_hz2 = 1.0/hx2, 1.0/hy2, 1.0/hz2
-    inv_hxhy = 1.0/(hx*hy)
-    inv_hxhz = 1.0/(hx*hz)
-    inv_hyhz = 1.0/(hy*hz)
+    diag = np.zeros(nx*ny*nz, dtype=float)
 
-    # helper to push a symmetric pair
-    def add(p, q, w):
-        rows.append(p); cols.append(q); vals.append(w)
-
-    for k in range(nz):
+    for i in range(nx):
         for j in range(ny):
-            for i in range(nx):
-                p = idx3(i, j, k)
-                if not inside_3[i, j, k]:
-                    # identity row (will be Dirichlet-stamped anyway)
-                    rows.append(p); cols.append(p); vals.append(1.0)
+            for k in range(nz):
+                if not inside_3[i,j,k]:
+                    continue
+                p = idx[i,j,k]
+                if fixed_1d[p]:
+                    # fixed rows are dropped later by slicing (no entries here)
                     continue
 
-                # ---- gather local tensors around (i,j,k) ----
-                Dc = D3[i, j, k]  # 3x3 at center
+                # x- neighbor (face between i-1 and i -> Tx[i-1,j,k])
+                if i > 0 and inside_3[i-1,j,k]:
+                    q = idx[i-1,j,k]
+                    K = Tx[i-1,j,k]
+                    if fixed_1d[q]:
+                        b[p] += K * val_1d[q]
+                    else:
+                        add(p, q, -K)
+                    diag[p] += K
 
-                # Face-centered (for principal parts): average adjacent cells
-                def D_face_x(iL, j0, k0, iR, j1, k1):
-                    return 0.5 * (D3[iL, j0, k0] + D3[iR, j1, k1])
-                def D_face_y(i0, jL, k0, i1, jR, k1):
-                    return 0.5 * (D3[i0, jL, k0] + D3[i1, jR, k1])
-                def D_face_z(i0, j0, kL, i1, j1, kR):
-                    return 0.5 * (D3[i0, j0, kL] + D3[i1, j1, kR])
+                # x+ neighbor (face between i and i+1 -> Tx[i,j,k])
+                if i+1 < nx and inside_3[i+1,j,k]:
+                    q = idx[i+1,j,k]
+                    K = Tx[i,j,k]
+                    if fixed_1d[q]:
+                        b[p] += K * val_1d[q]
+                    else:
+                        add(p, q, -K)
+                    diag[p] += K
 
-                # Edge/quad-centered (for mixed terms): average of 4 neighboring cells
-                def D_quad(i0, j0, k0, i1, j1, k1, i2, j2, k2, i3, j3, k3):
-                    return 0.25*(D3[i0,j0,k0] + D3[i1,j1,k1] + D3[i2,j2,k2] + D3[i3,j3,k3])
+                # y- (face j-1/j -> Ty[i,j-1,k])
+                if j > 0 and inside_3[i,j-1,k]:
+                    q = idx[i,j-1,k]
+                    K = Ty[i,j-1,k]
+                    if fixed_1d[q]:
+                        b[p] += K * val_1d[q]
+                    else:
+                        add(p, q, -K)
+                    diag[p] += K
 
-                diag = 0.0
+                # y+ (face j/j+1 -> Ty[i,j,k])
+                if j+1 < ny and inside_3[i,j+1,k]:
+                    q = idx[i,j+1,k]
+                    K = Ty[i,j,k]
+                    if fixed_1d[q]:
+                        b[p] += K * val_1d[q]
+                    else:
+                        add(p, q, -K)
+                    diag[p] += K
 
-                # =========================
-                # (1) Principal parts ∂x(Dxx ∂x u), ∂y(Dyy ∂y u), ∂z(Dzz ∂z u)
-                # =========================
-                # x-direction faces
-                if i > 0 and inside_3[i-1, j, k]:
-                    Dxm = D_face_x(i-1, j, k, i, j, k)
-                    w = Dxm[0, 0] * inv_hx2
-                    add(p, idx3(i-1, j, k), -w)
-                    diag += w
-                if i < nx-1 and inside_3[i+1, j, k]:
-                    Dxp = D_face_x(i, j, k, i+1, j, k)
-                    w = Dxp[0, 0] * inv_hx2
-                    add(p, idx3(i+1, j, k), -w)
-                    diag += w
+                # z- (face k-1/k -> Tz[i,j,k-1])
+                if k > 0 and inside_3[i,j,k-1]:
+                    q = idx[i,j,k-1]
+                    K = Tz[i,j,k-1]
+                    if fixed_1d[q]:
+                        b[p] += K * val_1d[q]
+                    else:
+                        add(p, q, -K)
+                    diag[p] += K
 
-                # y-direction faces
-                if j > 0 and inside_3[i, j-1, k]:
-                    Dym = D_face_y(i, j-1, k, i, j, k)
-                    w = Dym[1, 1] * inv_hy2
-                    add(p, idx3(i, j-1, k), -w)
-                    diag += w
-                if j < ny-1 and inside_3[i, j+1, k]:
-                    Dyp = D_face_y(i, j, k, i, j+1, k)
-                    w = Dyp[1, 1] * inv_hy2
-                    add(p, idx3(i, j+1, k), -w)
-                    diag += w
+                # z+ (face k/k+1 -> Tz[i,j,k])
+                if k+1 < nz and inside_3[i,j,k+1]:
+                    q = idx[i,j,k+1]
+                    K = Tz[i,j,k]
+                    if fixed_1d[q]:
+                        b[p] += K * val_1d[q]
+                    else:
+                        add(p, q, -K)
+                    diag[p] += K
 
-                # z-direction faces
-                if k > 0 and inside_3[i, j, k-1]:
-                    Dzm = D_face_z(i, j, k-1, i, j, k)
-                    w = Dzm[2, 2] * inv_hz2
-                    add(p, idx3(i, j, k-1), -w)
-                    diag += w
-                if k < nz-1 and inside_3[i, j, k+1]:
-                    Dzp = D_face_z(i, j, k, i, j, k+1)
-                    w = Dzp[2, 2] * inv_hz2
-                    add(p, idx3(i, j, k+1), -w)
-                    diag += w
+    # add diagonals only for free, inside rows
+    free = (inside) & (~fixed)
+    p_idx = np.where(free)[0]
+    rows += list(p_idx); cols += list(p_idx); vals += list(diag[p_idx])
 
-                # =========================
-                # (2) Mixed terms for ∂x(Dxy ∂y u) + ∂y(Dxy ∂x u)
-                #     (xy-plane edges/corners)
-                # =========================
-                def add_xy_block(sign_i, sign_j, coeff):
-                    ii = i + sign_i
-                    jj = j + sign_j
-                    if 0 <= ii < nx and 0 <= jj < ny and inside_3[ii, jj, k]:
-                        add(p, idx3(ii, jj, k), coeff)
+    A = coo_matrix((vals, (rows, cols)), shape=(nx*ny*nz, nx*ny*nz)).tocsr()
+    A_ff = A[free][:, free].tocsr()
+    b_f  = b[free]
+    fidx = np.where(free)[0]
+    return A_ff, b_f, fidx
 
-                if 0 < i < nx-1 and 0 < j < ny-1:
-                    # four quads around (i±1/2, j±1/2, k)
-                    Dpp = D_quad(i, j, k, i+1, j, k, i, j+1, k, i+1, j+1, k)   # +x,+y
-                    Dpm = D_quad(i, j, k, i+1, j, k, i, j-1, k, i+1, j-1, k)   # +x,-y
-                    Dmp = D_quad(i, j, k, i-1, j, k, i, j+1, k, i-1, j+1, k)   # -x,+y
-                    Dmm = D_quad(i, j, k, i-1, j, k, i, j-1, k, i-1, j-1, k)   # -x,-y
+def _matvec_full(u, nx, ny, nz, dx, dy, dz, inside_3, D3):
+    u3 = u.reshape(nx, ny, nz)
 
-                    # Coeffs from the standard 4-point mixed derivative stencil:
-                    c_pp =  + Dpp[0,1] * ( +1.0 ) * 0.25 * ( 4.0 * inv_hxhy )
-                    c_pm =  + Dpm[0,1] * ( -1.0 ) * 0.25 * ( 4.0 * inv_hxhy )
-                    c_mp =  + Dmp[0,1] * ( -1.0 ) * 0.25 * ( 4.0 * inv_hxhy )
-                    c_mm =  + Dmm[0,1] * ( +1.0 ) * 0.25 * ( 4.0 * inv_hxhy )
+    Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
 
-                    # corners (i±1, j±1, k)
-                    add_xy_block(+1, +1,  c_pp)
-                    add_xy_block(+1, -1,  c_pm)
-                    add_xy_block(-1, +1,  c_mp)
-                    add_xy_block(-1, -1,  c_mm)
+    mx = inside_3[1:,:,:] & inside_3[:-1,:,:]
+    my = inside_3[:,1:,:] & inside_3[:,:-1,:]
+    mz = inside_3[:,:,1:] & inside_3[:,:,:-1]
 
-                    # center couplings of the mixed term add negative mass at face nodes:
-                    # they come in implicitly when you expand (u_{i±1,j±1} - u_{i±1,j} - u_{i,j±1} + u_{i,j})
-                    # We account for the -u_{i±1,j} and -u_{i,j±1} with these edge weights:
-                    def add_edge(i_off, j_off, coeff_sum):
-                        ii = i + i_off; jj = j + j_off
-                        if 0 <= ii < nx and 0 <= jj < ny and inside_3[ii, jj, k]:
-                            add(p, idx3(ii, jj, k), coeff_sum)
+    duf_x = np.zeros_like(Tx); duf_x[mx] = (u3[1:,:,:] - u3[:-1,:,:])[mx]
+    duf_y = np.zeros_like(Ty); duf_y[my] = (u3[:,1:,:] - u3[:,:-1,:])[my]
+    duf_z = np.zeros_like(Tz); duf_z[mz] = (u3[:,:,1:] - u3[:,:,:-1])[mz]
 
-                    # coefficients on (i±1,j, k) and (i, j±1, k)
-                    c_i_p = -(c_pp + c_pm)  # sum over +y and -y
-                    c_i_m = -(c_mp + c_mm)  # sum over +y and -y with -x
-                    c_j_p = -(c_pp + c_mp)  # sum over +x and -x
-                    c_j_m = -(c_pm + c_mm)
+    Fx = np.zeros_like(Tx); Fx[mx] = Tx[mx] * duf_x[mx]
+    Fy = np.zeros_like(Ty); Fy[my] = Ty[my] * duf_y[my]
+    Fz = np.zeros_like(Tz); Fz[mz] = Tz[mz] * duf_z[mz]
 
-                    add_edge(+1,  0, c_i_p)
-                    add_edge(-1,  0, c_i_m)
-                    add_edge( 0, +1, c_j_p)
-                    add_edge( 0, -1, c_j_m)
+    divF = np.zeros((nx, ny, nz))
 
-                    # center contributes the remaining (−) mass of mixed terms:
-                    diag += - (c_i_p + c_i_m + c_j_p + c_j_m + c_pp + c_pm + c_mp + c_mm)
+    # x-direction
+    divF[1:-1,:,:] += (Fx[1:,:,:] - Fx[:-1,:,:])
 
-                # =========================
-                # (3) Mixed terms for xz-plane: ∂x(Dxz ∂z u)+∂z(Dxz ∂x u)
-                # =========================
-                def add_xz_block(sign_i, sign_k, coeff):
-                    ii = i + sign_i
-                    kk = k + sign_k
-                    if 0 <= ii < nx and 0 <= kk < nz and inside_3[ii, j, kk]:
-                        add(p, idx3(ii, j, kk), coeff)
+    # y-direction
+    divF[:,1:-1,:] += (Fy[:,1:,:] - Fy[:,:-1,:])
 
-                if 0 < i < nx-1 and 0 < k < nz-1:
-                    Dpp = D_quad(i, j, k, i+1, j, k, i, j, k+1, i+1, j, k+1)
-                    Dpm = D_quad(i, j, k, i+1, j, k, i, j, k-1, i+1, j, k-1)
-                    Dmp = D_quad(i, j, k, i-1, j, k, i, j, k+1, i-1, j, k+1)
-                    Dmm = D_quad(i, j, k, i-1, j, k, i, j, k-1, i-1, j, k-1)
+    # z-direction
+    divF[:,:,1:-1] += (Fz[:,:,1:] - Fz[:,:,:-1])
 
-                    c_pp = + Dpp[0,2] * (+1.0) * 0.25 * (4.0 * inv_hxhz)
-                    c_pm = + Dpm[0,2] * (-1.0) * 0.25 * (4.0 * inv_hxhz)
-                    c_mp = + Dmp[0,2] * (-1.0) * 0.25 * (4.0 * inv_hxhz)
-                    c_mm = + Dmm[0,2] * (+1.0) * 0.25 * (4.0 * inv_hxhz)
+    divF[~inside_3] = 0.0
+    return (-divF).ravel(order="C")
 
-                    add_xz_block(+1, +1,  c_pp)
-                    add_xz_block(+1, -1,  c_pm)
-                    add_xz_block(-1, +1,  c_mp)
-                    add_xz_block(-1, -1,  c_mm)
+def apply_symmetric_fci(u, fci):
+    # u: (N,)
+    up = np.sum(u[fci["idxp"]] * fci["wp"], axis=1)  # W_+ u
+    um = np.sum(u[fci["idxm"]] * fci["wm"], axis=1)  # W_- u
+    r  = np.zeros_like(u)
 
-                    c_i_p = -(c_pp + c_pm)
-                    c_i_m = -(c_mp + c_mm)
-                    c_k_p = -(c_pp + c_mp)
-                    c_k_m = -(c_pm + c_mm)
+    # (W_+ - I)^T (W_+ - I) u
+    # y = (W_+ - I) u = up - u
+    y = up - u
+    # scatter-add W_+^T y
+    np.add.at(r, fci["idxp"].ravel(), (fci["wp"].ravel() * np.repeat(y, 8)))
+    r -= y  # the "- I" transpose part
 
-                    # edges (i±1, j, k) and (i, j, k±1)
-                    if 0 < i < nx-1:
-                        if inside_3[i+1, j, k]: add(p, idx3(i+1, j, k), c_i_p)
-                        if inside_3[i-1, j, k]: add(p, idx3(i-1, j, k), c_i_m)
-                    if 0 < k < nz-1:
-                        if inside_3[i, j, k+1]: add(p, idx3(i, j, k+1), c_k_p)
-                        if inside_3[i, j, k-1]: add(p, idx3(i, j, k-1), c_k_m)
+    # (W_- - I)^T (W_- - I) u
+    y = um - u
+    np.add.at(r, fci["idxm"].ravel(), (fci["wm"].ravel() * np.repeat(y, 8)))
+    r -= y
 
-                    diag += - (c_i_p + c_i_m + c_k_p + c_k_m + c_pp + c_pm + c_mp + c_mm)
+    return r / (fci["step"]**2)
 
-                # =========================
-                # (4) Mixed terms for yz-plane: ∂y(Dyz ∂z u)+∂z(Dyz ∂y u)
-                # =========================
-                def add_yz_block(sign_j, sign_k, coeff):
-                    jj = j + sign_j
-                    kk = k + sign_k
-                    if 0 <= jj < ny and 0 <= kk < nz and inside_3[i, jj, kk]:
-                        add(p, idx3(i, jj, kk), coeff)
+def make_linear_operator(nx, ny, nz, dx, dy, dz, inside, Dperp, fixed_mask, fixed_val, fci=None):
+    """
+    Build a LinearOperator A_full such that A_full @ u_full returns
+    the residual of the stamped system:
+      - free rows: div(D grad u)
+      - fixed rows: u - fixed_val
+    All vectors are full-sized (N=nx*ny*nz).
+    """
+    inside_3 = inside.reshape(nx,ny,nz)
+    # D3 = Dfield.reshape(nx,ny,nz,3,3)
+    D3 = Dperp.reshape(nx,ny,nz,3,3)
 
-                if 0 < j < ny-1 and 0 < k < nz-1:
-                    Dpp = D_quad(i, j, k, i, j+1, k, i, j, k+1, i, j+1, k+1)
-                    Dpm = D_quad(i, j, k, i, j+1, k, i, j, k-1, i, j+1, k-1)
-                    Dmp = D_quad(i, j, k, i, j-1, k, i, j, k+1, i, j-1, k+1)
-                    Dmm = D_quad(i, j, k, i, j-1, k, i, j, k-1, i, j-1, k-1)
+    fixed_mask = fixed_mask.astype(bool)
+    rows_fixed = np.where(fixed_mask)[0] 
 
-                    c_pp = + Dpp[1,2] * (+1.0) * 0.25 * (4.0 * inv_hyhz)
-                    c_pm = + Dpm[1,2] * (-1.0) * 0.25 * (4.0 * inv_hyhz)
-                    c_mp = + Dmp[1,2] * (-1.0) * 0.25 * (4.0 * inv_hyhz)
-                    c_mm = + Dmm[1,2] * (+1.0) * 0.25 * (4.0 * inv_hyhz)
+    def matvec(u):
+        # ⊥ part (matrix-free face flux with D_perp)
+        out = _matvec_full(u, nx, ny, nz, dx, dy, dz, inside_3, D3)
+        # ∥ part via FCI (discrete 1D Laplacian along field lines)
+        if fci is not None:
+            # gather trilinear interpolants at footpoints
+            # (N,8) -> (N,), u is (N,)
+            up = np.sum(u[fci["idxp"]] * fci["wp"], axis=1)
+            um = np.sum(u[fci["idxm"]] * fci["wm"], axis=1)
+            # out += (up - 2.0*u + um) / (fci["step"]**2)
+            out += apply_symmetric_fci(u, fci)
+            
+        # Dirichlet stamping on fixed rows: u - fixed_val
+        out[rows_fixed] = u[rows_fixed] - fixed_val[rows_fixed]   # NEW
+        return out                                                # NEW
 
-                    add_yz_block(+1, +1,  c_pp)
-                    add_yz_block(+1, -1,  c_pm)
-                    add_yz_block(-1, +1,  c_mp)
-                    add_yz_block(-1, -1,  c_mm)
+    N = nx*ny*nz
+    return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
 
-                    c_j_p = -(c_pp + c_mp)
-                    c_j_m = -(c_pm + c_mm)
-                    c_k_p = -(c_pp + c_pm)
-                    c_k_m = -(c_mp + c_mm)
+# ---------------- FCI helpers: trilinear & footpoints ---------------- #
+def _search_indices(coord, grid):
+    """For each value in coord, return lower cell index i with grid[i] <= x <= grid[i+1].
+    Clamped to [0, len(grid)-2]. Vectorized."""
+    i = np.searchsorted(grid, coord, side="right") - 1
+    return np.clip(i, 0, len(grid) - 2)
 
-                    if 0 < j < ny-1:
-                        if inside_3[i, j+1, k]: add(p, idx3(i, j+1, k), c_j_p)
-                        if inside_3[i, j-1, k]: add(p, idx3(i, j-1, k), c_j_m)
-                    if 0 < k < nz-1:
-                        if inside_3[i, j, k+1]: add(p, idx3(i, j, k+1), c_k_p)
-                        if inside_3[i, j, k-1]: add(p, idx3(i, j, k-1), c_k_m)
+def _trilinear_weights_indices(Xp, xs, ys, zs, nx, ny, nz):
+    """Given footpoints Xp=(N,3), return (idx8, w8) where:
+       - idx8: (N,8) flat indices into the (nx,ny,nz) C-ordered grid
+       - w8  : (N,8) weights that sum to 1 for each row
+    Points outside the bbox are clamped to nearest cell for stability."""
+    x, y, z = Xp[:,0], Xp[:,1], Xp[:,2]
+    i = _search_indices(x, xs)
+    j = _search_indices(y, ys)
+    k = _search_indices(z, zs)
+    x0, x1 = xs[i], xs[i+1]; y0, y1 = ys[j], ys[j+1]; z0, z1 = zs[k], zs[k+1]
+    # barycentric coords in each cell
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fx = (x - x0) / np.maximum(x1 - x0, 1e-30)
+        fy = (y - y0) / np.maximum(y1 - y0, 1e-30)
+        fz = (z - z0) / np.maximum(z1 - z0, 1e-30)
+    fx = np.clip(fx, 0.0, 1.0); fy = np.clip(fy, 0.0, 1.0); fz = np.clip(fz, 0.0, 1.0)
+    # 8 corners, C-order flat index: p = i + nx*(j + ny*k)
+    def flat(ii, jj, kk): return (ii + nx*(jj + ny*kk)).astype(np.int64)
+    i0, j0, k0 = i, j, k
+    i1, j1, k1 = i+1, j+1, k+1
+    idx000 = flat(i0, j0, k0); idx100 = flat(i1, j0, k0)
+    idx010 = flat(i0, j1, k0); idx110 = flat(i1, j1, k0)
+    idx001 = flat(i0, j0, k1); idx101 = flat(i1, j0, k1)
+    idx011 = flat(i0, j1, k1); idx111 = flat(i1, j1, k1)
+    idx8 = np.stack([idx000, idx100, idx010, idx110, idx001, idx101, idx011, idx111], axis=1)
+    wx0, wx1 = (1.0 - fx), fx
+    wy0, wy1 = (1.0 - fy), fy
+    wz0, wz1 = (1.0 - fz), fz
+    w000 = wx0*wy0*wz0; w100 = wx1*wy0*wz0
+    w010 = wx0*wy1*wz0; w110 = wx1*wy1*wz0
+    w001 = wx0*wy0*wz1; w101 = wx1*wy0*wz1
+    w011 = wx0*wy1*wz1; w111 = wx1*wy1*wz1
+    w8 = np.stack([w000, w100, w010, w110, w001, w101, w011, w111], axis=1)
+    return idx8, w8
 
-                    diag += - (c_j_p + c_j_m + c_k_p + c_k_m + c_pp + c_pm + c_mp + c_mm)
+def precompute_fci(xs, ys, zs, Xq, t_hat, step):
+    """Precompute FCI footpoint interpolation for ± step along t_hat."""
+    Xplus  = Xq + step * t_hat
+    Xminus = Xq - step * t_hat
+    nx, ny, nz = len(xs), len(ys), len(zs)
+    idxp, wp = _trilinear_weights_indices(Xplus,  xs, ys, zs, nx, ny, nz)
+    idxm, wm = _trilinear_weights_indices(Xminus, xs, ys, zs, nx, ny, nz)
+    return dict(idxp=idxp, wp=wp, idxm=idxm, wm=wm, step=float(step))
 
-                # finally center diagonal
-                rows.append(p); cols.append(p); vals.append(diag if diag > 0 else 1.0)
+def diffusion_tensor_perp(gradphi, eps, delta=1e-2):
+    """D_perp = eps*(I - t t^T) + delta*I."""
+    I = np.eye(3)[None,:,:]
+    n = np.linalg.norm(gradphi, axis=-1, keepdims=True)
+    t = np.divide(gradphi, n, out=np.zeros_like(gradphi), where=n > 1e-12)
+    tt = np.einsum("...i,...j->...ij", t, t)
+    D = eps*(I - tt) + delta*I
+    return D
 
-    L = coo_matrix((vals, (rows, cols)), shape=(N, N)).tocsr()
-    rhs = np.zeros(N, dtype=float)
-    return L, rhs
+def eps_schedule(final_eps):
+    base = [0.3, 0.12, 0.06]
+    if final_eps >= base[0]:
+        return [final_eps]
+    seq = [e for e in base if e > final_eps] + [final_eps]
+    return seq
+
+def _decide_axis_sign(grad_phi, x0):
+    x0 = jnp.asarray(x0, dtype=jnp.float64)
+
+    def advance(x_init, sgn, K=10, step=1e-2):
+        x = jnp.asarray(x_init, dtype=jnp.float64)
+        # initialize g at the starting point
+        g = grad_phi(x[None, :])[0]
+        n = jnp.linalg.norm(g) + 1e-30
+        g = g / n
+        for _ in range(K):
+            # move first using current gradient
+            x = x + sgn * step * g
+            # then refresh gradient at the new location
+            g = grad_phi(x[None, :])[0]
+            n = jnp.linalg.norm(g) + 1e-30
+            g = g / n
+        return np.array(x)
+
+    x_plus  = advance(x0, +1.0)
+    x_minus = advance(x0, -1.0)
+    return "+", x_plus, "-", x_minus
 
 def march_iso_surface(psi_n, inside, nx, ny, nz, mins, maxs, level):
     vol = psi_n.reshape(nx, ny, nz).copy()
-    vol[~inside.reshape(nx,ny,nz)] = np.nan
+    mask = inside.reshape(nx, ny, nz)
+    vol[~mask] = np.nan
     vol = np.nan_to_num(vol, nan=-1.0)
-    verts, faces, norm, val = marching_cubes(vol, level=level)
+    verts, faces, norm, val = marching_cubes(vol, level=level, mask=mask)
+
     # index -> physical coords
     sx = (maxs[0]-mins[0])/(nx-1); sy = (maxs[1]-mins[1])/(ny-1); sz = (maxs[2]-mins[2])/(nz-1)
     vx = mins[0] + verts[:,0]*sx
@@ -452,14 +553,189 @@ def draw_poincare_from_segments(ax, segs):
     for S in segs:
         x, y, z = S[:,0], S[:,1], S[:,2]
         R = np.sqrt(x*x + y*y)
-        ax.plot(R, z, lw=1.0)
+        ax.plot(R, z, lw=1.0, alpha=0.9)
+        ax.plot(R[::10], z[::10], '.', ms=1.8, alpha=0.7)
         cnt += 1
     return cnt
 
+def boundary_curve_RZ(P, phi0, K_min=None):
+    # P: (Ns,3) boundary points
+    Phib = np.arctan2(P[:,1], P[:,0])
+    # pick K nearest-by-angle (wrap-aware)
+    dphi = ( (Phib - float(phi0) + np.pi) % (2*np.pi) ) - np.pi
+    if K_min is None:
+        K_min = max(50, P.shape[0]//200)   # ~0.5% or ≥50 points
+    keep = np.argsort(np.abs(dphi))[:K_min]
+
+    # orthonormal basis in the φ-plane
+    c, s = np.cos(phi0), np.sin(phi0)
+    eR   = np.array([ c,  s, 0.0])   # radial unit vector in plane
+    ephi = np.array([-s,  c, 0.0])   # azimuthal unit normal of the plane
+
+    # project exactly to φ=const plane: subtract (n·r) n with n = eφ
+    dist = P[keep] @ ephi
+    r_proj = P[keep] - dist[:,None] * ephi[None,:]
+
+    Rcut = r_proj @ eR
+    Zcut = r_proj[:,2]
+    return Rcut, Zcut
+
+def _snap_points(P, tol):
+    """
+    Snap nearly-identical 3D points within 'tol' together and return:
+      - P_snapped: (m,3) unique points after snapping
+      - labels: len(P) integers mapping each original row to a snapped index
+    """
+    if len(P) == 0:
+        return P, np.array([], dtype=int)
+
+    # grid-hash for O(n) expected
+    key = np.floor(P / tol).astype(np.int64)
+    # lexicographic key for grouping
+    order = np.lexsort((key[:,2], key[:,1], key[:,0]))
+    key_sorted = key[order]
+    P_sorted = P[order]
+
+    uniq_idx = [0]
+    for i in range(1, len(P_sorted)):
+        if not np.all(key_sorted[i] == key_sorted[uniq_idx[-1]]):
+            uniq_idx.append(i)
+    uniq_idx = np.array(uniq_idx, dtype=int)
+
+    centers = []
+    labels = np.empty(len(P_sorted), dtype=int)
+    start = 0
+    for ui, s in enumerate(uniq_idx):
+        e = uniq_idx[ui+1] if ui+1 < len(uniq_idx) else len(P_sorted)
+        block = P_sorted[s:e]
+        c = block.mean(axis=0)
+        centers.append(c)
+        labels[s:e] = ui
+        start = e
+
+    centers = np.array(centers)
+    # invert permutation
+    inv = np.empty_like(order)
+    inv[order] = np.arange(len(order))
+    return centers, labels[inv]
+
+def segments_to_polylines(segs, tol):
+    """
+    Convert a list of 2x3 segments into polylines by endpoint stitching.
+    Returns a list of arrays with shape (m_i, 3) each (closed loops will have first!=last, but are contiguous).
+    """
+    if not segs:
+        return []
+
+    # Collect endpoints
+    P0 = np.vstack([s[0] for s in segs])
+    P1 = np.vstack([s[1] for s in segs])
+    Pend = np.vstack([P0, P1])
+
+    # Snap endpoints
+    centers, lab = _snap_points(Pend, tol)
+    l0 = lab[:len(P0)]
+    l1 = lab[len(P0):]
+
+    # Build adjacency (undirected multigraph)
+    from collections import defaultdict, deque
+    adj = defaultdict(list)
+    for a, b in zip(l0, l1):
+        if a == b:
+            continue
+        adj[a].append(b)
+        adj[b].append(a)
+
+    visited_edge = defaultdict(int)
+    polylines = []
+
+    # For each node, walk unused edges to build chains
+    for start in range(len(centers)):
+        if start not in adj:
+            continue
+        # try every neighbor to start a new chain
+        for nb in list(adj[start]):
+            # Edge key (ordered)
+            ek = (min(start, nb), max(start, nb))
+            if visited_edge[ek] > 0:
+                continue
+
+            # walk forward
+            chain = [start, nb]
+            visited_edge[ek] += 1
+
+            # extend at the tail
+            cur = nb
+            prev = start
+            while True:
+                nxts = [u for u in adj[cur] if u != prev]
+                nxt = None
+                for u in nxts:
+                    e2 = (min(cur, u), max(cur, u))
+                    if visited_edge[e2] == 0:
+                        nxt = u
+                        visited_edge[e2] += 1
+                        break
+                if nxt is None:
+                    break
+                chain.append(nxt)
+                prev, cur = cur, nxt
+
+            # extend at the head
+            cur = start
+            prev = nb
+            while True:
+                nxts = [u for u in adj[cur] if u != prev]
+                nxt = None
+                for u in nxts:
+                    e2 = (min(cur, u), max(cur, u))
+                    if visited_edge[e2] == 0:
+                        nxt = u
+                        visited_edge[e2] += 1
+                        break
+                if nxt is None:
+                    break
+                chain = [nxt] + chain
+                prev, cur = cur, nxt
+
+            # Map to coordinates
+            poly = centers[np.array(chain)]
+            # Optional: close tiny gaps
+            if np.linalg.norm(poly[0] - poly[-1]) < 2*tol and len(poly) > 3:
+                poly = poly  # already effectively closed (we keep it open-form)
+            polylines.append(poly)
+
+    return polylines
+
+def draw_poincare_from_polylines(ax, polylines):
+    cnt = 0
+    for P in polylines:
+        R = np.sqrt(P[:,0]**2 + P[:,1]**2)
+        Z = P[:,2]
+        ax.plot(R, Z, lw=1.2, alpha=0.95)
+        cnt += 1
+    return cnt
+
+# Choose a reasonable R,Z box per φ from the boundary points
+def rz_box_for_phi(P, phi0, pad=0.05):
+    c, s = np.cos(phi0), np.sin(phi0)
+    eR = np.array([ c,  s, 0.0])
+    eφ = np.array([-s,  c, 0.0])
+    # project boundary to the plane: subtract (eφ·r)eφ
+    dist = P @ eφ
+    rproj = P - dist[:,None]*eφ[None,:]
+    Rb = rproj @ eR
+    Zb = rproj[:,2]
+    # pad the min/max a bit
+    Rmin, Rmax = Rb.min(), Rb.max()
+    Zmin, Zmax = Zb.min(), Zb.max()
+    dR, dZ = (Rmax-Rmin), (Zmax-Zmin)
+    return (Rmin-pad*dR, Rmax+pad*dR), (Zmin-pad*dZ, Zmax+pad*dZ)
 
 # ------------------------------- Main flow ------------------------------- #
-def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_band_radius=0.02,
-         cg_tol=1e-8, cg_maxit=2000, verbose=True, plot=True, psi0=0.3):
+def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band_radius=0.0,
+         cg_tol=1e-8, cg_maxit=2000, verbose=True, plot=True, psi0=0.3, nfp=2, psi_levels="",
+         save_figures=True, fci_step_cells=1.0):
 
     pinfo(f"Loading MFS checkpoint: {npz_file}")
     dat = np.load(npz_file, allow_pickle=True)
@@ -498,6 +774,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     # After loading Xq and computing inside, also get 's'
     inside, nn_idx, s_signed = inside_mask_from_surface(P, N, Xq)
     pstat("Inside mask", inside.astype(float))
+    
     # Estimate surface spacing from P (median NN distance on the surface)
     nbrs_surf = NearestNeighbors(n_neighbors=4, algorithm="kd_tree").fit(P)
     d_surf, _ = nbrs_surf.kneighbors(P)            # (Ns, 4)
@@ -507,14 +784,13 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     band = (np.abs(s_signed) <= h_band) & inside
 
     # Adapt to target fraction of inside (aim ~10%, tighten if >15%)
-    
-    target_frac = 0.10
-    max_frac    = 0.15
+    target_frac = 0.08
+    max_frac    = 0.12
     n_in = int(inside.sum())
     if n_in > 0:
         abs_s_inside = np.abs(s_signed[inside])
         # If current band too fat, shrink by quantile down to >= 0.5 voxel
-        for _ in range(3):
+        for _ in range(6):
             frac = band.sum() / n_in
             if frac <= max_frac:
                 break
@@ -525,31 +801,67 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
             band = (np.abs(s_signed) <= h_band) & inside
 
     pstat("Boundary band fraction", band.astype(float))
+    
+    pinfo("_decide_axis_sign outputs:")
+    if not np.any(inside):
+        raise RuntimeError("inside mask is empty; check surface normals or grid bounds.")
+    x0 = Xq[inside][0]
+    sp, xp, sm, xm = _decide_axis_sign(grad_phi, x0)
+    print(f"  {sp}: {xp}\n  {sm}: {xm}")
 
-    # Axis seeds via collapsing random interior points along +grad φ
+    # quick φ angles to verify intuition
+    phi0 = np.arctan2(x0[1], x0[0])
+    phip = np.arctan2(xp[1], xp[0])
+    phim = np.arctan2(xm[1], xm[0])
+
+    # distances first (so they exist before Δ print)
+    d_plus  = float(np.linalg.norm(xp - x0))
+    d_minus = float(np.linalg.norm(xm - x0))
+
+    pinfo(f"[AXIS-DIR] φ0={phi0:+.3f}, φ+= {phip:+.3f}, φ-= {phim:+.3f}")
+    pinfo(f"[AXIS-DIR] Δ={abs(d_plus - d_minus):.3e}")
+
+    # ---------- Choose a consistent toroidal direction ----------
+    dir_sign = +1.0 if d_plus > d_minus else -1.0 if abs(d_plus - d_minus) > 1e-6 else 1.0
+    pinfo(f"[AXIS-DIR] dir_sign={dir_sign:+.0f}  (d+= {d_plus:.3e}, d-= {d_minus:.3e})")
+
+    # Rebuild evaluators so the multivalued toroidal term matches dir_sign
+    a_flipped = np.array([float(dir_sign)*float(a[0]), float(a[1])], dtype=float)
+    ev = Evaluators(center=jnp.asarray(center), scale=scale,
+                    Yn=jnp.asarray(Yn), alpha=jnp.asarray(alpha),
+                    a=jnp.asarray(a_flipped), a_hat=jnp.asarray(a_hat))
+    phi_fn, grad_phi = ev.build()  # refresh with the signed MV piece
+
+    # Axis seeds via collapsing random interior points along ±grad φ
     rng = np.random.default_rng(0)
     candidates = Xq[inside]
-    if candidates.shape[0] < axis_seed_count:
-        axis_seed_count = max(8, candidates.shape[0]//20)
+    if axis_seed_count <= 0:
+        # Auto: ~2% of interior, clamped into [16, 128]
+        axis_seed_count = int(np.clip(candidates.shape[0] // 50, 16, 128))
+    axis_seed_count = min(axis_seed_count, max(16, candidates.shape[0]))
     picks = candidates[rng.choice(candidates.shape[0], size=axis_seed_count, replace=False)]
-    axis_pts = np.array([collapse_to_axis(grad_phi, x0, step=0.1*min(dx,dy,dz), iters=600, tol=1e-6) for x0 in picks])
-    # Cluster axis points to a 1D set (thin tube): use kNN thinning
-    nbrs = NearestNeighbors(n_neighbors=8).fit(axis_pts)
-    # Just keep them all; band selection will take radius
-    # axis_band = axis_band_mask(axis_pts, Xq, rad=axis_band_radius*np.linalg.norm(span))
-    # axis_band = np.logical_and(axis_band, inside)
-    # pick radius as a few voxels wide
-    # Downsample axis points to avoid "everywhere near-axis" tubes
-    if axis_pts.shape[0] > 64:
-        # quick thinning: keep every k-th point in k-NN order
-        keep = np.linspace(0, axis_pts.shape[0]-1, 64, dtype=int)
-        axis_pts_ds = axis_pts[keep]
-    else:
-        axis_pts_ds = axis_pts
+    axis_pts = np.array([
+        collapse_to_axis(grad_phi, x0, step=0.1*min(dx,dy,dz),
+                         iters=600, tol=1e-6, dir_sign=dir_sign)
+        for x0 in picks
+    ])
+    # Thinning for stability/efficiency
+    keepN = min(96, axis_pts.shape[0])
+    axis_pts_ds = axis_pts[np.linspace(0, axis_pts.shape[0]-1, keepN, dtype=int)]
 
-    # Radius ~ 1–1.5 voxels
-    axis_band_radius = float(axis_band_radius) * np.linalg.norm(span)
-    axis_band = axis_band_mask(axis_pts_ds, Xq, rad=axis_band_radius) & inside
+    # Interpret --axis-band-radius:
+    #   0      -> auto (1.5 * voxel)
+    #   (0,1)  -> fraction of bbox diagonal
+    #   >=1    -> absolute length in world units
+    bbox_diag = float(np.linalg.norm(maxs - mins))
+    if axis_band_radius == 0.0:
+        axis_band_radius_eff = 1.5 * min(dx, dy, dz)
+    elif axis_band_radius < 1.0:
+        axis_band_radius_eff = max(1.0 * min(dx, dy, dz), axis_band_radius * bbox_diag)
+    else:
+        axis_band_radius_eff = max(1.0 * min(dx, dy, dz), float(axis_band_radius))
+
+    axis_band = axis_band_mask(axis_pts_ds, Xq, rad=axis_band_radius_eff) & inside
     pstat("Axis band fraction", axis_band.astype(float))
 
     # Evaluate grad φ everywhere inside (vectorized in chunks to save memory)
@@ -558,31 +870,66 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     G = np.zeros_like(Xq)
     chunk = 50000
     for s in range(0, Xq.shape[0], chunk):
-        G[s:s+chunk] = eval_grad_chunk(Xq[s:s+chunk])
+        Gi = eval_grad_chunk(Xq[s:s+chunk])
+        # NEW: sanitize bad values from evaluator
+        bad = ~np.isfinite(Gi).all(axis=1)
+        if np.any(bad):
+            Gi[bad] = 0.0
+        G[s:s+chunk] = Gi
     eps_t = 1e-12
-    gnorm = np.linalg.norm(G, axis=1)
-    mask_t = (gnorm > eps_t)
+    gnorm = np.linalg.norm(G, axis=1, keepdims=True)
+    # NEW: explicit zeroing when ||∇φ|| is tiny
     t_hat = np.zeros_like(G)
-    t_hat[mask_t] = (G[mask_t].T / gnorm[mask_t]).T
-    D = diffusion_tensor(G, eps=eps)
+    good = (gnorm > eps_t)[:, 0]
+    t_hat[good] = (G[good] / gnorm[good])
+    # D = diffusion_tensor(G, eps=eps, delta=1e-2)
+    # Split tensor: D_perp only (parallel handled by FCI)
+    D_perp = diffusion_tensor_perp(G, eps=eps, delta=1e-2)
+    
+    # Fallback: build an axis band from low-|∇φ| skeleton if empty
+    if not np.any(axis_band):
+        pinfo("[AXIS] collapse-based axis band empty; using low-|∇φ| fallback.")
+        gmag = np.linalg.norm(G, axis=1)
+        gmag_inside = gmag[inside]
+        if gmag_inside.size:
+            thr = np.percentile(gmag_inside, 3.0)  # lowest 3%
+            cand = Xq[inside & (gmag <= thr)]
+            # thin to ~2k points if very dense
+            if cand.shape[0] > 2000:
+                cand = cand[np.linspace(0, cand.shape[0]-1, 2000, dtype=int)]
+            if cand.shape[0] >= 8:
+                # cluster into a 1D tube; radius ~ 2 * voxel
+                db = DBSCAN(eps=2.0*min(dx,dy,dz), min_samples=5).fit(cand)
+                centers = []
+                for lbl in set(db.labels_) - {-1}:
+                    pts = cand[db.labels_ == lbl]
+                    centers.append(pts.mean(axis=0))
+                centers = np.array(centers) if len(centers) else cand
+            else:
+                centers = cand
+            axis_band = axis_band_mask(centers, Xq, rad=axis_band_radius_eff) & inside
+            pstat("[AXIS fallback] Axis band fraction", axis_band.astype(float))
 
-    Dxx = D[...,0,0]; Dyy = D[...,1,1]; Dzz = D[...,2,2]
-    Dxy = D[...,0,1]; Dxz = D[...,0,2]; Dyz = D[...,1,2]
-    pstat("Dxx", Dxx); pstat("Dyy", Dyy); pstat("Dzz", Dzz)
-    pstat("Dxy", Dxy); pstat("Dxz", Dxz); pstat("Dyz", Dyz)
+    # Dxx = D[...,0,0]; Dyy = D[...,1,1]; Dzz = D[...,2,2]
+    # Dxy = D[...,0,1]; Dxz = D[...,0,2]; Dyz = D[...,1,2]
+    # pstat("Dxx", Dxx); pstat("Dyy", Dyy); pstat("Dzz", Dzz)
+    # pstat("Dxy", Dxy); pstat("Dxz", Dxz); pstat("Dyz", Dyz)
+    Dxx = D_perp[...,0,0]; Dyy = D_perp[...,1,1]; Dzz = D_perp[...,2,2]
+    Dxy = D_perp[...,0,1]; Dxz = D_perp[...,0,2]; Dyz = D_perp[...,1,2]
+    pstat("D⊥xx", Dxx); pstat("D⊥yy", Dyy); pstat("D⊥zz", Dzz)
+    pstat("D⊥xy", Dxy); pstat("D⊥xz", Dxz); pstat("D⊥yz", Dyz)
 
     n_tot = Xq.shape[0]
     n_in  = int(inside.sum())
     n_bnd = int(band.sum())
     n_ax  = int(axis_band.sum())
 
-    # Nodes we actually solve for (unfixed interior)
-    fixed = np.zeros(n_tot, dtype=bool)
-    fixed[band] = True
-    fixed[axis_band] = True
-    fixed[~inside] = True
-    n_fixed = int(fixed.sum())
-    n_free  = int(n_tot - n_fixed)
+    # For reporting only: fixed/free **inside** the domain
+    fixed_report = np.zeros(n_tot, dtype=bool)
+    fixed_report[band] = True
+    fixed_report[axis_band] = True
+    n_fixed = int((fixed_report & inside).sum())
+    n_free  = int((~fixed_report & inside).sum())
 
     pinfo(f"[COUNT] total={n_tot} inside={n_in} band={n_bnd} axis={n_ax} fixed={n_fixed} free={n_free}")
     if (n_bnd / max(1, n_in)) > 0.25:
@@ -595,107 +942,195 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         pinfo("[WARN] No free interior unknowns! Your boundary/axis bands are covering everything.")
     pinfo(f"[BAND] surf_h={surf_h:.3e}, h_band={h_band:.3e}, "
         f"band/inside={(n_bnd/max(1,n_in))*100:.1f}% of interior")
-    pinfo(f"[AXIS] axis_band_radius={axis_band_radius:.3e}, "
+    pinfo(f"[AXIS] axis_band_radius={axis_band_radius_eff:.3e}, "
         f"axis/inside={(n_ax/max(1,n_in))*100:.1f}% of interior")
     pinfo(f"[AXIS] seeds={axis_seed_count}, kept={axis_pts_ds.shape[0]} (thin tube)")
     
-    # Assemble SPD operator
-    pinfo("Assembling sparse operator L ...")
-    L, rhs = build_sparse_operator(nx, ny, nz, dx, dy, dz, inside, D)
-
-    # Dirichlet rows for boundary and axis bands
+    # =================== Matrix-free + AMG PCG (replaces assembly) ===================
+    pinfo("Preparing Dirichlet masks & values ...")
     Ntot = Xq.shape[0]
-    fixed = np.zeros(Ntot, dtype=bool)
-    val = np.zeros(Ntot, dtype=float)
-    fixed[band] = True; val[band] = 1.0
-    fixed[axis_band] = True; val[axis_band] = 0.0
-    # Outside nodes also fixed (identity rows already in L)
-    fixed[np.logical_not(inside)] = True; val[np.logical_not(inside)] = 0.0
-
-    pinfo(f"[L] nnz={L.nnz}, density={L.nnz/(L.shape[0]**2):.3e}")
-
-    # Impose Dirichlet on rows (standard row stamping)
-    pinfo("Imposing Dirichlet rows ...")
-    L = L.tolil()
-    rows = np.where(fixed)[0]
-    L[rows, :] = 0.0
-    L[rows, rows] = 1.0
-    rhs[rows] = val[rows]
-    # (optional) also stamp columns for stricter SPD full operator
-    # L = L.tocsc(); L[:, rows] = 0.0; L = L.tolil(); L[rows, rows] = 1.0; L = L.tocsr()
-    # Convert once to CSR and proceed; avoid zeroing columns (slow) and global symmetrization
-    L = L.tocsr()
-
-    # --- NEW: extract the reduced free-free system ---
-    free  = ~fixed
-    fidx  = np.where(free)[0]
-    cidx  = np.where(fixed)[0]   # complement (fixed nodes)
-
-    n_free = int(free.sum())
-    if n_free == 0:
-        raise RuntimeError("No free interior unknowns after band selection.")
-
-    # Known Dirichlet values on fixed nodes
-    psi_fixed = val[fixed]  # shape (n_fixed,)
-
-    # Blocks
-    L_ff = L[free][:, free].tocsr()
-    L_fc = L[free][:, fixed].tocsr()
-
-    symerr = (L_ff - L_ff.T).power(1).sum()
-    pinfo(f"[L_ff] symmetry check (||A-A^T||_1): {symerr:.2e}")
-
-    # Correct RHS for fixed contributions:
-    # L_ff * psi_f = rhs_f  with  rhs_f = rhs[free] - L_fc * psi_fixed
-    rhs_f = rhs[free] - L_fc.dot(psi_fixed)
-
-    diagL = np.array(L_ff.diagonal())
-    pstat("L_ff diag", diagL)
-    pinfo(f"[L_ff] nnz={L_ff.nnz}, avg row nnz≈{L_ff.nnz/L_ff.shape[0]:.1f}")
-
-    # Try ILU(0) on the reduced system; if it fails, try AMG (if available),
-    # else fall back to Jacobi.
-    try:
-        ilu = spilu(
-            L_ff.tocsc(),
-            drop_tol=1e-4,      # allow dropping tiny fill
-            fill_factor=5.0,    # more fill → better PC
-            diag_pivot_thresh=0.1
-        )
-        M = LinearOperator(L_ff.shape, ilu.solve)
-        pinfo("[PCG] Using ILU(0) preconditioner on reduced system")
-    except Exception as e:
-        pinfo(f"[PCG] ILU failed on reduced system ({e}); trying AMG if available...")
-        try:
-            import pyamg  # optional dependency
-            ml = pyamg.ruge_stuben_solver(L_ff)  # classical AMG
-            M = LinearOperator(L_ff.shape, lambda x: ml.aspreconditioner()(x))
-            pinfo("[PCG] Using AMG preconditioner (pyamg)")
-        except Exception as _:
-            pinfo("[PCG] Falling back to Jacobi")
-            from scipy.sparse import diags as spdiags
-            diagL = np.array(L_ff.diagonal(), dtype=float)
-            inv_diag = np.where(diagL > 0, 1.0/diagL, 1.0)
-            M = spdiags(inv_diag, offsets=0)
-
-    # Solve
-    pinfo("CG solve on reduced system ...")
-    t0 = time.time()
-    try:
-        psi_f, info = cg(L_ff, rhs_f, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M)
-    except TypeError:
-        psi_f, info = cg(L_ff, rhs_f, tol=cg_tol, maxiter=cg_maxit, M=M)
-    t1 = time.time()
     
-    # Report true reduced residual
-    # Residuals computed against the SAME (unsymmetrized) blocks:
-    r_free = (L_ff @ psi_f) + (L_fc @ psi_fixed) - rhs[free]
-    pinfo(f"[PCG] reduced residual: L2={np.linalg.norm(r_free):.3e}, Linf={np.max(np.abs(r_free)):.3e}")
-    pinfo(f"CG done (reduced): info={info}, iters<= {cg_maxit}, wall={t1-t0:.2f}s")
+    fixed = np.zeros(Ntot, dtype=bool)
+    val   = np.zeros(Ntot, dtype=float)
+    # Dirichlet on boundary band and axis band
+    fixed[band] = True;      val[band] = 1.0
+    fixed[axis_band] = True; val[axis_band] = 0.0
 
-    # Scatter back to full psi vector
-    psi = np.array(rhs)  # start with rhs so Dirichlet values are in place
+    free = inside & (~fixed)
+    if not np.any(free):
+        raise RuntimeError("No free interior unknowns inside domain.")
+
+    pinfo("Building matrix-free LinearOperator ...")
+    # A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D, fixed, val)
+    # FCI precompute (use only where we have a valid t-hat; elsewhere it collapses to center)
+    step_len = float(fci_step_cells) * min(dx, dy, dz)
+    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_len)
+    A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val, fci=fci)
+    
+    def Afree_matvec(x_f):
+        x_full = np.array(val, copy=True); x_full[free] = x_f
+        r_full = A_full @ x_full
+        r_free = r_full[free]
+        if not np.all(np.isfinite(r_free)):
+            raise FloatingPointError("Non-finite residual: increase delta or fix D/inside.")
+        return r_free
+
+    # Solve only on free rows by wrapping A_full with a 'free-slice' operator:
+    fidx = np.where(free)[0]
+    def Afree_linear_matvec(x_f):
+        # strictly linear operator: zero on fixed rows
+        x_full = np.zeros_like(val)
+        x_full[free] = x_f
+        r_full = A_full @ x_full          # free-row residual = L_ff x_f (linear)
+        return r_full[free]
+    # Build linear operator (no constant term inside)
+    A_free = LinearOperator((fidx.size, fidx.size), matvec=Afree_linear_matvec, rmatvec=Afree_linear_matvec, dtype=float)
+    # Build RHS from fixed values ONCE:
+    def residual_with_fixed_only():
+        x_full = np.array(val, copy=True)  # fixed=val, free=0
+        r_full = A_full @ x_full
+        return r_full[free]                # this equals -b_free (by definition)
+    b_free = -residual_with_fixed_only()
+    
+    # 1) Ones test: with axis band empty and boundary band at 1, a constant 1 should solve ⇒ A*1 == b
+    if not np.any(axis_band):
+        ones = np.ones_like(b_free)
+        print("||A_free*1 - b_free|| / ||b_free|| =",
+            np.linalg.norm((A_free @ ones) - b_free) / max(1e-16, np.linalg.norm(b_free)))
+
+
+    # after A_full/A_free are built
+    z = np.random.default_rng(1).standard_normal(fidx.size)
+    lhs = z @ (A_free @ z)
+    rhs = (A_free @ z) @ z
+    print("Energy symmetry check (free):", abs(lhs - rhs) / max(1e-16, abs(lhs) + abs(rhs)))
+
+    # consistency of CSR vs matvec on the same vector
+    # 2) CSR vs matvec: compare linear parts (no RHS)
+    # A_ff_csr, _, _ = build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, D, val)
+    # Preconditioner on ⊥ block only
+    A_ff_csr, _, _ = build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, D_perp, val)
+    psi_test = np.random.default_rng(2).standard_normal(fidx.size)
+    Apsi_matvec = A_free @ psi_test
+    Apsi_csr    = A_ff_csr @ psi_test
+    print("||A_matvec - A_csr|| / ||A||:", np.linalg.norm(Apsi_matvec - Apsi_csr) / max(1e-16, np.linalg.norm(Apsi_csr)))
+
+    # Check SPD-ish numerics
+    eig_diag = np.min(np.stack([Dxx, Dyy, Dzz], axis=-1), axis=-1)
+    assert np.all(np.isfinite(eig_diag))
+    assert np.percentile(eig_diag, 0.01) > 1e-8  # after delta=1e-2 this will hold
+
+    # 3) Symmetry probe now measures the true linear operator
+    print("[A_free] antisymmetry probe =", probe_symmetry(A_free))
+    
+    _probe = Afree_matvec(np.zeros(fidx.size))
+    if not np.all(np.isfinite(_probe)):
+        pinfo("[Afree] Non-finite residual on zero vector; increase delta or eps and retry.")
+
+    # Rayleigh quotient on free rows (crude λ_max/λ_min feel)
+    z = np.random.default_rng(0).standard_normal(fidx.size)
+    Az = A_free @ z
+    rq = float(z @ Az) / max(1e-16, float(z @ z))
+    pinfo(f"[Rayleigh ~⟨z,Az⟩/⟨z,z⟩] {rq:.3e}")
+    
+    # Diagnostics
+    bnorm = float(np.linalg.norm(b_free))
+    pinfo(f"[A_free] n_free={fidx.size}, ||b_free||_2={bnorm:.3e}")
+    if not np.isfinite(bnorm) or bnorm == 0.0:
+        pinfo("[WARN] b_free is zero or NaN; check bands/inside mask overlap and Dirichlet stamping.")
+
+    # Preconditioner: AMG built on a cheap isotropic Laplacian over free nodes (setup once)
+    try:
+        pinfo("[PCG] Building AMG on the true anisotropic operator (free rows) ...")
+        A_ff_csr, b_free_csr, fidx_csr = build_aniso_csr_free(
+            nx, ny, nz, dx, dy, dz, inside, fixed, D_perp, val
+        )
+        def probe_symmetry_csr(A):
+            rng = np.random.default_rng(0)
+            x = rng.standard_normal(A.shape[0]); y = rng.standard_normal(A.shape[0])
+            lhs = float(x @ (A @ y))
+            rhs = float((A @ x) @ y)
+            den = max(1e-16, abs(lhs) + abs(rhs))
+            return abs(lhs - rhs)/den
+        pinfo(f"[A_ff_csr symmetry probe] {probe_symmetry_csr(A_ff_csr):.3e}")
+        diag_par = 2.0 / (fci["step"]**2) * np.ones(A_ff_csr.shape[0])
+        A_ff_csr_plus = A_ff_csr + spdiags(diag_par, 0, A_ff_csr.shape[0], A_ff_csr.shape[1])
+        ml = smoothed_aggregation_solver(
+            A_ff_csr_plus,
+            symmetry='symmetric',
+            strength=('symmetric', {'theta': 0.04}),
+            smooth=('energy', {'krylov': 'cg', 'degree': 2}),
+            presmoother=('gauss_seidel', {'sweep': 'symmetric'}),
+            postsmoother=('gauss_seidel', {'sweep': 'symmetric'}),
+            max_coarse=400,
+            aggregate='standard',
+            improve_candidates=None,
+            B=np.ones((A_ff_csr.shape[0], 1))
+        )
+        M_amg = ml.aspreconditioner(cycle='W')
+
+        dfine = np.maximum(1e-12, np.asarray(ml.levels[0].A.diagonal()))
+        Dm12  = 1.0 / np.sqrt(dfine)
+
+        def M_apply(x):
+            y = Dm12 * x
+            y = M_amg @ y
+            y = Dm12 * y
+            return y
+
+        # Wrap as LinearOperator
+        M = LinearOperator((b_free.size, b_free.size), matvec=M_apply, rmatvec=M_apply, dtype=float)
+
+        # ---------- sanity probe ----------
+        vtest = np.random.default_rng(0).standard_normal(b_free.size)
+        ytest = M @ vtest
+        if not np.all(np.isfinite(ytest)):
+            raise RuntimeError("AMG preconditioner produced non-finite values; falling back.")
+        pinfo("[PCG] AMG preconditioner ready (finite check OK)")
+    except Exception as e:
+        pinfo(f"[PCG] Using Jacobi preconditioner ({e})")
+        diag_approx = np.maximum(1e-8, np.ones_like(b_free))  # crude but safe
+        def M_apply(x): return x / diag_approx
+        M = LinearOperator((b_free.size, b_free.size), matvec=M_apply, rmatvec=M_apply, dtype=float)
+        
+    # Initial guess: M @ b_free
+    x0_f = M @ b_free   # way better than zeros on hard cases
+    if not np.all(np.isfinite(x0_f)):
+        pinfo("[Init] Non-finite x0 from preconditioner; falling back to zeros.")
+        x0_f = np.zeros_like(b_free)
+    
+    pinfo("CG solve (matrix-free, SPD) ...")
+    t0 = time.time()
+    psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M, x0=x0_f)
+    if (not np.all(np.isfinite(psi_f))) or (info > 0):
+        pinfo(f"[CG] status={info}. Retrying CG with Jacobi (symmetric) preconditioner.")
+        # symmetric Jacobi:
+        diag_j = np.maximum(1e-10, np.ones_like(b_free))
+        M_jac = LinearOperator((b_free.size, b_free.size),
+                            matvec=lambda v: v/diag_j,
+                            rmatvec=lambda v: v/diag_j, dtype=float)
+        x0_f2 = M_jac @ b_free
+        psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M_jac, x0=x0_f2)
+        if (not np.all(np.isfinite(psi_f))) or (info > 0):
+            pinfo(f"[CG] still struggling (status={info}). MINRES (no/nice M).")
+            # MINRES requires symmetric A and symmetric positive (semi)definite M.
+            # Use none or Jacobi only:
+            psi_f, info = minres(A_free, b_free, rtol=cg_tol, maxiter=cg_maxit,
+                                M=M_jac, x0=x0_f2)
+    t1 = time.time()
+    pinfo(f"CG done: info={info}, iters≈{cg_maxit if info>0 else 'converged'} , wall={t1-t0:.2f}s")
+
+    # Scatter back to full vector
+    psi = np.array(val)    # Dirichlet in place
     psi[free] = psi_f
+
+    # Optional: full-operator residual should be ~0 everywhere (incl. fixed rows)
+    r_full = A_full @ psi
+    pstat("Residual Aψ (full)", r_full)
+        
+    # True reduced residual:
+    r_reduced = (A_free @ psi_f) - b_free
+    pinfo(f"[RES(reduced)] {np.linalg.norm(r_reduced)/max(1e-16, bnorm):.3e}")
 
     # Normalize ψ on the inside so [0,1] roughly spans interior
     psi_in = psi[inside]
@@ -705,6 +1140,12 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     psi0_n = np.clip((psi0 - p01)/scale, 0.0, 1.0)
 
     pinfo(f"[ψ] inside percentiles: p1={p01:.3e}, p50={p50:.3e}, p99={p99:.3e}; using normalized ψ in [0,1]")
+
+    levels = []
+    if psi_levels is not None and psi_levels.strip() != "":
+        levels = [float(s) for s in psi_levels.split(",") if s.strip()]
+    else:
+        levels = [psi0_n]
 
     # Quality metrics
     # parallel derivative proxy: |t_hat·∇ψ|
@@ -759,21 +1200,20 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
     pstat("|t·∇ψ| (interior core)", par)
     pinfo(f"[CORE] kept {par.size} samples ({100.0*par.size/max(1,core_mid.size):.1f}% of interior core)")
 
-    # Flux neutrality check inside: ∫ div(D∇ψ) dV ≈ 0 → sample residual
-    # quick residual r = Lψ - rhs (dense-free via multiply)
-    # Full residual (again vs the stamped L)
-    r = L @ psi - rhs
-    pstat("Residual Lψ - rhs", r)
+    # Split residual sanity (free vs fixed rows)
+    free_mask = inside & (~fixed)
+    pstat("Residual (free rows)", r_full[free_mask])
+    pstat("Residual (fixed rows)", r_full[fixed])
 
-    # split residual sanity
-    free = ~fixed
-    pstat("Residual (free rows)", (L[free] @ psi - rhs[free]))
-    pstat("Residual (fixed rows)", (L[fixed] @ psi - rhs[fixed]))
-
-    pinfo(f"[PCG] iterations: {info}")
-    cond_est = np.max(np.abs(diagL)) / max(1e-16, np.min(np.abs(diagL)))
-    pinfo(f"[L_ff] crude cond. diag ratio ~ {cond_est:.2e}")
-
+    # Crude conditioning proxy from the AMG proxy Laplacian (finest-level diag)
+    try:
+        Lfine = ml.levels[0].A  # pyamg hierarchy's finest operator
+        diag = np.abs(Lfine.diagonal())
+        cond_est = np.max(diag) / max(1e-16, np.min(diag))
+        pinfo(f"[AMG proxy] crude diag ratio ~ {cond_est:.2e}")
+    except Exception as _:
+        pinfo("[AMG proxy] could not estimate diag ratio")
+        
     # ------------------------------ Plots ------------------------------ #
     if plot:
         # 3D isosurfaces
@@ -782,21 +1222,23 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         Pb = P[::stride]
         Gb = np.asarray(grad_phi(jnp.asarray(Pb)))
         # scale arrows by a visually reasonable factor
-        gscale = 0.15 * max(maxs - mins).max() * 0.03
+        gscale = 0.03 * float(np.linalg.norm(maxs - mins))
 
         fig = plt.figure(figsize=(14,6))
         ax = fig.add_subplot(1,2,1, projection='3d')
         # take only inside region
-        vol = psi.reshape(nx,ny,nz).copy()
+        # 3D isosurfaces (normalized ψ)
+        vol = psi_n.reshape(nx,ny,nz).copy()
         vol[~inside.reshape(nx,ny,nz)] = np.nan
         for lv in [0.1, 0.5]:
             try:
-                verts, faces, norm, val = marching_cubes(np.nan_to_num(vol, nan=-1.0), level=lv)
-                # map verts from index to real coords
+                vol = psi_n.reshape(nx,ny,nz)
+                mask = inside.reshape(nx,ny,nz)
+                verts, faces, _, _ = marching_cubes(np.nan_to_num(vol, nan=-1.0), level=lv, mask=mask)
                 vx = mins[0] + verts[:,0]*(maxs[0]-mins[0])/(nx-1)
                 vy = mins[1] + verts[:,1]*(maxs[1]-mins[1])/(ny-1)
                 vz = mins[2] + verts[:,2]*(maxs[2]-mins[2])/(nz-1)
-                ax.plot_trisurf(vx, vy, faces, vz, alpha=0.35, linewidth=0.1)
+                ax.plot_trisurf(vx, vy, vz, triangles=faces, alpha=0.35, linewidth=0.1)
             except Exception as e:
                 pinfo(f"Marching cubes failed at level {lv}: {e}")
         ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2], s=2, c='k', alpha=0.35)
@@ -806,64 +1248,157 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=64, axis_ban
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
         fix_matplotlib_3d(ax)
 
-        # Quality dashboard
+        # Quality dashboard: |t·∇ψ| / |∇ψ|  (dimensionless in [0,1])
         ax2 = fig.add_subplot(1,2,2)
-        ax2.hist(np.abs(par), bins=60, alpha=0.8)
-        ax2.set_yscale('log'); ax2.set_xlabel(r"$|\,\hat t\cdot\nabla\psi\,|$")
-        ax2.set_title("Field-aligned derivative magnitude (smaller is better)")
+        # center differences already computed: dpsidx, dpsidy, dpsidz on the (nx-2,ny-2,nz-2) core
+        grad_mag = np.sqrt(dpsidx**2 + dpsidy**2 + dpsidz**2)
+        par_core = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz)  # same shape
+        with np.errstate(divide='ignore', invalid='ignore'):
+            q = np.abs(par_core) / np.maximum(grad_mag, 1e-14)
+        # sample only meaningful interior (mask_mid)
+        qv = q[mask_mid].ravel()
+        ax2.hist(qv, bins=60, alpha=0.8)
+        ax2.set_yscale('log')
+        ax2.set_xlabel(r"$|\,\hat t\cdot\nabla\psi\,|/|\nabla\psi|$")
+        ax2.set_title("Field-alignment metric (smaller is better)")
         plt.tight_layout()
+        if save_figures:
+            fig.savefig("solve_flux_3d_iso_and_quality.png", dpi=150)
 
         # Residual scatter & slices
         fig2, axa = plt.subplots(1,3, figsize=(14,4))
-        r3 = r.reshape(nx,ny,nz)
+        r3 = r_full.reshape(nx,ny,nz)
         im0 = axa[0].imshow(r3[:,:,nz//2].T, origin='lower', aspect='equal'); plt.colorbar(im0, ax=axa[0]); axa[0].set_title("residual @ z mid")
         im1 = axa[1].imshow(r3[:,ny//2,:].T, origin='lower', aspect='equal'); plt.colorbar(im1, ax=axa[1]); axa[1].set_title("residual @ y mid")
         im2 = axa[2].imshow(r3[nx//2,:,:].T, origin='lower', aspect='equal'); plt.colorbar(im2, ax=axa[2]); axa[2].set_title("residual @ x mid")
         plt.tight_layout()
+        if save_figures:
+            fig2.savefig("solve_flux_residual_slices.png", dpi=150)
 
         # --------- Poincaré-like cross-sections of iso-surface ψ=psi0 ----------
         # --- Build iso-surface once (normalized ψ) ---
-        try:
-            Viso, Fiso = march_iso_surface(psi_n, inside, nx, ny, nz, mins, maxs, level=psi0_n)
-        except Exception as e:
-            pinfo(f"Marching cubes (normalized) failed at ψ≈{psi0_n:.2f}: {e}")
-            Viso = Fiso = None
+        iso_cache = []
+        for lv in levels:
+            try:
+                Viso, Fiso = march_iso_surface(psi_n, inside, nx, ny, nz, mins, maxs, level=lv)
+                iso_cache.append((lv, Viso, Fiso))
+            except Exception as e:
+                pinfo(f"Marching cubes failed at level {lv:.2f}: {e}")
+                iso_cache.append((lv, None, None))
 
-        phi_list = jnp.linspace(0, 2*jnp.pi/args.nfp, 4, endpoint=False).tolist()
+        phi_list = jnp.linspace(0, 2*jnp.pi/nfp, 4, endpoint=False).tolist()
         figp, axes = plt.subplots(1, 4, figsize=(14,7), constrained_layout=True)
         axes = axes.ravel()
 
         for aidx, phi0 in enumerate(phi_list):
             axp = axes[aidx]
-            if Viso is None:
-                axp.set_title(f"φ={phi0:+.2f} (no iso)"); axp.axis('off'); continue
-            segs = intersect_iso_with_phi_plane(Viso, Fiso, phi0)
-            nseg = draw_poincare_from_segments(axp, segs)
-            pinfo(f"[POI] φ={phi0:+.2f}: segments={nseg}")
-            axp.set_aspect('equal', 'box'); axp.set_xlabel("R"); axp.set_ylabel("Z")
-            axp.set_title(f"φ={phi0:+.2f} (ψ≈{psi0_n:.2f})")
+            # boundary curve (see B below) before plotting cuts:
+            Rb, Zb = boundary_curve_RZ(P, phi0)
+            if Rb.size:
+                axp.scatter(Rb, Zb, s=4, alpha=0.8, edgecolors='none')  # boundary first
+
+            for (lv, Viso, Fiso) in iso_cache:
+                if Viso is None:
+                    continue
+                segs = intersect_iso_with_phi_plane(Viso, Fiso, phi0)
+                # stitch segments into polylines; tolerance ~ voxel scale
+                tol = 0.75 * min(dx, dy, dz)
+                polys = segments_to_polylines(segs, tol=tol)
+                nseg = draw_poincare_from_polylines(axp, polys)
+            axp.set_aspect('equal', 'box')
+            axp.set_xlabel("R"); axp.set_ylabel("Z")
+            axp.set_title(f"φ={phi0:+.2f}")
+
 
         for k in range(len(phi_list), len(axes)):
             axes[k].axis('off')
         
+        if save_figures:
+            figp.savefig("solve_flux_poincare_cuts.png", dpi=150)
+        
+        # --- Interpolator for ψ and for 'inside' mask (nearest for mask) ---
+        psi3 = psi.reshape(nx, ny, nz)        # (nx,ny,nz)
+        inside3 = inside.reshape(nx, ny, nz)  # (nx,ny,nz)
+
+        psi_interp = RGI((xs, ys, zs), psi3, bounds_error=False, fill_value=np.nan)
+        ins_interp = RGI((xs, ys, zs), inside3.astype(float), method="nearest",
+                        bounds_error=False, fill_value=0.0)
+
+        figrz, axrz = plt.subplots(1, 4, figsize=(14,5), constrained_layout=True)
+        axrz = axrz.ravel()
+
+        for aidx, phi0 in enumerate(phi_list):
+            axp = axrz[aidx]
+            (Rlo,Rhi), (Zlo,Zhi) = rz_box_for_phi(P, phi0, pad=0.08)
+
+            # build a modest R–Z sampling grid
+            nR, nZ = 240, 160
+            Rg = np.linspace(Rlo, Rhi, nR)
+            Zg = np.linspace(Zlo, Zhi, nZ)
+            RR, ZZ = np.meshgrid(Rg, Zg, indexing="xy")
+
+            # map to Cartesian at this φ-plane
+            c, s = np.cos(phi0), np.sin(phi0)
+            XXp = RR*c
+            YYp = RR*s
+            ZZp = ZZ
+
+            pts = np.column_stack([XXp.ravel(), YYp.ravel(), ZZp.ravel()])
+            Psi_plane = psi_interp(pts).reshape(nR, nZ).T
+            Ins_plane = ins_interp(pts).reshape(nR, nZ).T > 0.5  # boolean
+
+            # mask outside-of-domain pixels
+            Psi_plane_masked = np.ma.array(Psi_plane, mask=~Ins_plane)
+
+            im = axp.imshow(Psi_plane_masked,
+                            origin="lower", aspect="equal",
+                            extent=[Rlo, Rhi, Zlo, Zhi])
+            # overlay a few ψ contours to aid reading
+            try:
+                cs = axp.contour(Rg, Zg, Psi_plane_masked, levels=[p50, p01, p99], linewidths=0.8)
+                axp.clabel(cs, fmt="ψ=%.2f", inline=True, fontsize=8)
+            except Exception:
+                pass
+
+            # also overlay boundary points projected in this plane for reference
+            Rb, Zb = boundary_curve_RZ(P, phi0)
+            axp.plot(Rb, Zb, '.', ms=2, alpha=0.6, color='k')
+
+            axp.set_title(f"ψ(R,Z) @ φ={phi0:+.2f}")
+            axp.set_xlabel("R"); axp.set_ylabel("Z")
+
+        figrz.colorbar(im, ax=axrz.tolist(), shrink=0.85, pad=0.02)
+        if save_figures:
+            figrz.savefig("solve_flux_maps_RZ_planes.png", dpi=150)
+        
         plt.show()
 
-    return dict(psi=psi, grid=(xs,ys,zs), inside=inside, quality=dict(parallel_dot_grad=par, residual=r))
+    return dict(psi=psi, grid=(xs,ys,zs), inside=inside, quality=dict(parallel_dot_grad=par, residual=r_full))
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("npz", default="wout_precise_QA_solution.npz", help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
+    ap.add_argument("npz", nargs="?", default="wout_precise_QA_solution.npz",
+                    help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
-    ap.add_argument("--N", type=int, default=26, help="grid resolution per axis")
-    ap.add_argument("--eps", type=float, default=1e-2, help="parallel diffusion weight (smaller => more field-aligned)")
-    ap.add_argument("--band-h", type=float, default=1.0, help="boundary band thickness multiplier")
-    ap.add_argument("--cg-maxit", type=int, default=500)
-    ap.add_argument("--axis-seed-count", type=int, default=64, help="number of interior seeds to collapse onto axis")
-    ap.add_argument("--axis-band-radius", type=float, default=0.012, help="axis band radius as fraction of bbox size")
+    ap.add_argument("--N", type=int, default=32, help="grid resolution per axis")
+    ap.add_argument("--eps", type=float, default=0.12, help="perpendicular diffusion coefficient (smaller ⇒ more field-aligned)")
+    ap.add_argument("--band-h", type=float, default=0.25, help="boundary band thickness multiplier")
+    ap.add_argument("--cg-maxit", type=int, default=1000)
+    ap.add_argument("--axis-seed-count", type=int, default=128,
+                    help="number of interior seeds to collapse onto axis; 0 = auto (~2% of interior, clamped to [16,128])")
+    ap.add_argument("--axis-band-radius", type=float, default=0.05,
+                    help="axis band radius: 0=auto (1.5*voxel); (0,1)=fraction of bbox diagonal; >=1=absolute units")
     ap.add_argument("--cg-tol", type=float, default=1e-8)
     ap.add_argument("--no-plot", action="store_true")
-    ap.add_argument("--psi0", type=float, default=0.3, help="iso-surface level for plotting")
+    ap.add_argument("--psi0", type=float, default=0.1, help="iso-surface level for plotting")
+    ap.add_argument("--psi-levels", type=str, default="0.1,0.3,0.5,0.8",
+                    help="comma-separated normalized levels for iso-surface cuts (e.g. '0.2,0.5,0.8'). If empty, use --psi0 only.")
+    ap.add_argument("--save-figures", action="store_true", default=True, help="save figures instead of showing interactively")
+    ap.add_argument("--fci-step-cells", type=float, default=1.0,
+                    help="FCI step length along t̂ in multiples of the smallest voxel size")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
                axis_seed_count=args.axis_seed_count, axis_band_radius=args.axis_band_radius,
-               cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, plot=(not args.no_plot), psi0=args.psi0)
+               cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, plot=(not args.no_plot), psi0=args.psi0,
+               nfp=args.nfp, psi_levels=args.psi_levels, save_figures=args.save_figures,
+               fci_step_cells=args.fci_step_cells)
