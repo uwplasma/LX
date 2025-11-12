@@ -1109,7 +1109,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     eff3 = dilate_k(eff3, k=2)  # try 2 or 3
     effective_inside = eff3.ravel(order="C")
 
-    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, effective_inside, substeps_max=10)
+    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, effective_inside, substeps_max=16)
     pinfo(f"[FCI] step_cells={step_cells:.2f}; "
         f"median step={np.median(step_vec):.3e}  min/max={step_vec.min():.3e}/{step_vec.max():.3e}")
     pinfo(f"[FCI] valid +footpoints: {100.0*np.mean(fci['in_p']):.1f}%   "
@@ -1638,7 +1638,7 @@ if __name__ == "__main__":
                     help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
     ap.add_argument("--N", type=int, default=32, help="grid resolution per axis")
-    ap.add_argument("--eps", type=float, default=0.12, help="perpendicular diffusion coefficient (smaller ⇒ more field-aligned)")
+    ap.add_argument("--eps", type=float, default=0.08, help="perpendicular diffusion coefficient (smaller ⇒ more field-aligned)")
     ap.add_argument("--band-h", type=float, default=0.25, help="boundary band thickness multiplier")
     ap.add_argument("--cg-maxit", type=int, default=1000)
     ap.add_argument("--axis-seed-count", type=int, default=0,
@@ -1654,7 +1654,7 @@ if __name__ == "__main__":
     ap.add_argument("--fci-step-cells", type=float, default=0.4,
                     help="FCI step length along t̂ in multiples of the smallest voxel size")
     ap.add_argument("--alpha-par", type=float, default=1.0, help="scale factor multiplying the parallel (FCI) operator")
-    ap.add_argument("--delta-mult", type=float, default=1e-2, help="regularization delta multiplier (larger ⇒ more stable, less anisotropic)")
+    ap.add_argument("--delta-mult", type=float, default=5e-3, help="regularization delta multiplier (larger ⇒ more stable, less anisotropic)")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
                axis_seed_count=args.axis_seed_count, axis_band_radius=args.axis_band_radius,
