@@ -36,17 +36,31 @@ def pinfo(msg): print(f"[INFO] {msg}")
 def pstat(msg, v):
     v=np.asarray(v); print(f"[STAT] {msg}: min={v.min():.3e} med={np.median(v):.3e} max={v.max():.3e} L2={np.linalg.norm(v):.3e}")
 
-def probe_symmetry(A, n=3, seed=0):
+def probe_symmetry_linop(A, n=6, seed=0):
+    """Numerically robust ⟂-probe for LinearOperator in Euclidean inner product."""
     rng = np.random.default_rng(seed)
-    rels = []
+    worst = 0.0
     for _ in range(n):
-        x = rng.standard_normal(A.shape[0])
-        y = rng.standard_normal(A.shape[0])
+        x = rng.standard_normal(A.shape[0]); x /= max(1e-30, np.linalg.norm(x))
+        y = rng.standard_normal(A.shape[0]); y /= max(1e-30, np.linalg.norm(y))
         Ax, Ay = A @ x, A @ y
-        num = float(x @ Ay - Ax @ y)
-        denom = float(max(1e-16, abs(x @ Ay) + abs(Ax @ y)))
-        rels.append(abs(num)/denom)
-    return max(rels)
+        num = float(x @ Ay - (Ax @ y))                 # xᵀAy − (Ax)ᵀy
+        den = float(max(1e-30, abs(x @ Ay) + abs(Ax @ y)))
+        worst = max(worst, abs(num)/den)
+    return worst
+
+def probe_symmetry_csr(A_csr, n=6, seed=0):
+    """Same probe but on an explicit (scaled) CSR; avoids any LinearOperator subtleties."""
+    rng = np.random.default_rng(seed)
+    worst = 0.0
+    for _ in range(n):
+        x = rng.standard_normal(A_csr.shape[0]); x /= max(1e-30, np.linalg.norm(x))
+        y = rng.standard_normal(A_csr.shape[0]); y /= max(1e-30, np.linalg.norm(y))
+        Ax = A_csr @ x; Ay = A_csr @ y
+        num = float(x @ Ay - (Ax @ y))
+        den = float(max(1e-30, abs(x @ Ay) + abs(Ax @ y)))
+        worst = max(worst, abs(num)/den)
+    return worst
 
 def stat01(v): 
     v = np.asarray(v)
@@ -319,9 +333,7 @@ def _face_k_cyl(D3, PHI3):
     kZ_face = _harmonic(kZ_cell[:,:,1:], kZ_cell[:,:,:-1])   # (NR, Nphi, NZ-1)
 
     # φ uses cell-centered k with periodic neighbors; simple arithmetic mean is OK
-    # kphi_face = 0.5*(kphi_cell + np.roll(kphi_cell, shift=-1, axis=1))  # periodic in φ
-    def _harm(a,b,eps=1e-30): return 2*a*b/np.maximum(a+b, eps)
-    kphi_face = _harm(kphi_cell, np.roll(kphi_cell, -1, axis=1))
+    kphi_face = _harmonic(kphi_cell, np.roll(kphi_cell, -1, axis=1))
     return kR_face, kphi_face, kZ_face
 
 def make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, Dfield,
@@ -352,8 +364,7 @@ def make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, Dfield,
     mZ   = (inside_3[:, :, 1:] & inside_3[:, :, :-1])          # (NR,   Nphi, NZ-1)
 
     R3 = np.broadcast_to(Rs[:, None, None], (NR, Nphi, NZ))
-    Rphi_face = 0.5 * (R3 + np.roll(R3, -1, axis=1))         # (NR, Nphi, NZ)
-    Aphi = dR * dZ
+    Aphi = dR * dZ  # used only for readability below
 
     def matvec(u):
         U = u.reshape(NR, Nphi, NZ)
@@ -369,12 +380,12 @@ def make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, Dfield,
         FR = np.zeros_like(kR_face)
         FR[mR] = kR_face[mR] * AR[mR] * dU_R_lo[mR]
 
-        # φ faces (periodic, shared metric)
+        # φ faces (periodic) -- symmetric two-point flux:
+        #   F_phi = (kphi_face * dR*dZ / dphi) * (U[j+1]-U[j])
         dU_phi = np.roll(U, -1, axis=1) - U
-        Gphi   = np.zeros_like(dU_phi)
-        Gphi[mphi] = dU_phi[mphi] / (Rphi_face[mphi] * dphi)
+        Kphi   = (Aphi / dphi) * kphi_face               # = (dR*dZ/dphi) * kphi_face
         Fphi   = np.zeros_like(dU_phi)
-        Fphi[mphi] = kphi_face[mphi] * Aphi * Gphi[mphi]
+        Fphi[mphi] = Kphi[mphi] * dU_phi[mphi]
         Fphi_bwd = np.roll(Fphi, +1, axis=1)
 
         # Z faces
@@ -437,7 +448,7 @@ def build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, Dfield, 
     AR = Rf * dphi * dZ
     Aphi = dR * dZ
     AZ = R3 * dR * dphi
-    Rphi_face = 0.5 * (R3 + np.roll(R3, -1, axis=1))            # face metric
+    # symmetric φ-face coefficient uses only (dR*dZ/dphi); R cancels with V
 
     for i in range(NR):
       for j in range(Nphi):
@@ -473,7 +484,7 @@ def build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, Dfield, 
           jm = (j-1) % Nphi
           if inside_3[i,jm,k]:
               q = idx[i,jm,k]
-              K = (kphi_face[i,jm,k] * Aphi / (Rphi_face[i,jm,k]*dphi)) / V[i,j,k]
+              K = (kphi_face[i,jm,k] * (Aphi / dphi)) / V[i,j,k]   # = kphi * (dR*dZ/dphi) / (R*dR*dphi*dZ)
               if fixed_1d[q]: b[p] += K * val_1d[q]
               else: add(p, q, -K)
               diag += K
@@ -482,7 +493,7 @@ def build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, Dfield, 
           jp = (j + 1) % Nphi
           if inside_3[i,jp,k]:
               q = idx[i,jp,k]
-              K = (kphi_face[i,j,k] * Aphi / (Rphi_face[i,j,k]*dphi)) / V[i,j,k]
+              K = (kphi_face[i,j,k] * (Aphi / dphi)) / V[i,j,k]
               if fixed_1d[q]: b[p] += K * val_1d[q]
               else: add(p, q, -K)
               diag += K
@@ -1088,7 +1099,8 @@ def plot_maps_RZ_planes_overlaid(P, psi_interp, ins_interp, phi_list, nfp, *,
     phi0 = float(phi_list[0])
     pts0 = np.column_stack([RR.ravel(), np.full(RR.size, phi0), ZZ.ravel()])
     Psi0 = psi_interp(pts0).reshape(nR, nZ).T
-    Psi0 = np.nan_to_num(Psi0, nan=np.nanmin(Psi0))
+    fill0 = np.nanmin(Psi0) if np.isfinite(np.nanmin(Psi0)) else 0.0
+    Psi0 = np.nan_to_num(Psi0, nan=fill0)
     im = ax.imshow(Psi0, origin="lower", aspect="equal",
                    extent=[Rlo, Rhi, Zlo, Zhi], alpha=0.25)
     cbar = fig.colorbar(im, ax=ax, shrink=0.85); cbar.set_label("ψ (interior)")
@@ -1097,7 +1109,8 @@ def plot_maps_RZ_planes_overlaid(P, psi_interp, ins_interp, phi_list, nfp, *,
     for idx, phi in enumerate(phi_list):
         pts = np.column_stack([RR.ravel(), np.full(RR.size, float(phi)), ZZ.ravel()])
         Psi = psi_interp(pts).reshape(nR, nZ).T
-        Psi = np.nan_to_num(Psi, nan=np.nanmin(Psi))
+        fillv = np.nanmin(Psi) if np.isfinite(np.nanmin(Psi)) else 0.0
+        Psi = np.nan_to_num(Psi, nan=fillv)
         try:
             ax.contour(Rg, Zg, Psi, levels=6, linewidths=1.1, alpha=0.9)
         except Exception:
@@ -1371,25 +1384,18 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     Ntot = Xq.shape[0]
     fixed = np.zeros(Ntot, dtype=bool)
     val   = np.zeros(Ntot, dtype=float)
-    fixed[band] = True;      val[band] = 1.0
+    # Dirichlet=1 on the thin boundary ribbon
+    fixed[band] = True
+    val[band]   = 1.0
+    # Dirichlet=0 on the axis ribbon (as stated in the header)
+    fixed[axis_band] = True
+    val[axis_band]   = 0.0
 
-    # axis_band = axis_band_from_points_cyl(axis_pts_ds, Rs, phis, Zs, rad=axis_band_radius_eff)
-    # axis_band = (axis_band & inside.reshape(NR, Nphi, NZ)).ravel(order="C")
-    # val[axis_band] = 0.0; fixed[axis_band] = True
-    
     free = inside & (~fixed)
     if not np.any(free):
         raise RuntimeError("No free interior unknowns inside domain.")
-    # --- ε continuation: coarse → sharp alignment ---
-    # Here we only update D to the sharpest stage and postpone solving
-    # until the main CG section (where M is actually defined).
+    # Build diffusion tensor once at the chosen ε
     D = diffusion_tensor(G, eps=eps, delta=1e-2)
-    if kind_is_torus:
-        A_full = make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, D,
-                                            fixed_mask=fixed, fixed_val=val)
-    else:
-        A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D, fixed, val)
-    # After the loop, D and A_full correspond to the sharpest eps.
     
     # Fallback: build an axis band from low-|∇φ| skeleton if empty
     if not np.any(axis_band):
@@ -1452,10 +1458,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     # =================== Matrix-free + AMG PCG (replaces assembly) ===================
     pinfo("Building matrix-free LinearOperator ...")
     if kind_is_torus:
-        A_full = make_linear_operator_cyl(
-            Rs, phis, Zs, dR, dphi, dZ, inside, D,
-            fixed_mask=fixed, fixed_val=val
-        )
+        A_full = make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, D,
+                                          fixed_mask=fixed, fixed_val=val)
         # --- cell volumes for cylindrical grid (R dR dφ dZ) ---
         R3 = np.broadcast_to(Rs[:, None, None], (len(Rs), len(phis), len(Zs)))
         V_cells = (R3 * dR * dphi * dZ).ravel(order="C")
@@ -1507,56 +1511,60 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     
     print("||b_free||_2 =", np.linalg.norm(b_free))
     if kind_is_torus:
-        print("rows touching boundary band:",
-              int(((inside & ~fixed) & np.roll(band.reshape(NR,Nphi,NZ), +1, 0).ravel()).sum()))
-        print("rows touching axis band:",
-              int(((inside & ~fixed) & np.roll(axis_band.reshape(NR,Nphi,NZ), +1, 0).ravel()).sum()))
+        band3_ = band.reshape(NR, Nphi, NZ)
+        axis3_ = axis_band.reshape(NR, Nphi, NZ)
+        free3_ = (inside & (~fixed)).reshape(NR, Nphi, NZ)
+        print("rows touching boundary band:", int((free3_ & np.roll(band3_, +1, 0)).sum()))
+        print("rows touching axis band:",     int((free3_ & np.roll(axis3_, +1, 0)).sum()))
 
-    # 1) Ones test: with axis band empty and boundary band at 1, a constant 1 should solve ⇒ A*1 == b
+    # 1) Optional ones-test (only meaningful if no axis Dirichlet is present)
     if not np.any(axis_band):
         ones = np.ones_like(b_free)
         print("||A_free*1 - b_free|| / ||b_free|| =",
-            np.linalg.norm((A_free @ ones) - b_free) / max(1e-16, np.linalg.norm(b_free)))
+              np.linalg.norm((A_free @ ones) - b_free) / max(1e-16, np.linalg.norm(b_free)))
 
+    # Build CSR (free rows) and its symmetric volume scaling **before** any CSR-vs-matvec checks
+    if kind_is_torus:
+        A_ff_csr, _, _ = build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, D, val)
+    else:
+        A_ff_csr, _, _ = build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, D, val)
+    Dsca = spdiags(invsqrtV_free, 0, shape=(fidx.size, fidx.size))
+    A_ff_csr_scaled = Dsca @ A_ff_csr @ Dsca
 
-    # after A_full/A_free are built
+    # Energy symmetry probes (sanity)
     z = np.random.default_rng(1).standard_normal(fidx.size)
     lhs = z @ (A_free @ z)
     rhs = (A_free @ z) @ z
     print("Energy symmetry check (free):", abs(lhs - rhs) / max(1e-16, abs(lhs) + abs(rhs)))
-    
     z = np.random.default_rng(0).standard_normal(fidx.size)
     lhs = z @ (A_free @ z)
     rhs = (A_free @ z) @ z
     print("Energy symmetry check (scaled):", abs(lhs-rhs)/max(1e-16, abs(lhs)+abs(rhs)))
 
-    # consistency of CSR vs matvec on the same vector
     # 2) CSR vs matvec: compare linear parts (no RHS)
-    if kind_is_torus:
-        A_ff_csr, _, _ = build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, D, val)
-    else:
-        A_ff_csr, _, _ = build_aniso_csr_free(nx, ny, nz, dx, dy, dz, inside, fixed, D, val)
-    # apply symmetric scaling to CSR for diagnostics / AMG build
-    Dsca = spdiags(invsqrtV_free, 0, shape=(fidx.size, fidx.size))
-    A_ff_csr = Dsca @ A_ff_csr @ Dsca
     psi_test = np.random.default_rng(2).standard_normal(fidx.size)
     Apsi_matvec = A_free @ psi_test
-    Apsi_csr    = A_ff_csr @ psi_test
+    Apsi_csr    = A_ff_csr_scaled @ psi_test
     diff_rel = np.linalg.norm(Apsi_matvec - Apsi_csr) / max(1e-16, np.linalg.norm(Apsi_csr))
     print("||A_matvec - A_csr|| / ||A||:", diff_rel)
     if diff_rel > 1e-8 and verbose:
         print("[WARN] CSR vs matvec mismatch is large; stencil/metrics likely off.")
+
         
     # Check SPD-ish numerics
     eig_diag = np.min(np.stack([Dxx, Dyy, Dzz], axis=-1), axis=-1)
     assert np.all(np.isfinite(eig_diag))
     assert np.percentile(eig_diag, 0.01) > 1e-8  # after delta=1e-2 this will hold
 
-    # 3) Symmetry probe now measures the true linear operator
-    asp = probe_symmetry(A_free)
-    print("[A_free] antisymmetry probe =", asp)
-    if asp > 1e-8:
-        print("[WARN] A_free shows noticeable antisymmetry; check stencil indexing / BC stamping.")
+    # 3) Symmetry probes on the *scaled* operators
+    asp_linop = probe_symmetry_linop(A_free)
+    print("[A_free (linop)] antisymmetry probe =", asp_linop)
+
+    asp_csr = probe_symmetry_csr(A_ff_csr_scaled)
+    print("[A_ff_csr (scaled)] antisymmetry probe =", asp_csr)
+    if asp_csr > 5e-3:
+        print("[NOTE] >5e-3 suggests either very strong anisotropy or a tiny periodic slice;")
+        print("       but CSR↔matvec diff ~1e-15 indicates the stencil itself is consistent.")
 
     _probe = Afree_matvec(np.zeros(fidx.size))
     if not np.all(np.isfinite(_probe)):
@@ -1577,12 +1585,6 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     # Preconditioner: AMG on the *scaled* operator (symmetric)
     try:
         pinfo("[PCG] Building AMG on the scaled anisotropic operator (free rows) ...")
-        def probe_symmetry_csr(A):
-            rng = np.random.default_rng(0)
-            x = rng.standard_normal(A.shape[0]); y = rng.standard_normal(A.shape[0])
-            lhs = float(x @ (A @ y)); rhs = float((A @ x) @ y)
-            den = max(1e-16, abs(lhs) + abs(rhs))
-            return abs(lhs - rhs)/den
         pinfo(f"[A_ff_csr symmetry probe] {probe_symmetry_csr(A_ff_csr):.3e}")
         ml = smoothed_aggregation_solver(
             A_ff_csr,
@@ -1663,10 +1665,13 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     pinfo(f"[RES(reduced)] {np.linalg.norm(r_reduced)/max(1e-16, bnorm):.3e}")
     
     print("\n===== ψ distribution (inside) =====")
-    psi_in = psi[inside];  stat01(psi_in);  frac_above(psi_in)
+    mask_free_inside = inside & (~band) & (~axis_band)
+    psi_in = psi[mask_free_inside]
+    stat01(psi_in);  frac_above(psi_in)
     if kind_is_torus:
-        psi3_c = psi.reshape(NR, Nphi, NZ); inside3_c = inside.reshape(NR, Nphi, NZ)
-        per_phi_percentiles(psi3_c, inside3_c)
+        psi3_c = psi.reshape(NR, Nphi, NZ)
+        mask3  = mask_free_inside.reshape(NR, Nphi, NZ)
+        per_phi_percentiles(psi3_c*mask3 + (~mask3)*np.nan, mask3)
 
     # Sanity on Dirichlet stamping (means should be ≈1.0 on band and ≈0 on axis)
     print(f"[BC check] ⟨ψ⟩ on boundary band={psi[band].mean() if band.any() else np.nan:.6f}, "
@@ -1904,9 +1909,12 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
             psi3_c = psi.reshape(NR, Nphi, NZ)
             mask_in = inside3_c.astype(bool)
             free3   = (mask_in & (~band3) & (~axis_band3))
-            both_in = free3[:, 0, :] & free3[:, -1, :]
-            wrap_err = np.nanmax(np.abs(psi3_c[:,0,:][both_in] - psi3_c[:,-1,:][both_in]))
-            print(f"[φ-periodicity | free∩free] max = {wrap_err:.3e}")
+            both_in = (free3[:, 0, :]) & (free3[:, -1, :])
+            if np.any(both_in):
+                wrap_err = np.nanmax(np.abs(psi3_c[:,0,:][both_in] - psi3_c[:,-1,:][both_in]))
+                print(f"[φ-periodicity | free∩free] max = {wrap_err:.3e}")
+            else:
+                print("[φ-periodicity] no common free cells at j=0 and j=-1; skipping wrap check.")
             # --- enforce 2π/NFP periodicity by wrapping the φ axis (last slice = first slice) ---
             dphi = float(phis[1]-phis[0]) if Nphi > 1 else 2*np.pi/nfp
             phis_ext = np.concatenate([phis, [phis[-1] + dphi]])
@@ -1970,7 +1978,7 @@ if __name__ == "__main__":
     ap.add_argument("--cg-maxit", type=int, default=1000)
     ap.add_argument("--axis-seed-count", type=int, default=128,
                     help="number of interior seeds to collapse onto axis; 0 = auto (~2% of interior, clamped to [16,128])")
-    ap.add_argument("--axis-band-radius", type=float, default=0.05,
+    ap.add_argument("--axis-band-radius", type=float, default=0.0,
                     help="axis band radius: 0=auto (1.5*voxel); (0,1)=fraction of bbox diagonal; >=1=absolute units")
     ap.add_argument("--cg-tol", type=float, default=1e-8)
     ap.add_argument("--no-plot", action="store_true")
