@@ -364,25 +364,30 @@ def _matvec_full(u, nx, ny, nz, dx, dy, dz, inside_3, D3):
     divF[~inside_3] = 0.0
     return (-divF).ravel(order="C")
 
-def apply_symmetric_fci_full(u, fci, alpha_par=1.0):
+def apply_fci_spd(u, fci, alpha_par=1.0):
+    """
+    SPD 'normal-equations' form for the parallel operator:
+      A_par u = α * [ (W+ - I)^T (W+ - I) + (W- - I)^T (W- - I) ] u / step^2
+    This is guaranteed symmetric positive semidefinite even with masking.
+    """
     idxp, wp, in_p = fci["idxp"], fci["wp"], fci["in_p"]
     idxm, wm, in_m = fci["idxm"], fci["wm"], fci["in_m"]
     step = np.maximum(1e-30, fci["step"])
 
-    up = np.sum(u[idxp] * wp, axis=1); up = np.where(in_p, up, u)
-    um = np.sum(u[idxm] * wm, axis=1); um = np.where(in_m, um, u)
+    def apply_one(W_idx, W_w, in_mask):
+        # Wu (interpolation)
+        Wu = np.sum(u[W_idx] * W_w, axis=1)
+        Wu = np.where(in_mask, Wu, u)   # if footpoint invalid, treat as identity (W->I)
+        v  = Wu - u                     # (W - I) u
 
-    r  = np.zeros_like(u)
-    # (W+ - I) part
-    y = up - u
-    np.add.at(r, idxp.ravel(), (wp.ravel() * np.repeat(y, 8)))
-    r -= y
-    # (W- - I) part
-    y = um - u
-    np.add.at(r, idxm.ravel(), (wm.ravel() * np.repeat(y, 8)))
-    r -= y
+        # y = (W - I)^T v
+        y  = -v.copy()                  # the " -I " part
+        np.add.at(y, W_idx.ravel(), (W_w.ravel() * np.repeat(v, 8)))  # the W^T part
+        return y
 
+    r = apply_one(idxp, wp, in_p) + apply_one(idxm, wm, in_m)
     return alpha_par * (r / (step**2))
+
 
 def smooth_vec3_box(nx, ny, nz, V, passes=1):
     """
@@ -429,7 +434,7 @@ def make_linear_operator(nx, ny, nz, dx, dy, dz, inside, Dperp, fixed_mask, fixe
         out = _matvec_full(u, nx, ny, nz, dx, dy, dz, inside_3, D3)
         # ∥ part via FCI (discrete 1D Laplacian along field lines)
         if fci is not None:
-            r_par_full = apply_symmetric_fci_full(u, fci, alpha_par=alpha_par)
+            r_par_full = apply_fci_spd(u, fci, alpha_par=alpha_par)
             out += r_par_full
             
         # Dirichlet stamping last (overrides any accumulation on fixed rows)
@@ -471,38 +476,61 @@ def _trilinear_weights_indices(Xp, xs, ys, zs, nx, ny, nz):
                    wx0*wy0*wz1, wx1*wy0*wz1, wx0*wy1*wz1, wx1*wy1*wz1], axis=1)
     return idx8, w8
 
-def precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, inside_bool):
+def precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, inside_bool, substeps_max=6):
     """
-    Per-node +/- footpoints with per-node step length:
-      X± = Xq ± step_vec * t_hat
-    Returns dict with (idx,w) for ±, the per-node 'step_vec', and masks that say
-    whether each footpoint stayed inside (so we can null its contribution).
+    Compute +/- footpoints with adaptive substepping so the endpoints remain inside.
+    If a full step would leave the 'effective inside' set, we bisect until valid or
+    we hit substeps_max. Returns the same dict keys as before.
     """
-    step_vec = np.asarray(step_vec).reshape(-1, 1)
-    th = np.asarray(t_hat)
-    Xplus  = Xq + step_vec * th
-    Xminus = Xq - step_vec * th
-
+    xs = np.asarray(xs); ys = np.asarray(ys); zs = np.asarray(zs)
+    Xq = np.asarray(Xq); th = np.asarray(t_hat)
+    inside = np.asarray(inside_bool).astype(bool)
     nx, ny, nz = len(xs), len(ys), len(zs)
-    idxp, wp = _trilinear_weights_indices(Xplus,  xs, ys, zs, nx, ny, nz)
-    idxm, wm = _trilinear_weights_indices(Xminus, xs, ys, zs, nx, ny, nz)
 
-    # mark footpoints that land outside the computational bbox or outside interior
-    # (nearest-cell trilinear ensures "in bbox", but they may be outside 'inside' set)
-    inside_3 = inside_bool.reshape(nx, ny, nz)
-    # Center-cell inside test: pick the (i,j,k) lower corner and test that voxel's center
+    # utility: trilinear lookups for a batch of points
+    def idx_w_for(points):
+        return _trilinear_weights_indices(points, xs, ys, zs, nx, ny, nz)
+
+    # helper to test if the *cell center* of the containing voxel is inside
+    inside_3 = inside.reshape(nx, ny, nz)
     def center_inside(idx8):
-        i = idx8[:,0] % nx
-        j = (idx8[:,0] // nx) % ny
-        k = idx8[:,0] // (nx*ny)
-        # center voxel index = (i,j,k); if that cell center is inside, accept
+        i = idx8[:, 0] % nx
+        j = (idx8[:, 0] // nx) % ny
+        k = (idx8[:, 0] // (nx * ny))
         return inside_3.ravel(order="C")[i + nx*(j + ny*k)]
 
-    in_p = center_inside(idxp)
-    in_m = center_inside(idxm)
+    step = np.asarray(step_vec).reshape(-1, 1)
+    Xp_try = Xq + step * th
+    Xm_try = Xq - step * th
 
-    return dict(idxp=idxp, wp=wp, idxm=idxm, wm=wm, step=step_vec.flatten(),
-                in_p=in_p, in_m=in_m)
+    # If a footpoint lands outside, shorten the step (bisect) up to substeps_max times
+    def repair(points, sign):
+        P = points.copy()
+        s = step.copy()
+        ok_idx, w = idx_w_for(P)
+        ok = center_inside(ok_idx)
+        tries = 0
+        while (not ok.all()) and (tries < substeps_max):
+            # halve the remaining step where not ok
+            s[~ok] *= 0.5
+            P[~ok] = Xq[~ok] + sign * s[~ok] * th[~ok]
+            ok_idx, w = idx_w_for(P)
+            ok = center_inside(ok_idx)
+            tries += 1
+        return P, ok
+
+    Xp, in_p = repair(Xp_try, +1.0)
+    Xm, in_m = repair(Xm_try, -1.0)
+
+    idxp, wp = _trilinear_weights_indices(Xp, xs, ys, zs, nx, ny, nz)
+    idxm, wm = _trilinear_weights_indices(Xm, xs, ys, zs, nx, ny, nz)
+
+    # Final per-node effective step (used in operator scaling)
+    # (note: even when invalid, we keep step so SPD form can fall back to I)
+    step_eff = step.flatten()
+
+    return dict(idxp=idxp, wp=wp, idxm=idxm, wm=wm, step=step_eff, in_p=in_p, in_m=in_m)
+
 
 def diffusion_tensor_perp(gradphi, eps, delta=1e-2):
     """D_perp = eps*(I - t t^T) + delta*I."""
@@ -512,6 +540,23 @@ def diffusion_tensor_perp(gradphi, eps, delta=1e-2):
     tt = np.einsum("...i,...j->...ij", t, t)
     D = eps*(I - tt) + delta*I
     return D
+
+def diffusion_tensor_perp_world_diagonal(gradphi, eps, delta=1e-2):
+    """
+    World-diagonal version consistent with the 6-face 2-point stencil:
+      D_diag = eps * diag(1 - t_x^2, 1 - t_y^2, 1 - t_z^2) + delta * I
+    """
+    n = np.linalg.norm(gradphi, axis=-1, keepdims=True)
+    t = np.divide(gradphi, n, out=np.zeros_like(gradphi), where=n > 1e-12)
+    tx2, ty2, tz2 = t[...,0]**2, t[...,1]**2, t[...,2]**2
+    Dxx = eps*(1.0 - tx2) + delta
+    Dyy = eps*(1.0 - ty2) + delta
+    Dzz = eps*(1.0 - tz2) + delta
+    # pack as (nx,ny,nz,3,3) with zeros off-diagonal
+    D = np.zeros(gradphi.shape[:-1] + (3,3), dtype=float)
+    D[...,0,0] = Dxx; D[...,1,1] = Dyy; D[...,2,2] = Dzz
+    return D
+
 
 def eps_schedule(final_eps):
     base = [0.3, 0.12, 0.06]
@@ -919,7 +964,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     t_hat[good] = (G[good] / gnorm[good])
     # D = diffusion_tensor(G, eps=eps, delta=1e-2)
     # Split tensor: D_perp only (parallel handled by FCI)
-    D_perp = diffusion_tensor_perp(G, eps=eps, delta=1e-2)
+    delta_val = 1e-2 * (dx*dx + dy*dy + dz*dz) / 3.0
+    D_perp = diffusion_tensor_perp_world_diagonal(G, eps=eps, delta=delta_val)
     
     # report tiny-gradient fraction
     tiny = (gnorm[:,0] <= 1e-10)
@@ -1518,7 +1564,7 @@ if __name__ == "__main__":
     ap.add_argument("npz", nargs="?", default="wout_precise_QA_solution.npz",
                     help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
-    ap.add_argument("--N", type=int, default=64, help="grid resolution per axis")
+    ap.add_argument("--N", type=int, default=32, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=0.12, help="perpendicular diffusion coefficient (smaller ⇒ more field-aligned)")
     ap.add_argument("--band-h", type=float, default=0.25, help="boundary band thickness multiplier")
     ap.add_argument("--cg-maxit", type=int, default=1000)
