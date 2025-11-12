@@ -351,11 +351,13 @@ def make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, Dfield,
     mphi = (inside_3 & np.roll(inside_3, -1, axis=1))           # (NR,   Nphi, NZ)
     mZ   = (inside_3[:, :, 1:] & inside_3[:, :, :-1])          # (NR,   Nphi, NZ-1)
 
+    R3 = np.broadcast_to(Rs[:, None, None], (NR, Nphi, NZ))
+    Rphi_face = 0.5 * (R3 + np.roll(R3, -1, axis=1))         # (NR, Nphi, NZ)
+    Aphi = dR * dZ
+
     def matvec(u):
         U = u.reshape(NR, Nphi, NZ)
-
         # cell volumes
-        R3 = np.broadcast_to(Rs[:, None, None], (NR, Nphi, NZ))
         V  = R3 * dR * dphi * dZ
 
         # R faces
@@ -367,23 +369,13 @@ def make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, Dfield,
         FR = np.zeros_like(kR_face)
         FR[mR] = kR_face[mR] * AR[mR] * dU_R_lo[mR]
 
-        # φ faces (periodic); gradient has metric 1/(R dφ)
-        # Aphi = dR * dZ
-        # shU = np.roll(U, -1, axis=1)
-        # dU_phi_lo = np.zeros_like(kphi_face)
-        # dU_phi_lo[mphi] = (shU - U)[mphi] / (R3[mphi] * dphi)
-        # Fphi = np.zeros_like(kphi_face)
-        # Fphi[mphi] = kphi_face[mphi] * Aphi * dU_phi_lo[mphi]
-        # helper once:
-        R3 = np.broadcast_to(Rs[:, None, None], (NR, Nphi, NZ))
-        Rphi_face = 0.5 * (R3 + np.roll(R3, -1, axis=1))            # (NR, Nphi, NZ)
-
-        # use in matvec:
-        dU_phi = np.roll(U, -1, axis=1) - U                         # (NR,Nphi,NZ)
+        # φ faces (periodic, shared metric)
+        dU_phi = np.roll(U, -1, axis=1) - U
         Gphi   = np.zeros_like(dU_phi)
-        Gphi[mphi] = dU_phi[mphi] / (Rphi_face[mphi] * dphi)        # gradient with shared metric
+        Gphi[mphi] = dU_phi[mphi] / (Rphi_face[mphi] * dphi)
         Fphi   = np.zeros_like(dU_phi)
-        Fphi[mphi] = kphi_face[mphi] * (dR * dZ) * Gphi[mphi]       # area already = dR*dZ
+        Fphi[mphi] = kphi_face[mphi] * Aphi * Gphi[mphi]
+        Fphi_bwd = np.roll(Fphi, +1, axis=1)
 
         # Z faces
         AZ = R3 * dR * dphi
@@ -397,9 +389,10 @@ def make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, Dfield,
 
         # R
         div[1:-1, :, :] += (FR[1:, :, :] - FR[:-1, :, :]) / V[1:-1, :, :]
+
         # φ
-        Fphi_bwd = np.roll(Fphi, +1, axis=1)
         div += (Fphi - Fphi_bwd) / V
+
         # Z
         div[:, :, 1:-1] += (FZ[:, :, 1:] - FZ[:, :, :-1]) / V[:, :, 1:-1]
 
@@ -444,6 +437,7 @@ def build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, Dfield, 
     AR = Rf * dphi * dZ
     Aphi = dR * dZ
     AZ = R3 * dR * dphi
+    Rphi_face = 0.5 * (R3 + np.roll(R3, -1, axis=1))            # face metric
 
     for i in range(NR):
       for j in range(Nphi):
@@ -475,15 +469,11 @@ def build_aniso_csr_free_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, fixed, Dfield, 
               else: add(p, q, -K)
               diag += K
 
-          R3 = np.broadcast_to(Rs[:,None,None], (NR, Nphi, NZ))
-          Rphi_face = 0.5 * (R3 + np.roll(R3, -1, axis=1))            # face metric
-          Aphi = dR * dZ
-
           # φ- neighbor (j-1) periodic  --> use conductivity on the *backward* face (j-1)
           jm = (j-1) % Nphi
           if inside_3[i,jm,k]:
               q = idx[i,jm,k]
-              K = (kphi_face[i,jm,k] * Aphi / (Rphi_face[i,j,k]*dphi)) / V[i,j,k]
+              K = (kphi_face[i,jm,k] * Aphi / (Rphi_face[i,jm,k]*dphi)) / V[i,j,k]
               if fixed_1d[q]: b[p] += K * val_1d[q]
               else: add(p, q, -K)
               diag += K
@@ -967,7 +957,7 @@ def draw_poincare_from_polylines(ax, polylines):
         cnt += 1
     return cnt
 
-def boundary_band_cylindrical(P, N, Rs, phis, Zs, h_band_vox, j_smooth=3):
+def boundary_band_cylindrical(P, N, Rs, phis, Zs, h_band_vox, j_smooth=2):
     """
     Return boolean mask 'band' of shape (NR, Nphi, NZ) selecting a continuous
     ribbon of Dirichlet=1 cells near the boundary in each φ-slice.
@@ -976,32 +966,42 @@ def boundary_band_cylindrical(P, N, Rs, phis, Zs, h_band_vox, j_smooth=3):
     """
     NR, Nphi, NZ = len(Rs), len(phis), len(Zs)
     band = np.zeros((NR, Nphi, NZ), dtype=bool)
-
-    # precompute grids for (R,Z)
-    RR, ZZ = np.meshgrid(Rs, Zs, indexing="ij")          # (NR, NZ)
+    RR, ZZ = np.meshgrid(Rs, Zs, indexing="ij")
 
     for jj, phi0 in enumerate(phis):
-        # project boundary to this φ-plane
-        Rb, Zb = boundary_curve_RZ(P, float(phi0))
-        if Rb.size == 0:
-            continue
+        # project boundary *points and normals* to this φ-plane
+        c, s = np.cos(phi0), np.sin(phi0)
+        eR   = np.array([ c,  s, 0.0])
+        ephi = np.array([-s,  c, 0.0])  # plane normal
+        # exact projection onto the plane
+        dist = P @ ephi
+        Pp   = P - dist[:,None]*ephi[None,:]
+        Np   = N - (N @ ephi)[:,None]*ephi[None,:]      # normals projected into plane
+        # normalize 2D normals in (R,Z)
+        Rb = Pp @ eR
+        Zb = Pp[:,2]
+        NbR = Np @ eR
+        NbZ = Np[:,2]
+        n2 = np.hypot(NbR, NbZ) + 1e-30
+        NbR /= n2; NbZ /= n2
 
-        # k-NN distance in the plane (R,Z)
-        # (this gives an *unsigned* distance to the boundary curve)
-        from sklearn.neighbors import NearestNeighbors
-        nbr = NearestNeighbors(n_neighbors=4, algorithm="kd_tree").fit(
-            np.c_[Rb, Zb]
-        )
+        # nearest neighbor in-plane
+        nbr = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(np.c_[Rb, Zb])
         d, idx = nbr.kneighbors(np.c_[RR.ravel(), ZZ.ravel()])
-        dmin = d[:, 0].reshape(NR, NZ)   # unsigned distance
+        dmin = d[:,0].reshape(NR, NZ)
 
-        # optional: smooth a hair to kill pixel noise
+        # signed by projected normal
+        Q = idx[:,0]
+        sign = np.sign((RR.ravel()-Rb[Q]) * NbR[Q] + (ZZ.ravel()-Zb[Q]) * NbZ[Q]).reshape(NR, NZ)
+        dsigned = dmin * sign  # >0 outside if normals are outward
+
+        # thin interior ribbon: dsigned < 0 and |dsigned| <= h_band_vox
+        m = (dsigned < 0.0) & (np.abs(dsigned) <= h_band_vox)
         if j_smooth > 0:
-            from scipy.ndimage import gaussian_filter
-            dmin = gaussian_filter(dmin, sigma=j_smooth*0.25, mode="nearest")
-
-        # choose ribbon half-thickness (world units)
-        band[:, jj, :] = (dmin <= h_band_vox)
+            from scipy.ndimage import binary_erosion
+            # micro-erosion to avoid fat overlap and keep a 1–2 voxel stripe
+            m = binary_erosion(m, iterations=1, border_value=0)
+        band[:, jj, :] = m
 
     return band
 
@@ -1283,7 +1283,10 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     pinfo(f"[AXIS-DIR] Δ={abs(d_plus - d_minus):.3e}")
 
     # ---------- Choose a consistent toroidal direction ----------
-    dir_sign = +1.0 if d_plus > d_minus else -1.0 if abs(d_plus - d_minus) > 1e-6 else 1.0
+    if abs(d_plus - d_minus) <= 5e-5 * max(d_plus, d_minus):  # relative tie
+        dir_sign = +1.0  # deterministic default
+    else:
+        dir_sign = +1.0 if d_plus > d_minus else -1.0
     pinfo(f"[AXIS-DIR] dir_sign={dir_sign:+.0f}  (d+= {d_plus:.3e}, d-= {d_minus:.3e})")
 
     # Rebuild evaluators so the multivalued toroidal term matches dir_sign
@@ -1322,33 +1325,24 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     else:
         axis_band_radius_eff = max(1.0 * min(dx, dy, dz), float(axis_band_radius))
 
-    axis_band = axis_band_mask(axis_pts_ds, Xq, rad=axis_band_radius_eff) & inside
-    pstat("Axis band fraction", axis_band.astype(float))
-    
-
     Ntot = Xq.shape[0]
-    
-    # --- keep this (build & stamp once) ---
     h_band_vox = max(2.0*voxel, float(band_h)*voxel)
+
+    # compute bands once
     band3 = boundary_band_cylindrical(P, N, Rs, phis, Zs, h_band_vox)
     band3 &= inside.reshape(NR, Nphi, NZ)
-
-    # axis band (3-D), then wrap periodicity:
     axis_band3 = axis_band_from_points_cyl(axis_pts_ds, Rs, phis, Zs, rad=axis_band_radius_eff)
     axis_band3 &= inside.reshape(NR, Nphi, NZ)
-
-    # enforce φ periodicity on masks
+    # wrap periodicity
     band3[:, -1, :]      |= band3[:,  0, :]
     axis_band3[:, -1, :] |= axis_band3[:, 0, :]
+    # ravel once
+    band      = band3.ravel(order="C")
+    axis_band = axis_band3.ravel(order="C")
 
-    # ravel and stamp
-    band       = band3.ravel(order="C")
-    axis_band  = axis_band3.ravel(order="C")
-
-    fixed = np.zeros(Ntot, dtype=bool)
-    val   = np.zeros(Ntot, dtype=float)
-    val[band] = 1.0;     fixed[band] = True
-    val[axis_band] = 0.0; fixed[axis_band] = True
+    # free = inside & (~fixed)
+    # if not np.any(free):
+    #     raise RuntimeError("No free interior unknowns inside domain.")
 
     pstat("Boundary band fraction", band.astype(float))
     pstat("Axis band fraction", axis_band.astype(float))
@@ -1379,9 +1373,9 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     val   = np.zeros(Ntot, dtype=float)
     fixed[band] = True;      val[band] = 1.0
 
-    axis_band = axis_band_from_points_cyl(axis_pts_ds, Rs, phis, Zs, rad=axis_band_radius_eff)
-    axis_band = (axis_band & inside.reshape(NR, Nphi, NZ)).ravel(order="C")
-    val[axis_band] = 0.0; fixed[axis_band] = True
+    # axis_band = axis_band_from_points_cyl(axis_pts_ds, Rs, phis, Zs, rad=axis_band_radius_eff)
+    # axis_band = (axis_band & inside.reshape(NR, Nphi, NZ)).ravel(order="C")
+    # val[axis_band] = 0.0; fixed[axis_band] = True
     
     free = inside & (~fixed)
     if not np.any(free):
@@ -1389,17 +1383,12 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     # --- ε continuation: coarse → sharp alignment ---
     # Here we only update D to the sharpest stage and postpone solving
     # until the main CG section (where M is actually defined).
-    eps_list = eps_schedule(eps)           # e.g., [0.3, 0.12, 0.06] → [eps]
-    for i_eps, eps_now in enumerate(eps_list):
-        pinfo(f"[EPS] stage {i_eps+1}/{len(eps_list)} : eps={eps_now:g}")
-        D = diffusion_tensor(G, eps=eps_now, delta=1e-2)
-        # Optionally touch A_full to validate stencil at this stage,
-        # but do NOT solve yet (M not built yet).
-        if kind_is_torus:
-            A_full = make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, D,
-                                              fixed_mask=fixed, fixed_val=val)
-        else:
-            A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D, fixed, val)
+    D = diffusion_tensor(G, eps=eps, delta=1e-2)
+    if kind_is_torus:
+        A_full = make_linear_operator_cyl(Rs, phis, Zs, dR, dphi, dZ, inside, D,
+                                            fixed_mask=fixed, fixed_val=val)
+    else:
+        A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D, fixed, val)
     # After the loop, D and A_full correspond to the sharpest eps.
     
     # Fallback: build an axis band from low-|∇φ| skeleton if empty
@@ -1425,8 +1414,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
                 centers = cand
             if centers.size == 0:
                 centers = cand  # absolute last resort: use the raw candidates
-            axis_band = axis_band_mask(centers, Xq, rad=axis_band_radius_eff) & inside
-            pstat("[AXIS fallback] Axis band fraction", axis_band.astype(float))
+            # axis_band = axis_band_mask(centers, Xq, rad=axis_band_radius_eff) & inside
+            # pstat("[AXIS fallback] Axis band fraction", axis_band.astype(float))
 
     Dxx = D[...,0,0]; Dyy = D[...,1,1]; Dzz = D[...,2,2]
     Dxy = D[...,0,1]; Dxz = D[...,0,2]; Dyz = D[...,1,2]
@@ -1685,11 +1674,11 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
 
 
     # Normalize ψ on the inside so [0,1] roughly spans interior
-    psi_in = psi[inside]
-    p01, p50, p99 = np.percentile(psi_in, [1, 50, 99])
+    mask_free_inside = inside & (~band) & (~axis_band)
+    psi_in = psi[mask_free_inside]
+    p01, p50, p99 = np.percentile(psi_in, [1, 50, 99]) if psi_in.size else (0.0, 0.0, 1.0)
     scale = max(p99 - p01, 1e-12)
     psi_n = np.clip((psi - p01)/scale, 0.0, 1.0)
-    psi0_n = np.clip((psi0 - p01)/scale, 0.0, 1.0)
 
     pinfo(f"[ψ] inside percentiles: p1={p01:.3e}, p50={p50:.3e}, p99={p99:.3e}; using normalized ψ in [0,1]")
 
@@ -1731,7 +1720,6 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         gnorm3 = gnorm.reshape(NR, Nphi, NZ)[1:-1,1:-1,1:-1]
         mask_mid = (gnorm3 > 1e-10)
         par = par_core[mask_mid].ravel()
-        pstat("|t·∇ψ| (interior core, cyl)", par)
     else:
         # Cartesian (nx,ny,nz) path as before
         psi3 = psi.reshape(nx, ny, nz)
@@ -1742,7 +1730,6 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         t_hat_y = t_hat[:,1].reshape(nx, ny, nz)[1:-1,1:-1,1:-1]
         t_hat_z = t_hat[:,2].reshape(nx, ny, nz)[1:-1,1:-1,1:-1]
         par = (t_hat_x*dpsidx + t_hat_y*dpsidy + t_hat_z*dpsidz).ravel()
-        pstat("|t·∇ψ| (interior)", par)
 
     # build boolean voxel masks (per grid kind)
     if kind_is_torus:
@@ -1784,7 +1771,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     par = par_core[mask_mid].ravel()
     if par.size < 100:
         pinfo("[CORE] very small core sample; shrink bands or increase --N")
-    pstat("|t·∇ψ| (interior core)", par)
+    pstat("|t·∇ψ| (core, mid, cyl-frame)", par)
     pinfo(f"[CORE] kept {par.size} samples ({100.0*par.size/max(1,core_mid.size):.1f}% of interior core)")
 
     # Split residual sanity (free vs fixed rows)
@@ -1834,9 +1821,9 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
                     ax.plot_trisurf(vx, vy, vz, triangles=faces, alpha=0.35, linewidth=0.1)
             except Exception as e:
                 pinfo(f"Marching cubes failed at level {lv}: {e}")
-        ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2], s=2, c='k', alpha=0.35)
+        ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2], s=2, c='k', alpha=0.3)
         ax.quiver(Pb[:,0], Pb[:,1], Pb[:,2], Gb[:,0], Gb[:,1], Gb[:,2],
-                  length=gscale, normalize=True, linewidth=0.5, color='tab:red', alpha=0.6)
+                  length=gscale, normalize=True, linewidth=0.5, color='tab:red', alpha=0.1)
         ax.set_title("Isosurfaces of ψ (0.1, 0.5) + boundary points")
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
         fix_matplotlib_3d(ax)
@@ -1915,10 +1902,11 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         if kind_is_torus:
             inside3_c = inside.reshape(NR, Nphi, NZ)
             psi3_c = psi.reshape(NR, Nphi, NZ)
-            ins3   = inside.reshape(NR, Nphi, NZ)
-            both_in = ins3[:, 0, :] & ins3[:, -1, :]
+            mask_in = inside3_c.astype(bool)
+            free3   = (mask_in & (~band3) & (~axis_band3))
+            both_in = free3[:, 0, :] & free3[:, -1, :]
             wrap_err = np.nanmax(np.abs(psi3_c[:,0,:][both_in] - psi3_c[:,-1,:][both_in]))
-            print(f"[φ-periodicity | inside∩inside] max = {wrap_err:.3e}")
+            print(f"[φ-periodicity | free∩free] max = {wrap_err:.3e}")
             # --- enforce 2π/NFP periodicity by wrapping the φ axis (last slice = first slice) ---
             dphi = float(phis[1]-phis[0]) if Nphi > 1 else 2*np.pi/nfp
             phis_ext = np.concatenate([phis, [phis[-1] + dphi]])
@@ -1964,7 +1952,12 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         
         plt.show()
 
-    return dict(psi=psi, grid=(xs,ys,zs), inside=inside, quality=dict(parallel_dot_grad=par, residual=r_full))
+    if kind_is_torus:
+        grid = dict(kind="cyl", Rs=Rs, phis=phis, Zs=Zs)
+    else:
+        grid = dict(kind="cart", xs=xs, ys=ys, zs=zs)
+
+    return dict(psi=psi, grid=grid, inside=inside, quality=dict(parallel_dot_grad=par, residual=r_full))
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -1973,7 +1966,7 @@ if __name__ == "__main__":
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
     ap.add_argument("--N", type=int, default=48, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=0.1, help="parallel diffusion weight (smaller => more field-aligned)")
-    ap.add_argument("--band-h", type=float, default=0.12, help="boundary band thickness multiplier")
+    ap.add_argument("--band-h", type=float, default=2.0, help="boundary band thickness multiplier")
     ap.add_argument("--cg-maxit", type=int, default=1000)
     ap.add_argument("--axis-seed-count", type=int, default=128,
                     help="number of interior seeds to collapse onto axis; 0 = auto (~2% of interior, clamped to [16,128])")
