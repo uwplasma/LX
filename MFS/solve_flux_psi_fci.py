@@ -376,13 +376,17 @@ def apply_fci_spd(u, fci, alpha_par=1.0):
 
     def apply_one(W_idx, W_w, in_mask):
         # Wu (interpolation)
+        # Wu = np.sum(u[W_idx] * W_w, axis=1)
+        # Wu = np.where(in_mask, Wu, u)   # if footpoint invalid, treat as identity (W->I)
+        # v  = Wu - u                     # (W - I) u
         Wu = np.sum(u[W_idx] * W_w, axis=1)
-        Wu = np.where(in_mask, Wu, u)   # if footpoint invalid, treat as identity (W->I)
-        v  = Wu - u                     # (W - I) u
+        Wu = np.where(in_mask, Wu, u)   # current
+        # better: if invalid, drop the whole parallel term for that row
+        v  = np.where(in_mask, Wu - u, 0.0)
 
         # y = (W - I)^T v
-        y  = -v.copy()                  # the " -I " part
-        np.add.at(y, W_idx.ravel(), (W_w.ravel() * np.repeat(v, 8)))  # the W^T part
+        y = -v.copy()
+        np.add.at(y, W_idx, W_w * v[:, None])  # (N,8) broadcast, no manual repeat
         return y
 
     r = apply_one(idxp, wp, in_p) + apply_one(idxm, wm, in_m)
@@ -815,7 +819,7 @@ def rz_box_for_phi(P, phi0, pad=0.05):
 # ------------------------------- Main flow ------------------------------- #
 def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band_radius=0.0,
          cg_tol=1e-8, cg_maxit=2000, verbose=True, plot=True, psi0=0.3, nfp=2, psi_levels="",
-         save_figures=True, fci_step_cells=1.0, alpha_par=1.0):
+         save_figures=True, fci_step_cells=1.0, alpha_par=1.0, delta_mult=1e-2):
 
     pinfo(f"Loading MFS checkpoint: {npz_file}")
     dat = np.load(npz_file, allow_pickle=True)
@@ -933,13 +937,18 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     #   0      -> auto (1.5 * voxel)
     #   (0,1)  -> fraction of bbox diagonal
     #   >=1    -> absolute length in world units
-    bbox_diag = float(np.linalg.norm(maxs - mins))
+    voxel = min(dx, dy, dz)
     if axis_band_radius == 0.0:
-        axis_band_radius_eff = 1.5 * min(dx, dy, dz)
+        # auto: ~1.5 voxels wide tube (resolution-invariant)
+        axis_band_radius_eff = 1.5 * voxel
     elif axis_band_radius < 1.0:
-        axis_band_radius_eff = max(1.0 * min(dx, dy, dz), axis_band_radius * bbox_diag)
+        # interpret as "multiples of voxel" (not fraction of bbox size)
+        axis_band_radius_eff = max(1.0 * voxel, float(axis_band_radius) * voxel / 0.05)
+        # if you want 0.05 to keep today's behavior, delete "/ 0.05"
     else:
-        axis_band_radius_eff = max(1.0 * min(dx, dy, dz), float(axis_band_radius))
+        # absolute world units
+        axis_band_radius_eff = max(1.0 * voxel, float(axis_band_radius))
+
 
     axis_band = axis_band_mask(axis_pts_ds, Xq, rad=axis_band_radius_eff) & inside
     pstat("Axis band fraction", axis_band.astype(float))
@@ -964,7 +973,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     t_hat[good] = (G[good] / gnorm[good])
     # D = diffusion_tensor(G, eps=eps, delta=1e-2)
     # Split tensor: D_perp only (parallel handled by FCI)
-    delta_val = 1e-2 * (dx*dx + dy*dy + dz*dz) / 3.0
+    delta_val = delta_mult * (dx*dx + dy*dy + dz*dz) / 3.0
     D_perp = diffusion_tensor_perp_world_diagonal(G, eps=eps, delta=delta_val)
     
     # report tiny-gradient fraction
@@ -985,7 +994,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         gmag = np.linalg.norm(G, axis=1)
         gmag_inside = gmag[inside]
         if gmag_inside.size:
-            thr = np.percentile(gmag_inside, 3.0)  # lowest 3%
+            thr = np.percentile(gmag_inside, 3.0 if gmag_inside.size > 500 else 1.0)
             cand = Xq[inside & (gmag <= thr)]
             # thin to ~2k points if very dense
             if cand.shape[0] > 2000:
@@ -1064,6 +1073,8 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         step_vec_try = np.maximum(1e-12, step_cells_try * np.sqrt((dx*np.abs(t_hat[:,0]))**2 +
                                                                    (dy*np.abs(t_hat[:,1]))**2 +
                                                                    (dz*np.abs(t_hat[:,2]))**2))
+        base = min(dx, dy, dz)
+        step_vec_try = np.minimum(step_vec_try, 0.8 * base)
         return precompute_fci(xs, ys, zs, Xq, t_hat, step_vec_try,
                               inside & (~band) & (~axis_band)), step_vec_try
 
@@ -1075,11 +1086,30 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         if valrate >= target_valid or step_cells < 0.05:
             break
         step_cells *= 0.6  # shrink and retry
+    step_cells = max(step_cells, 0.05)   # don’t let it get too tiny
 
     # FCI precompute (masked) using INSIDE to prevent cross-boundary leakage
     effective_inside = inside & (~band) & (~axis_band)
     # pass effective_inside to precompute_fci instead of inside
-    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, effective_inside)
+    # NEW: a one-voxel dilation just for FCI feasibility
+    # dilate bands by one cell to avoid numerical mixing (simple pad + max)
+    def dilate1(b):
+        # cheap 6-neighbor dilation
+        bb = b.copy()
+        bb[1:,:,:] |= b[:-1,:,:]; bb[:-1,:,:] |= b[1:,:,:]
+        bb[:,1:,:] |= b[:,:-1,:]; bb[:,:-1,:] |= b[:,1:,:]
+        bb[:,:,1:] |= b[:,:,:-1]; bb[:,:,:-1] |= b[:,:,1:]
+        return bb
+    eff3 = effective_inside.reshape(nx,ny,nz)
+    def dilate_k(b, k=2):
+        bb = b.copy()
+        for _ in range(k):
+            bb = dilate1(bb)
+        return bb
+    eff3 = dilate_k(eff3, k=2)  # try 2 or 3
+    effective_inside = eff3.ravel(order="C")
+
+    fci = precompute_fci(xs, ys, zs, Xq, t_hat, step_vec, effective_inside, substeps_max=10)
     pinfo(f"[FCI] step_cells={step_cells:.2f}; "
         f"median step={np.median(step_vec):.3e}  min/max={step_vec.min():.3e}/{step_vec.max():.3e}")
     pinfo(f"[FCI] valid +footpoints: {100.0*np.mean(fci['in_p']):.1f}%   "
@@ -1090,6 +1120,10 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     cross_p = np.any(in_band[fci["idxp"]], axis=1)  # any of the 8 corners lies in band
     cross_m = np.any(in_band[fci["idxm"]], axis=1)
     pinfo(f"[FCI] crosses boundary band: + {100.0*np.mean(cross_p):.1f}% , - {100.0*np.mean(cross_m):.1f}%")
+    
+    bad = cross_p | cross_m
+    fci["wp"][bad] *= 0.0; fci["wm"][bad] *= 0.0
+    fci["in_p"][bad] = False; fci["in_m"][bad] = False
 
     # Report alignment per-decile (after solve we do a histogram already, this is pre-solve geometry)
     gcos = np.abs( (t_hat * (G/np.maximum(gnorm,1e-30))).sum(axis=1) )
@@ -1097,8 +1131,11 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     for p in (50, 75, 90, 95, 99):
         print(f"[pre] |t̂·ĝ| perc {p:2d}: {np.percentile(gcos, p):.3e}")
     
+    valrate = 0.5*(np.mean(fci["in_p"]) + np.mean(fci["in_m"]))
+    alpha_par_eff = alpha_par * float(valrate)
     A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val,
-                              fci=fci, alpha_par=alpha_par)
+                              fci=fci, alpha_par=alpha_par_eff)
+    pinfo(f"[FCI] using alpha_par_eff={alpha_par_eff:.3f}")
     
     def Afree_matvec(x_f):
         x_full = np.array(val, copy=True); x_full[free] = x_f
@@ -1130,13 +1167,6 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         ones = np.ones_like(b_free)
         print("||A_free*1 - b_free|| / ||b_free|| =",
             np.linalg.norm((A_free @ ones) - b_free) / max(1e-16, np.linalg.norm(b_free)))
-
-
-    # after A_full/A_free are built
-    z = np.random.default_rng(1).standard_normal(fidx.size)
-    lhs = z @ (A_free @ z)
-    rhs = (A_free @ z) @ z
-    print("Energy symmetry check (free):", abs(lhs - rhs) / max(1e-16, abs(lhs) + abs(rhs)))
 
     # consistency of CSR vs matvec on the same vector
     # 2) CSR vs matvec: compare linear parts (no RHS)
@@ -1245,21 +1275,46 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     
     # psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M, x0=x0_f)
     psi_f = None
-    for e in eps_schedule(eps):            # e.g. [0.3, 0.12, final]
-        D_perp = diffusion_tensor_perp(G, eps=e, delta=1e-2)
-        # rebuild A_full / A_free with this D_perp
-        A_full  = make_linear_operator(nx, ny, nz, dx, dy, dz, inside, D_perp, fixed, val, fci=fci)
+    x0_f  = M @ b_free if 'M' in locals() else np.zeros_like(b_free)  # initial warm start
+    for e in eps_schedule(eps):                   # e.g. [0.3, 0.12, final]
+        D_perp = diffusion_tensor_perp_world_diagonal(G, eps=e, delta=delta_val)
+
+        # *** keep the same alpha_par_eff you computed earlier ***
+        A_full = make_linear_operator(
+            nx, ny, nz, dx, dy, dz,
+            inside, D_perp, fixed, val,
+            fci=fci, alpha_par=alpha_par_eff
+        )
+
+        free = inside & (~fixed)                 # (unchanged, but keep local)
+        fidx = np.where(free)[0]
+
         def Afree_linear_matvec(x_f):
             x_full = np.zeros_like(val); x_full[free] = x_f
             return (A_full @ x_full)[free]
-        A_free = LinearOperator((fidx.size, fidx.size), matvec=Afree_linear_matvec, rmatvec=Afree_linear_matvec, dtype=float)
-        # RHS stays the same (depends only on fixed stamping)
-        if psi_f is None:
-            x0_f = M @ b_free if 'M' in locals() else np.zeros_like(b_free)
-        else:
-            x0_f = psi_f                         # warm start from last stage
-        psi_f, info = cg(A_free, b_free, rtol=cg_tol, atol=0.0, maxiter=cg_maxit, M=M, x0=x0_f)
 
+        A_free = LinearOperator(
+            (fidx.size, fidx.size),
+            matvec=Afree_linear_matvec,
+            rmatvec=Afree_linear_matvec,
+            dtype=float
+        )
+
+        # *** RHS MUST be rebuilt whenever A_full changes ***
+        def residual_with_fixed_only():
+            x_full = np.array(val, copy=True)    # fixed rows = val, free = 0
+            return (A_full @ x_full)[free]
+        b_free = -residual_with_fixed_only()
+
+        # warm start
+        if psi_f is not None:
+            x0_f = psi_f
+
+        psi_f, info = cg(
+            A_free, b_free,
+            rtol=cg_tol, atol=0.0, maxiter=cg_maxit,
+            M=M, x0=x0_f
+        )
     
     if (not np.all(np.isfinite(psi_f))) or (info > 0):
         pinfo(f"[CG] status={info}. Retrying CG with Jacobi (symmetric) preconditioner.")
@@ -1279,6 +1334,20 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     t1 = time.time()
     pinfo(f"CG done: info={info}, iters≈{cg_maxit if info>0 else 'converged'} , wall={t1-t0:.2f}s")
 
+    print("[A_free] antisymmetry probe (final) =", probe_symmetry(A_free))
+        
+    def sym_check(A, n=5, seed=0):
+        rng = np.random.default_rng(seed)
+        s = []
+        for _ in range(n):
+            x = rng.standard_normal(A.shape[0]); y = rng.standard_normal(A.shape[0])
+            Ax, Ay = A @ x, A @ y
+            num = abs(x @ Ay - y @ Ax)
+            den = np.linalg.norm(Ax)*np.linalg.norm(y) + np.linalg.norm(Ay)*np.linalg.norm(x) + 1e-16
+            s.append(num / den)
+        return max(s)
+    print("[A_free] sym_check =", sym_check(A_free))
+
     # Scatter back to full vector
     psi = np.array(val)    # Dirichlet in place
     psi[free] = psi_f
@@ -1288,9 +1357,13 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     pstat("Residual Aψ (full)", r_full)
         
     # True reduced residual:
-    r_reduced = (A_free @ psi_f) - b_free
-    pinfo(f"[RES(reduced)] {np.linalg.norm(r_reduced)/max(1e-16, bnorm):.3e}")
+    r_free_full = (A_full @ psi)[free]
+    print("[RES] ||r_free_full||/||b_free|| =",
+        np.linalg.norm(r_free_full) / max(1e-16, np.linalg.norm(b_free)))
 
+    r_reduced = (A_free @ psi_f) - b_free
+    pinfo(f"[RES(reduced)] {np.linalg.norm(r_reduced)/max(1e-16, np.linalg.norm(b_free)):.3e}")
+    
     # Normalize ψ on the inside so [0,1] roughly spans interior
     psi_in = psi[inside]
     p01, p50, p99 = np.percentile(psi_in, [1, 50, 99])
@@ -1400,9 +1473,9 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
                 ax.plot_trisurf(vx, vy, vz, triangles=faces, alpha=0.35, linewidth=0.1)
             except Exception as e:
                 pinfo(f"Marching cubes failed at level {lv}: {e}")
-        ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2], s=2, c='k', alpha=0.35)
+        ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2], s=2, c='k', alpha=0.15)
         ax.quiver(Pb[:,0], Pb[:,1], Pb[:,2], Gb[:,0], Gb[:,1], Gb[:,2],
-                    length=gscale, normalize=True, linewidth=0.5, color='tab:red', alpha=0.6)
+                    length=gscale, normalize=True, linewidth=0.5, color='tab:red', alpha=0.3)
         ax.set_title("Isosurfaces of ψ (0.1, 0.5) + boundary points")
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
         fix_matplotlib_3d(ax)
@@ -1419,22 +1492,22 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
         for p in (50, 75, 90, 95, 99):
             print(f"q perc {p:2d}: {np.percentile(qv, p):.3e}")
             
-    # Per-shell (R bins) median of alignment in the core
-    Rmid3 = np.sqrt(XX[1:-1,1:-1,1:-1]**2 + YY[1:-1,1:-1,1:-1]**2)              # keep 3-D
-    rm    = Rmid3[mask_mid]                                                     # → 1-D
-    qcore = q[mask_mid]                                                         # → 1-D
-    if qcore.size:
-        bins = np.quantile(rm, [0.0, 0.25, 0.5, 0.75, 1.0])
-        for b0, b1 in zip(bins[:-1], bins[1:]):
-            sel = (rm >= b0) & (rm < b1)
-            if sel.any():
-                print(f"[core] R∈[{b0:.3f},{b1:.3f})  median(q)={np.median(qcore[sel]):.3e}  n={sel.sum()}")
-    if qcore.size:
-        bins = np.quantile(rm, [0.0, 0.25, 0.5, 0.75, 1.0])
-        for b0, b1 in zip(bins[:-1], bins[1:]):
-            sel = (rm>=b0) & (rm<b1)
-            if sel.any():
-                print(f"[core] R∈[{b0:.3f},{b1:.3f})  median(q)={np.median(qcore[sel]):.3e}  n={sel.sum()}")
+        # Per-shell (R bins) median of alignment in the core
+        Rmid3 = np.sqrt(XX[1:-1,1:-1,1:-1]**2 + YY[1:-1,1:-1,1:-1]**2)              # keep 3-D
+        rm    = Rmid3[mask_mid]                                                     # → 1-D
+        qcore = q[mask_mid]                                                         # → 1-D
+        if qcore.size:
+            bins = np.quantile(rm, [0.0, 0.25, 0.5, 0.75, 1.0])
+            for b0, b1 in zip(bins[:-1], bins[1:]):
+                sel = (rm >= b0) & (rm < b1)
+                if sel.any():
+                    print(f"[core] R∈[{b0:.3f},{b1:.3f})  median(q)={np.median(qcore[sel]):.3e}  n={sel.sum()}")
+        if qcore.size:
+            bins = np.quantile(rm, [0.0, 0.25, 0.5, 0.75, 1.0])
+            for b0, b1 in zip(bins[:-1], bins[1:]):
+                sel = (rm>=b0) & (rm<b1)
+                if sel.any():
+                    print(f"[core] R∈[{b0:.3f},{b1:.3f})  median(q)={np.median(qcore[sel]):.3e}  n={sel.sum()}")
             
         # sample only meaningful interior (mask_mid)
         qv = q[mask_mid].ravel()
@@ -1483,7 +1556,7 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
                     continue
                 segs = intersect_iso_with_phi_plane(Viso, Fiso, phi0)
                 # stitch segments into polylines; tolerance ~ voxel scale
-                tol = 0.75 * min(dx, dy, dz)
+                tol = 0.5 * min(dx, dy, dz)
                 polys = segments_to_polylines(segs, tol=tol)
                 nseg = draw_poincare_from_polylines(axp, polys)
             axp.set_aspect('equal', 'box')
@@ -1561,16 +1634,16 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("npz", nargs="?", default="wout_precise_QA_solution.npz",
+    ap.add_argument("npz", nargs="?", default="wout_precise_QH_solution.npz",
                     help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
-    ap.add_argument("--N", type=int, default=32, help="grid resolution per axis")
+    ap.add_argument("--N", type=int, default=48, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=0.12, help="perpendicular diffusion coefficient (smaller ⇒ more field-aligned)")
     ap.add_argument("--band-h", type=float, default=0.25, help="boundary band thickness multiplier")
     ap.add_argument("--cg-maxit", type=int, default=1000)
-    ap.add_argument("--axis-seed-count", type=int, default=128,
+    ap.add_argument("--axis-seed-count", type=int, default=0,
                     help="number of interior seeds to collapse onto axis; 0 = auto (~2% of interior, clamped to [16,128])")
-    ap.add_argument("--axis-band-radius", type=float, default=0.05,
+    ap.add_argument("--axis-band-radius", type=float, default=0,
                     help="axis band radius: 0=auto (1.5*voxel); (0,1)=fraction of bbox diagonal; >=1=absolute units")
     ap.add_argument("--cg-tol", type=float, default=1e-8)
     ap.add_argument("--no-plot", action="store_true")
@@ -1581,9 +1654,10 @@ if __name__ == "__main__":
     ap.add_argument("--fci-step-cells", type=float, default=0.4,
                     help="FCI step length along t̂ in multiples of the smallest voxel size")
     ap.add_argument("--alpha-par", type=float, default=1.0, help="scale factor multiplying the parallel (FCI) operator")
+    ap.add_argument("--delta-mult", type=float, default=1e-2, help="regularization delta multiplier (larger ⇒ more stable, less anisotropic)")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
                axis_seed_count=args.axis_seed_count, axis_band_radius=args.axis_band_radius,
                cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, plot=(not args.no_plot), psi0=args.psi0,
                nfp=args.nfp, psi_levels=args.psi_levels, save_figures=args.save_figures,
-               fci_step_cells=args.fci_step_cells, alpha_par=args.alpha_par)
+               fci_step_cells=args.fci_step_cells, alpha_par=args.alpha_par, delta_mult=args.delta_mult)
