@@ -18,7 +18,7 @@ The .npz must contain (as saved by main.py):
 from __future__ import annotations
 
 import os
-number_of_processors_to_use = 7 # Parallelization, this should divide nfieldlines
+number_of_processors_to_use = 8 # Parallelization, this should divide nfieldlines
 os.environ["XLA_FLAGS"] = f'--xla_force_host_platform_device_count={number_of_processors_to_use}'
 
 import time, argparse
@@ -38,6 +38,8 @@ import diffrax as dfx
 from jax import jit, vmap, tree_util, random, lax, device_put
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
 mesh = Mesh(jax.devices(), ("dev",))
 spec=PartitionSpec("dev", None)
 spec_index=PartitionSpec("dev")
@@ -45,28 +47,37 @@ sharding = NamedSharding(mesh, spec)
 sharding_index = NamedSharding(mesh, spec_index)
 out_sharding = NamedSharding(mesh, PartitionSpec("dev", None, None))
 
+# -------------------------- Paths and utils ------------------------- #
+script_dir = Path(__file__).resolve().parent
+
+def resolve_npz_file_location(npz_file, subdir="outputs"):
+    try:
+        npz_name = os.path.basename(str(npz_file))
+        candidate = (script_dir / ".." / subdir / npz_name).resolve()
+        if candidate.exists():
+            npz_file = str(candidate)
+            print(f"Resolved checkpoint path -> {npz_file}")
+        else:
+            print(f"[WARN] Expected checkpoint not found at {candidate}; using provided path: {npz_file}")
+    except Exception as e:
+        print(f"[WARN] Failed to resolve ../{subdir} path: {e}; using provided path: {npz_file}")
+    return npz_file
+
 # ----------------------------- Styling ----------------------------- #
+def fix_matplotlib_3d(ax):
+    x_limits = ax.get_xlim3d(); y_limits = ax.get_ylim3d(); z_limits = ax.get_zlim3d()
+    x_range = abs(x_limits[1]-x_limits[0]); x_mid = np.mean(x_limits)
+    y_range = abs(y_limits[1]-y_limits[0]); y_mid = np.mean(y_limits)
+    z_range = abs(z_limits[1]-z_limits[0]); z_mid = np.mean(z_limits)
+    R = 0.5 * max([x_range, y_range, z_range])
+    ax.set_xlim3d([x_mid-R, x_mid+R]); ax.set_ylim3d([y_mid-R, y_mid+R]); ax.set_zlim3d([z_mid-R, z_mid+R])
+
 def apply_paper_style():
     fig_w = 5.5
-    mpl.rcParams.update({
-        "figure.figsize": (fig_w, fig_w),
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight",
-        "font.size": 12,
-        "axes.titlesize": 13,
-        "axes.labelsize": 12.5,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
-        "legend.fontsize": 10.5,
-        "axes.linewidth": 0.9,
-        "xtick.major.width": 0.8,
-        "ytick.major.width": 0.8,
-        "xtick.major.size": 4,
-        "ytick.major.size": 4,
-        "xtick.minor.size": 2.5,
-        "ytick.minor.size": 2.5,
-        "text.usetex": False,
-    })
+    mpl.rcParams.update({"figure.figsize": (fig_w, fig_w),
+        "savefig.dpi": 300, "savefig.bbox": "tight", "font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12.5, "xtick.labelsize": 11,
+        "ytick.labelsize": 11, "legend.fontsize": 10.5, "axes.linewidth": 0.9, "xtick.major.width": 0.8, "ytick.major.width": 0.8,
+        "xtick.major.size": 4, "ytick.major.size": 4, "xtick.minor.size": 2.5, "ytick.minor.size": 2.5, "text.usetex": False})
     return fig_w
 
 def set_equal_data_aspect(ax, rmin, rmax, zmin, zmax, pad_frac=0.03):
@@ -212,8 +223,10 @@ def load_mfs_solution(npz_path: str):
         return grad_mv_point_world(x) + grad_psi_point_world(x)
 
     # For surface coloring (value not required, but handy)
+    @jax.jit
     def u_fn(xs: jnp.ndarray) -> jnp.ndarray:
         xs = xs.reshape(-1, 3)
+        G  = jax.vmap(lambda x: _green_G((x - center) * scale, Yn))(xs)
         vals = jax.vmap(psi_point_world)(xs)
         return vals.reshape((-1,))
 
@@ -332,6 +345,41 @@ def make_rhs(grad_u_point: Callable[[jnp.ndarray], jnp.ndarray],
         return g
     return f
 
+@jax.jit
+def _cum_and(mask_t):
+    return jax.lax.associative_scan(lambda a, b: a & b, mask_t, axis=0)
+
+@jax.jit
+def _keep_entered(mask_t: jnp.ndarray) -> jnp.ndarray:
+    def step(carry, m):
+        started, alive = carry
+        started_new = jnp.logical_or(started, m)
+        alive_new   = jnp.where(started_new, jnp.logical_and(alive, m), True)
+        keep        = jnp.logical_and(started_new, alive_new)
+        return (started_new, alive_new), keep
+    (_, _), keep_seq = lax.scan(step, (jnp.bool_(False), jnp.bool_(True)), mask_t)
+    return keep_seq
+
+def make_streamline_solver(f, ts, dt0_signed, n_save, rtol, atol):
+    solver = dfx.Tsit5()  # or Dopri8, your choice
+    stepsize_controller = dfx.PIDController(rtol=rtol, atol=atol)
+    term = dfx.ODETerm(f)
+    saveat = dfx.SaveAt(ts=ts)
+
+    def _solve_one(y0):
+        sol = dfx.diffeqsolve(
+            term, solver, t0=0.0, t1=ts[-1], dt0=dt0_signed,
+            y0=y0, stepsize_controller=stepsize_controller,
+            max_steps=200_000, saveat=saveat
+        )
+        return sol.ys
+
+    return jax.jit(
+        jax.vmap(_solve_one),
+        in_shardings=sharding,
+        out_shardings=out_sharding,
+    )
+
 def integrate_streamlines_vmap(
     seeds: np.ndarray,
     f,
@@ -344,31 +392,12 @@ def integrate_streamlines_vmap(
     rtol: float = 1e-5,
     atol: float = 1e-7,
 ):
-    seeds = jnp.asarray(seeds, dtype=jnp.float64)
-    t0, t1 = (0.0, -t_final) if backward else (0.0, t_final)
     dt0_signed = -abs(dt0) if backward else abs(dt0)
+    t_final = -abs(t_final) if backward else abs(t_final)
+    ts = jnp.linspace(0, t_final, int(n_save), dtype=jnp.float64)
 
-    solver = dfx.Dopri8()
-    stepsize_controller = dfx.PIDController(rtol=rtol, atol=atol)
-    term = dfx.ODETerm(f)
-    ts = jnp.linspace(t0, t1, int(n_save), dtype=jnp.float64)
-    saveat = dfx.SaveAt(ts=ts)
-
-    def _solve_one(y0):
-        sol = dfx.diffeqsolve(
-            term, solver, t0=t0, t1=t1, dt0=dt0_signed, y0=y0,
-            stepsize_controller=stepsize_controller,
-            max_steps=200_000, saveat=saveat
-        )
-        return sol.ys
-
-    ys_all = jax.jit(
-        jax.vmap(_solve_one),
-        in_shardings=sharding,          # one arg -> one sharding; seeds has shape (S,3)
-        out_shardings=out_sharding      # output (S, n_save, 3)
-    )(
-        device_put(seeds, sharding)     # put seeds on sharded devices
-    )
+    vmapped_solver = make_streamline_solver(f, ts, dt0_signed, n_save, rtol, atol)
+    ys_all = vmapped_solver(device_put(seeds, sharding))
 
     x_min, x_max, y_min, y_max, z_min, z_max = box
     X, Y, Z = ys_all[..., 0], ys_all[..., 1], ys_all[..., 2]
@@ -421,32 +450,44 @@ def _wrap_diff_jnp(a_minus_b):
 
 @jax.jit
 def poincare_RZ_points_jax_dense(Y_all: jnp.ndarray, phi0: float):
+    # Y_all: (S, T, 3)
     valid = ~jnp.any(jnp.isnan(Y_all), axis=-1)            # (S,T)
     X = Y_all[..., 0]; Y = Y_all[..., 1]; Z = Y_all[..., 2]
     phi = jnp.arctan2(Y, X)
     dphi = _wrap_diff_jnp(phi - phi0)
     s = jnp.sign(dphi)
     s = jnp.where(s == 0.0, 1.0, s)
+
     valid_seg = valid[..., :-1] & valid[..., 1:]
     changed   = (s[..., :-1] * s[..., 1:] < 0.0) & valid_seg
+
     p0 = Y_all[:, :-1, :]
     p1 = Y_all[:,  1:, :]
     d0 = dphi[:, :-1]
     d1 = dphi[:,  1:]
     t = jnp.clip(d0 / (d0 - d1), 0.0, 1.0)
     p = p0 + t[..., None] * (p1 - p0)
-    R = jnp.linalg.norm(p[..., :2], axis=-1)
-    Zc = p[..., 2]
+
+    R  = jnp.linalg.norm(p[..., :2], axis=-1)  # (S, T-1)
+    Zc = p[..., 2]                             # (S, T-1)
+
+    # Flatten everything
+    S, Tm1 = R.shape
     R_flat    = R.reshape(-1)
     Z_flat    = Zc.reshape(-1)
     mask_flat = changed.reshape(-1)
-    return R_flat, Z_flat, mask_flat
+
+    # Seed index for each candidate: 0..S-1 repeated along time
+    seed_idx  = jnp.tile(jnp.arange(S)[:, None], (1, Tm1))  # (S, T-1)
+    seed_flat = seed_idx.reshape(-1)
+
+    return R_flat, Z_flat, mask_flat, seed_flat
+
 
 def poincare_multi_phi_jax(Y_all: jnp.ndarray, phis: jnp.ndarray):
-    R_flat, Z_flat, M_flat = jax.vmap(poincare_RZ_points_jax_dense, in_axes=(None, 0))(Y_all, phis)
-    R_list = [np.asarray(R_flat[k])[np.asarray(M_flat[k])] for k in range(R_flat.shape[0])]
-    Z_list = [np.asarray(Z_flat[k])[np.asarray(M_flat[k])] for k in range(Z_flat.shape[0])]
-    return R_list, Z_list
+    R_flat, Z_flat, M_flat, seed_flat = jax.vmap(
+        poincare_RZ_points_jax_dense, in_axes=(None, 0))(Y_all, phis)
+    return R_flat, Z_flat, M_flat, seed_flat
 
 # ------------------------------- Main ------------------------------- #
 def main(mfs_npz: str,
@@ -512,6 +553,7 @@ def main(mfs_npz: str,
     print(f"[BOX] Integration box: x[{x_min:.3f}, {x_max:.3f}], y[{y_min:.3f}, {y_max:.3f}], z[{z_min:.3f}, {z_max:.3f}]")
 
     # Integrate fwd/back in parallel
+    print(f"[INTEGRATION] Starting integration with {seeds_arr.shape[0]} seeds, t_final={t_final}, n_save={n_save}")
     t0 = time.time()
     ts_f, Yf = integrate_streamlines_vmap(
         seeds_arr, f, t_final=t_final, box=box,
@@ -528,23 +570,68 @@ def main(mfs_npz: str,
     # Poincaré (optional)
     if poincare_phi and len(poincare_phi) > 0:
         phis = jnp.asarray(poincare_phi, dtype=jnp.float64)
-        R_list, Z_list = poincare_multi_phi_jax(jnp.asarray(Y), phis)
+
+        # NEW: get flat arrays + seed indices
+        R_flat, Z_flat, M_flat, seed_flat = poincare_multi_phi_jax(jnp.asarray(Y), phis)
+
         apply_paper_style()
         fig_p, ax_p = plt.subplots()
         any_points = False
+
+        S = Y.shape[0]  # number of seeds / field lines
+        cmap = mpl.colormaps.get_cmap("tab10")  # or "tab10" if S<=10
+
+        # For axis limits later
+        all_R = []
+        all_Z = []
+
+        # Loop over Poincaré planes
         for k, phi0 in enumerate(np.asarray(phis)):
-            R, Z = R_list[k], Z_list[k]
-            if R.size == 0: continue
+            Rf = np.asarray(R_flat[k])
+            Zf = np.asarray(Z_flat[k])
+            Mf = np.asarray(M_flat[k])
+            Sf = np.asarray(seed_flat[k])
+
+            # Keep only valid intersections
+            Rk = Rf[Mf]
+            Zk = Zf[Mf]
+            Sk = Sf[Mf]
+
+            if Rk.size == 0:
+                continue
+
             any_points = True
-            if poincare_label_pi:
-                ax_p.scatter(R, Z, s=0.3, alpha=0.85, rasterized=True, label=phi_label_pi(float(phi0), wrap=True))
-            else:
-                ax_p.scatter(R, Z, s=0.3, alpha=0.85, rasterized=True, color="b")
-        ax_p.set_xlabel(r"$R=\sqrt{x^2+y^2}$"); ax_p.set_ylabel(r"$Z$")
+            all_R.append(Rk)
+            all_Z.append(Zk)
+
+            # Plot each seed with its own color
+            for s in range(S):
+                mask_s = (Sk == s)
+                if not np.any(mask_s):
+                    continue
+                color = cmap(s)
+                if poincare_label_pi:
+                    # optional: only label once per seed for legend clarity
+                    label = f"seed {s}" if k == 0 else None
+                    ax_p.scatter(
+                        Rk[mask_s], Zk[mask_s],
+                        s=0.5, alpha=0.85, rasterized=True,
+                        color=color, label=label,
+                    )
+                else:
+                    ax_p.scatter(
+                        Rk[mask_s], Zk[mask_s],
+                        s=0.5, alpha=0.85, rasterized=True,
+                        color=color,
+                    )
+
+        ax_p.set_xlabel(r"$R=\sqrt{x^2+y^2}$")
+        ax_p.set_ylabel(r"$Z$")
         ax_p.set_title(r"Poincaré section(s): cylindrical $\phi$")
+
         if any_points:
-            R_all = np.concatenate([r for r in R_list if r.size])
-            Z_all = np.concatenate([z for z in Z_list if z.size])
+            R_all = np.concatenate(all_R)
+            Z_all = np.concatenate(all_Z)
 
             if args.poincare_tight:
                 p_lo, p_hi = args.poincare_pct
@@ -565,7 +652,6 @@ def main(mfs_npz: str,
                 ax_p.set_ylim(zlo, zhi)
                 ax_p.set_aspect("auto")  # key line: don't force equal aspect
             else:
-                # current behavior
                 rmin, rmax = float(np.min(R_all)), float(np.max(R_all))
                 zmin, zmax = float(np.min(Z_all)), float(np.max(Z_all))
                 set_equal_data_aspect(ax_p, rmin, rmax, zmin, zmax, pad_frac=0.03)
@@ -575,66 +661,93 @@ def main(mfs_npz: str,
 
         if poincare_label_pi:
             ax_p.legend(loc="best", frameon=True, framealpha=0.85)
+
         fig_p.tight_layout()
         if save_figure:
             suffix = "_multi" if len(phis) > 1 else f"_phi{float(phis[0]):.6f}".replace(".", "p").replace("-", "m")
             poincare_out = mfs_npz.replace(".npz", "_poincare")
             fig_p.savefig(f"{poincare_out}{suffix}.png")
-            # fig_p.savefig(f"{poincare_out}{suffix}.pdf")
             print(f"[POINCARE] Saved {poincare_out}{suffix}.png")
 
-    # Plot 3D with |∇φ| on boundary points
-    fig = plt.figure(figsize=(8,6))
-    ax = fig.add_subplot(111, projection="3d")
+    # -------------------- 3D viewer: boundary + field lines -------------------- #
+    # Plot 3D with |∇φ| on boundary points and field lines
+    fig_3d = plt.figure(figsize=(8, 6))
+    ax_3d = fig_3d.add_subplot(111, projection="3d")
 
     # Color boundary points by |∇φ|
     Pj = jnp.asarray(P, dtype=jnp.float64)
-    def _u_point(x): return u_fn(x[None,:]).squeeze()
-    grad_point = jax.jit(jax.grad(_u_point))
-    G = jax.vmap(grad_point_fn)(Pj)          # (Nb,3)
-    Gm = np.linalg.norm(np.asarray(G), axis=1)
-    vmin, vmax = float(np.nanpercentile(Gm, 1.0)), float(np.nanpercentile(Gm, 99.0))
-    m = mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax), cmap="viridis")
-    colors = m.to_rgba(Gm)
-    ax.scatter(P[:,0], P[:,1], P[:,2], c=colors, s=1, depthshade=False, alpha=0.85)
-    cb = plt.colorbar(m, ax=ax, pad=0.05); cb.set_label(r"$|\nabla \phi|$ on $\Gamma$")
+    G = jax.vmap(grad_point_fn)(Pj)              # (Nb, 3)
+    Gm = np.linalg.norm(np.asarray(G), axis=1)   # |∇φ| on boundary
+
+    # Robust color limits (avoid outliers)
+    vmin = float(np.nanpercentile(Gm, 1.0))
+    vmax = float(np.nanpercentile(Gm, 99.0))
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = mpl.colormaps.get_cmap("viridis")
+    mappable = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    colors = mappable.to_rgba(Gm)
+
+    ax_3d.scatter(
+        P[:, 0], P[:, 1], P[:, 2],
+        c=colors, s=1, depthshade=False, alpha=0.85
+    )
+    cb = plt.colorbar(mappable, ax=ax_3d, pad=0.05)
+    cb.set_label(r"$|\nabla \phi|$ on $\Gamma$")
 
     # Field lines
     for line in Y:
-        ax.plot(line[:, 0], line[:, 1], line[:, 2], lw=1.1)
-    ax.scatter(seeds_arr[:,0], seeds_arr[:,1], seeds_arr[:,2], s=18, depthshade=True, color="k")
+        ax_3d.plot(line[:, 0], line[:, 1], line[:, 2], lw=1.1)
 
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-    ax.set_title("Field lines of ∇φ (MFS)")
-    ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max); ax.set_zlim(z_min, z_max)
-    plt.tight_layout()
+    # Seed points
+    ax_3d.scatter(
+        seeds_arr[:, 0], seeds_arr[:, 1], seeds_arr[:, 2],
+        s=18, depthshade=True, color="k"
+    )
+
+    ax_3d.set_xlabel("x")
+    ax_3d.set_ylabel("y")
+    ax_3d.set_zlabel("z")
+    ax_3d.set_title("Field lines of ∇φ (MFS)")
+
+    fix_matplotlib_3d(ax_3d)
+
+    fig_3d.tight_layout()
     if save_figure:
         figure_out = mfs_npz.replace(".npz", "_fieldlines.png")
-        fig.savefig(figure_out)
+        fig_3d.savefig(figure_out)
         print(f"[FIGURE] Saved {figure_out}")
+
     plt.show()
 
 if __name__ == "__main__":
+    ### Solutions available in the repo (uncomment one to use as default)
+    # default_solution = "wout_precise_QA_solution.npz";
+    # default_solution = "wout_precise_QH_solution.npz";
+    default_solution = "wout_SLAM_4_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
+
+    nfp_default = 2; tfinal_default = 1200.0; seeds_default = None; n_save_default = 8
+    if 'QH' in default_solution: nfp_default = 4
+    if 'SLAM' in default_solution:
+        n_save_default = 0.5; tfinal_default = 15000; seeds_default = "2.55:0:0,2.65:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
     ap = argparse.ArgumentParser()
     ### MAIN PARAMETERS TO CHANGE
-    # Single argument usable as positional or optional (--file / -f).
-    ap.add_argument("file", nargs="?", type=str, default="wout_precise_QH_solution.npz",
+    ap.add_argument("file", nargs="?", type=str, default=resolve_npz_file_location(default_solution),
                     help="Path to mfs_solution.npz (positional or --file).")
     ap.add_argument("-f", "--file", dest="file", type=str, help="Path to mfs_solution.npz (overrides positional if both given).")
-    ap.add_argument("--nfp", type=int, default=4, help="Number of field periods for Poincaré sampling.")
-    ap.add_argument("--tfinal", type=float, default=800.0, help="Final integration time for streamlines.")
-    ap.add_argument("--save-figure", action="store_true", default=True, help="Save figures to disk instead of just showing.")
+    ap.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods for Poincaré sampling.")
+    ap.add_argument("--tfinal", type=float, default=tfinal_default, help="Final integration time for streamlines.")
+    ap.add_argument("--n-save", type=int, default=n_save_default, help="Factor => total output points = n_save * tfinal")
     ### NUMBER OF FIELDLINES, NSEED, WILL BE THE NUMBER OF PROCESSORS USED (DEFINED ON TOP)
+    ap.add_argument("--save-figure", action="store_true", default=True, help="Save figures to disk instead of just showing.")
     ap.add_argument("--nseed", type=int, default=None)
     ap.add_argument("--normalize", action="store_true")
     ap.add_argument("--clip", type=float, default=None)
     ap.add_argument("--eps", type=float, default=1e-2)
-    ap.add_argument("--rtol", type=float, default=1e-9)
-    ap.add_argument("--atol", type=float, default=1e-9)
-    ap.add_argument("--n-save", type=int, default=5,
-                    help="Factor => total output points = n_save * tfinal")
+    ap.add_argument("--rtol", type=float, default=1e-6)
+    ap.add_argument("--atol", type=float, default=1e-6)
     ap.add_argument("--poincare-label-pi", action="store_true", help="Use π-fraction labels on Poincaré plots.")
-    ap.add_argument("--box-pad", type=float, default=0.10)
+    ap.add_argument("--box-pad", type=float, default=0.40)
     ap.add_argument("--poincare-nphi", type=int, default=4)
     ap.add_argument("--seed-mode", choices=["axis", "boundary"], default="axis",
                     help="axis: chord across center using a_hat; boundary: old inward-offset sampling")
@@ -645,20 +758,14 @@ if __name__ == "__main__":
                     help="Tight axes based on data percentiles; disables equal aspect.")
     ap.add_argument("--poincare-pad-frac", type=float, default=0.03,
                     help="Padding fraction for tight Poincaré limits.")
-    ap.add_argument("--poincare-pct", type=float, nargs=2, default=[1.0, 99.0],
+    ap.add_argument("--poincare-pct", type=float, nargs=2, default=[0.1, 99.9],
                     help="Low/high percentiles for tight limits (e.g., 1 99).")
     ap.add_argument("--mask-mode", choices=["strict","instant","entered","none"],
-                    default="entered",
-                    help="Masking policy: "
-                        "strict=cumulative AND from t0; "
-                        "instant=keep only samples inside; "
-                        "entered=keep after first entry until exit; "
-                        "none=no masking.")
+                    default="entered", help="Masking policy: ""strict=cumulative AND from t0; "
+                        "instant=keep only samples inside; " "entered=keep after first entry until exit; " "none=no masking.")
     ap.add_argument("--mask-report", action="store_true", default=True, help="Print per-line mask stats.")
-    ap.add_argument(
-        "--seeds", type=str, default=None,
-        help="Comma-separated list of seed points as x:y:z,x:y:z,... (overrides automatic seed computation)"
-    )
+    ap.add_argument("--seeds", type=str, default=seeds_default,
+        help="Comma-separated list of seed points as x:y:z,x:y:z,... (overrides automatic seed computation)")
 
     args = ap.parse_args()
 
@@ -669,32 +776,21 @@ if __name__ == "__main__":
             user_seeds = []
             for item in args.seeds.split(","):
                 xyz = tuple(float(v) for v in item.split(":"))
-                if len(xyz) == 3:
-                    user_seeds.append(xyz)
-            if len(user_seeds) == 0:
-                user_seeds = None
+                if len(xyz) == 3: user_seeds.append(xyz)
+            if len(user_seeds) == 0: user_seeds = None
         except Exception as e:
             print(f"[ERROR] Could not parse --seeds argument: {e}")
             user_seeds = None
 
-    args.poincare_phi = jnp.linspace(0, 2*jnp.pi/args.nfp, args.poincare_nphi, endpoint=False).tolist()
+    if "SLAM" in args.file:
+        args.poincare_phi = [0., 1.57079633]#, 2.6]
+    else:
+        args.poincare_phi = jnp.linspace(0, 2*jnp.pi/args.nfp, args.poincare_nphi, endpoint=False).tolist()
     args.nseed = number_of_processors_to_use
 
     n_save = int(args.n_save * args.tfinal)
-    main(
-        mfs_npz=args.file,
-        seeds=user_seeds,
-        t_final=args.tfinal,
-        normalize=args.normalize,
-        clip_grad=args.clip,
-        nseed=args.nseed,
-        eps=args.eps,
-        rtol=args.rtol,
-        atol=args.atol,
-        n_save=n_save,
-        box_pad=args.box_pad,
-        poincare_phi=args.poincare_phi,
-        save_figure=args.save_figure,
-        poincare_label_pi=args.poincare_label_pi,
-        args=args
-    )
+    main( mfs_npz=args.file, seeds=user_seeds,
+        t_final=args.tfinal, normalize=args.normalize, clip_grad=args.clip,
+        nseed=args.nseed, eps=args.eps, rtol=args.rtol, atol=args.atol,
+        n_save=n_save, box_pad=args.box_pad, poincare_phi=args.poincare_phi,
+        save_figure=args.save_figure, poincare_label_pi=args.poincare_label_pi, args=args)

@@ -30,6 +30,24 @@ from scipy.interpolate import RegularGridInterpolator as RGI
 from matplotlib.patches import Rectangle
 import itertools
 import diffrax as dfx
+import os
+from pathlib import Path
+
+# -------------------------- Paths and utils ------------------------- #
+script_dir = Path(__file__).resolve().parent
+
+def resolve_npz_file_location(npz_file, subdir="outputs"):
+    try:
+        npz_name = os.path.basename(str(npz_file))
+        candidate = (script_dir / ".." / subdir / npz_name).resolve()
+        if candidate.exists():
+            npz_file = str(candidate)
+            print(f"Resolved checkpoint path -> {npz_file}")
+        else:
+            print(f"[WARN] Expected checkpoint not found at {candidate}; using provided path: {npz_file}")
+    except Exception as e:
+        print(f"[WARN] Failed to resolve ../{subdir} path: {e}; using provided path: {npz_file}")
+    return npz_file
 
 # ---------------------------- Debug utils ---------------------------- #
 def pct(a, p): return float(np.percentile(np.asarray(a), p))
@@ -1235,7 +1253,6 @@ def draw_RZ_box(ax, Rs, Zs, pad_frac=0.01):
     ax.set_ylim(Zmin - pad_frac*dZ, Zmax + pad_frac*dZ)
     # Draw rectangle slightly *inside* the true window
     epsR = 0.002*dR; epsZ = 0.002*dZ
-    from matplotlib.patches import Rectangle
     rect = Rectangle((Rmin+epsR, Zmin+epsZ),
                      dR-2*epsR, dZ-2*epsZ,
                      fill=False, linewidth=1.5,
@@ -1297,7 +1314,6 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
          cg_tol=1e-8, cg_maxit=2000, verbose=True, plot=True, nfp=2, delta=5e-3,
          save_figures=True, NR=12, NZ=12, Nphi=32, debug_probe_p=False):
 
-    pinfo(f"Loading MFS checkpoint: {npz_file}")
     dat = np.load(npz_file, allow_pickle=True)
     center = dat["center"]; scale = float(dat["scale"])
     Yn = dat["Yn"]; alpha = dat["alpha"]; a = dat["a"]; a_hat = dat["a_hat"]
@@ -2190,9 +2206,17 @@ def main(npz_file, grid_N=96, eps=1e-3, band_h=1.5, axis_seed_count=0, axis_band
     return dict(psi=psi, grid=grid, inside=inside, quality=dict(parallel_dot_grad=par, residual=r_full))
 
 if __name__ == "__main__":
+    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QH_solution.npz"
+    # default_solution = "wout_SLAM_4_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("npz", nargs="?", default="wout_precise_QA_solution.npz",
+    ap.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                     help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
+    ap.add_argument("--NR", type=int, default=32)
+    ap.add_argument("--NZ", type=int, default=32)
+    ap.add_argument("--Nphi", type=int, default=128)
     ap.add_argument("--nfp", type=int, default=2, help="number of field periods (for plotting)")
     ap.add_argument("--N", type=int, default=48, help="grid resolution per axis")
     ap.add_argument("--eps", type=float, default=1e-3, help="parallel diffusion weight (smaller => more field-aligned)")
@@ -2206,9 +2230,6 @@ if __name__ == "__main__":
     ap.add_argument("--cg-tol", type=float, default=1e-12)
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--save-figures", action="store_true", default=True, help="save figures instead of showing interactively")
-    ap.add_argument("--NR", type=int, default=32)
-    ap.add_argument("--NZ", type=int, default=32)
-    ap.add_argument("--Nphi", type=int, default=64)
     ap.add_argument("--debug-probe-p", action="store_true", default=False, help="enable detailed probe prints during CSR build")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,

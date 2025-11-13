@@ -49,11 +49,31 @@ from scipy.interpolate import griddata
 from jax import debug as jax_debug
 from functools import partial
 import argparse
+import os
+from pathlib import Path
 
 # ------------------------- JAX: 64-bit ------------------------- #
 jax.config.update("jax_enable_x64", True)
 
-# -------------------------- Small utils ------------------------ #
+# -------------------------- Paths and utils ------------------------- #
+script_dir = Path(__file__).resolve().parent
+
+def get_candidates(file_name, subdir="inputs"):
+    try:
+        candidate_xyz = (script_dir / ".." / subdir / (file_name + ".csv")).resolve()
+        candidate_normals = (script_dir / ".." / subdir / (file_name+'_normals.csv')).resolve()
+        if candidate_xyz.exists():
+            candidate_xyz = str(candidate_xyz)
+            print(f"Resolved checkpoint path -> {candidate_xyz}")
+        else: print(f"[WARN] Expected checkpoint not found at {candidate_xyz}; using provided path: {candidate_xyz}")
+        if candidate_normals.exists():
+            candidate_normals = str(candidate_normals)
+            print(f"Resolved checkpoint path -> {candidate_normals}")
+        else: print(f"[WARN] Expected checkpoint not found at {candidate_normals}; using provided path: {candidate_normals}")
+    except Exception as e:
+        print(f"[WARN] Failed to resolve ../{subdir} path: {e}; using provided path: {candidate_xyz}")
+    return candidate_xyz, candidate_normals
+
 def pct(a, p): return float(np.percentile(np.asarray(a), p))
 
 def vec_stats(title, v, W=None):
@@ -1338,23 +1358,16 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     )
 
 if __name__ == "__main__":
-    # default_xyz = "wout_precise_QA.csv"
-    # default_normals = "wout_precise_QA_normals.csv"
-    default_xyz = "slam_surface.csv"
-    default_normals = "slam_surface_normals.csv"
-    # default_xyz = "sflm_rm4.csv"
-    # default_normals = "sflm_rm4_normals.csv"
-    # default_xyz = "wout_precise_QH.csv"
-    # default_normals = "wout_precise_QH_normals.csv"
+    # default_normals = "wout_precise_QA"
+    # default_normals = "wout_precise_QH"
+    # file_name = "wout_SLAM_6_coils"
+    file_name = "wout_SLAM_4_coils"
+    candidate_xyz, candidate_normals = get_candidates(file_name, subdir="inputs")
     ap = argparse.ArgumentParser()
-    ap.add_argument("xyz", nargs="?", default=default_xyz,
+    ap.add_argument("xyz", nargs="?", default=candidate_xyz,
                     help="CSV file with x,y,z columns (positional or --xyz)")
-    ap.add_argument("normals", nargs="?", default=default_normals,
+    ap.add_argument("normals", nargs="?", default=candidate_normals,
                     help="CSV file with nx,ny,nz columns (positional or --nrm)")
-    ap.add_argument("--xyz", dest="xyz_flag", default=default_xyz,
-                    help="CSV file with x,y,z columns (alternative to positional)")
-    ap.add_argument("--normals", dest="nrm_flag", default=default_normals,
-                    help="CSV file with nx,ny,nz columns (alternative to positional)")
     ap.add_argument("--sf_min", type=float, default=1.0, help="Min source factor for autotuning")
     ap.add_argument("--sf_max", type=float, default=6.5, help="Max source factor for autotuning")
     ap.add_argument("--lbfgs-maxiter", type=int, default=5, help="Max iterations for L-BFGS")
@@ -1373,6 +1386,8 @@ if __name__ == "__main__":
 
     if args.mfs_out == None:
         args.mfs_out = args.xyz.replace(".csv", "_solution.npz")
+        args.mfs_out = str((script_dir / ".." / "outputs" / os.path.basename(args.mfs_out)).resolve())
+        print(f"[INFO] No --mfs-out provided; defaulting to {args.mfs_out}")
 
     out = main(
         xyz_csv=args.xyz, nrm_csv=args.normals,
@@ -1387,12 +1402,7 @@ if __name__ == "__main__":
     )
 
     # --- SAVE a portable checkpoint for the tracer ---
-    # Pull everything we need out of 'out' and the local scope
     try:
-        # Objects available at end of main():
-        #   P, N, Pn, W, rk, h_med, alpha, a, delta_n, eps_n,
-        #   phi_fn, grad_fn, psi_fn, grad_psi_fn, laplacian_psi_fn
-        # Local names still in scope here: scinfo, Yn, best/kind, best["a_hat"]
         np.savez(
             args.mfs_out,
             center=np.asarray(out["scinfo"].center, dtype=float),
