@@ -96,23 +96,35 @@ import jax.numpy as jnp
 from jax import jit, vmap
 
 from sklearn.neighbors import NearestNeighbors
-from scipy.sparse import coo_matrix, diags as spdiags
+from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import LinearOperator, cg, minres
 from pyamg import smoothed_aggregation_solver
-from sklearn.cluster import DBSCAN
 import diffrax as dfx
 import matplotlib.pyplot as plt
+import os
+from pathlib import Path
+
+# -------------------------- Paths and utils ------------------------- #
+script_dir = Path(__file__).resolve().parent
+
+def resolve_npz_file_location(npz_file, subdir="outputs"):
+    try:
+        npz_name = os.path.basename(str(npz_file))
+        candidate = (script_dir / ".." / subdir / npz_name).resolve()
+        if candidate.exists():
+            npz_file = str(candidate)
+            print(f"Resolved checkpoint path -> {npz_file}")
+        else:
+            print(f"[WARN] Expected checkpoint not found at {candidate}; using provided path: {npz_file}")
+    except Exception as e:
+        print(f"[WARN] Failed to resolve ../{subdir} path: {e}; using provided path: {npz_file}")
+    return npz_file
 
 # ---------------------------- Debug utils ---------------------------- #
 def pct(a, p): return float(np.percentile(np.asarray(a), p))
 def pinfo(msg): print(f"[INFO] {msg}")
 def pstat(msg, v):
     v=np.asarray(v); print(f"[STAT] {msg}: min={v.min():.3e} med={np.median(v):.3e} max={v.max():.3e} L2={np.linalg.norm(v):.3e}")
-def stat01(v): 
-    v = np.asarray(v)
-    p = np.percentile(v, [0, 1, 5, 25, 50, 75, 95, 99, 100])
-    print(f"[ψ stats] min={p[0]:.3e} p1={p[1]:.3e} p5={p[2]:.3e} "
-          f"p50={p[4]:.3e} p95={p[6]:.3e} p99={p[7]:.3e} max={p[8]:.3e}")
 
 # ----------------------------- Geometry utilities ---------------------------- #
 def axis_band_mask(P_axis, Xq, rad):
@@ -739,27 +751,67 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     if verbose:
         pinfo(f"Axis orbit integrated; sample point: R={axis_pts[0,0]:.3e}, Z={axis_pts[0,2]:.3e}")
 
+    # Debug: are axis points inside or outside the surface?
+    inside_axis, _, signed_axis = inside_mask_from_surface(P, Nsurf, axis_pts)
+    if verbose:
+        pinfo(
+            f"Axis vs surface signed distance: "
+            f"min={signed_axis.min():.3e}, max={signed_axis.max():.3e}"
+        )
+        pinfo(f"Axis points classified inside: {inside_axis.sum()} / {inside_axis.size}")
+
     # Build boundary band and axis band
     bbox_diag = float(np.linalg.norm(maxs - mins))
     if axis_band_radius == 0.0:
-        axis_band_radius_eff = 1.5 * voxel
+        # Start with a few voxels; will adjust if needed
+        axis_band_radius_eff = 2.5 * voxel
     elif axis_band_radius < 1.0:
-        axis_band_radius_eff = max(1.5 * voxel, axis_band_radius * bbox_diag)
+        axis_band_radius_eff = max(2.5 * voxel, axis_band_radius * bbox_diag)
     else:
-        axis_band_radius_eff = max(1.5 * voxel, float(axis_band_radius))
-    h_band_vox = max(2.0 * voxel, float(band_h) * voxel)
-    # Axis band by nearest neighbours to axis points
+        axis_band_radius_eff = max(2.5 * voxel, float(axis_band_radius))
+
+    h_band_vox = max(1.5 * voxel, float(band_h) * voxel)
+
+    # ---------------- Axis band (primary guess) ----------------
     axis_band = axis_band_mask(axis_pts, Xq, axis_band_radius_eff) & inside_mask
-    # Boundary band by projecting onto surface and thresholding signed distance
-    # Equivalent to morphological band:  inside and |signed_dist| <= h_band_vox
+
+    # If the band is empty, adaptively pick the innermost inside nodes
+    if not np.any(axis_band):
+        if verbose:
+            pinfo("Axis band empty; rebuilding adaptively based on distance to axis.")
+
+        # Distances to axis curve for all grid points
+        nbrs_axis = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(axis_pts)
+        d_axis, _ = nbrs_axis.kneighbors(Xq)
+        d_axis = d_axis[:, 0]
+
+        inside_idx = np.where(inside_mask)[0]
+        if inside_idx.size == 0:
+            raise RuntimeError("Inside mask empty when building axis band.")
+
+        # Choose a small fraction of innermost inside nodes as axis band
+        frac = 0.02  # 2% of inside nodes
+        n_axis_nodes = max(10, int(frac * inside_idx.size))
+        order = np.argsort(d_axis[inside_idx])
+        chosen = inside_idx[order[:n_axis_nodes]]
+
+        axis_band = np.zeros_like(inside_mask, dtype=bool)
+        axis_band[chosen] = True
+        axis_band_radius_eff = float(d_axis[chosen].max())
+
+        if verbose:
+            pinfo(
+                f"Axis band rebuilt adaptively with {n_axis_nodes} nodes; "
+                f"effective radius ≈ {axis_band_radius_eff:.3e}"
+            )
+
+    # ---------------- Boundary band ----------------
     band = (inside_mask & (np.abs(signed_dist) <= h_band_vox))
+
     # Ensure axis band dominates boundary band where they overlap
     overlap = band & axis_band
     axis_band[overlap] = True
     band[overlap] = False
-    if verbose:
-        pstat("Boundary band fraction", band.astype(float))
-        pstat("Axis band fraction", axis_band.astype(float))
 
     # Prepare Dirichlet masks and values
     Ntot = Xq.shape[0]
@@ -768,6 +820,14 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     fixed[band] = True; val[band] = 1.0
     fixed[axis_band] = True; val[axis_band] = 0.0
     free = inside_mask & (~fixed)
+
+    if verbose:
+        print(f"[INFO] #inside nodes        : {inside_mask.sum()} / {Ntot}")
+        print(f"[INFO] #boundary band nodes : {band.sum()} / {Ntot}")
+        print(f"[INFO] #axis band nodes     : {axis_band.sum()} / {Ntot}")
+        print(f"[INFO] boundary band width  ≈ {h_band_vox:.3e}")
+        print(f"[INFO] axis band radius     ≈ {axis_band_radius_eff:.3e}")
+
     if not np.any(free):
         raise RuntimeError("No free interior nodes; bands cover the entire domain.")
     # Evaluate ∇φ on the grid (chunked to save memory)
@@ -810,22 +870,23 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         return sqrtV * r_free
     A_sym = LinearOperator((Nfree, Nfree), matvec=A_sym_matvec, rmatvec=A_sym_matvec, dtype=float)
     b_sym = sqrtV * b_free
-    # Build AMG preconditioner
+    # Build AMG preconditioner (optional)
     if not no_amg:
         try:
             if verbose:
                 pinfo("Assembling CSR matrix for AMG preconditioner ...")
-            # Assemble explicit CSR matrix on free nodes
-            def build_csr_free() -> Tuple[Any, Any, Any]:
-                # Reuse generic build routine
+
+            def build_csr_free():
+                """Assemble explicit CSR matrix A_ff on free nodes for AMG."""
                 inside3 = inside_mask.reshape(nx, ny, nz)
                 fixed1d = fixed.ravel(order="C")
                 D3 = D.reshape(nx, ny, nz, 3, 3)
                 Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
                 idx3 = np.arange(nx * ny * nz).reshape(nx, ny, nz)
-                rows, cols, vals_csr = [], [], []
+
+                rows, cols, vals = [], [], []
                 diag = np.zeros(nx * ny * nz, dtype=float)
-                b_vec = np.zeros(nx * ny * nz, dtype=float)
+
                 for i in range(nx):
                     for j in range(ny):
                         for k in range(nz):
@@ -834,97 +895,100 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                             p = idx3[i, j, k]
                             if fixed1d[p]:
                                 continue
+
                             # x-
                             if i > 0 and inside3[i - 1, j, k]:
                                 q = idx3[i - 1, j, k]
                                 K = Tx[i - 1, j, k]
                                 if fixed1d[q]:
-                                    b_vec[p] += K * val[q]
+                                    # Dirichlet contribution to RHS (handled in b_free)
+                                    pass
                                 else:
-                                    rows.append(p); cols.append(q); vals_csr.append(-K)
+                                    rows.append(p); cols.append(q); vals.append(-K)
                                 diag[p] += K
                             # x+
                             if i + 1 < nx and inside3[i + 1, j, k]:
                                 q = idx3[i + 1, j, k]
                                 K = Tx[i, j, k]
                                 if fixed1d[q]:
-                                    b_vec[p] += K * val[q]
+                                    pass
                                 else:
-                                    rows.append(p); cols.append(q); vals_csr.append(-K)
+                                    rows.append(p); cols.append(q); vals.append(-K)
                                 diag[p] += K
                             # y-
                             if j > 0 and inside3[i, j - 1, k]:
                                 q = idx3[i, j - 1, k]
                                 K = Ty[i, j - 1, k]
                                 if fixed1d[q]:
-                                    b_vec[p] += K * val[q]
+                                    pass
                                 else:
-                                    rows.append(p); cols.append(q); vals_csr.append(-K)
+                                    rows.append(p); cols.append(q); vals.append(-K)
                                 diag[p] += K
                             # y+
                             if j + 1 < ny and inside3[i, j + 1, k]:
                                 q = idx3[i, j + 1, k]
                                 K = Ty[i, j, k]
                                 if fixed1d[q]:
-                                    b_vec[p] += K * val[q]
+                                    pass
                                 else:
-                                    rows.append(p); cols.append(q); vals_csr.append(-K)
+                                    rows.append(p); cols.append(q); vals.append(-K)
                                 diag[p] += K
                             # z-
                             if k > 0 and inside3[i, j, k - 1]:
                                 q = idx3[i, j, k - 1]
                                 K = Tz[i, j, k - 1]
                                 if fixed1d[q]:
-                                    b_vec[p] += K * val[q]
+                                    pass
                                 else:
-                                    rows.append(p); cols.append(q); vals_csr.append(-K)
+                                    rows.append(p); cols.append(q); vals.append(-K)
                                 diag[p] += K
                             # z+
                             if k + 1 < nz and inside3[i, j, k + 1]:
                                 q = idx3[i, j, k + 1]
                                 K = Tz[i, j, k]
                                 if fixed1d[q]:
-                                    b_vec[p] += K * val[q]
+                                    pass
                                 else:
-                                    rows.append(p); cols.append(q); vals_csr.append(-K)
+                                    rows.append(p); cols.append(q); vals.append(-K)
                                 diag[p] += K
-                # Add diagonal
+
+                # Add diagonal entries for free nodes
                 p_idx = np.where(inside_mask & (~fixed))[0]
                 rows += list(p_idx)
                 cols += list(p_idx)
-                vals_csr += list(diag[p_idx])
-                A_full = coo_matrix((vals_csr, (rows, cols)), shape=(nx * ny * nz, nx * ny * nz)).tocsr()
-                A_ff = A_full[free][:, free]
+                vals += list(diag[p_idx])
+
+                A_full_csr = coo_matrix((vals, (rows, cols)),
+                                        shape=(nx * ny * nz, nx * ny * nz)).tocsr()
+                A_ff = A_full_csr[free][:, free]
                 return A_ff
+
             A_csr_free = build_csr_free()
-            # Apply symmetric volume scaling
-            diag_vec = np.ones(Nfree)
-            D_left = spdiags(sqrtV * diag_vec, 0, Nfree, Nfree)
-            D_right = spdiags((1.0 / sqrtV) * diag_vec, 0, Nfree, Nfree)
-            A_csr_scaled = D_left @ A_csr_free @ D_right
-            ml = smoothed_aggregation_solver(A_csr_scaled, symmetry='symmetric',
-                                             strength=('symmetric', {'theta': 0.04}),
-                                             smooth=('energy', {'krylov': 'cg', 'degree': 2}),
-                                             presmoother=('gauss_seidel', {'sweep': 'symmetric'}),
-                                             postsmoother=('gauss_seidel', {'sweep': 'symmetric'}))
+
+            # Basic smoothed aggregation AMG with default options
+            ml = smoothed_aggregation_solver(A_csr_free, symmetry='symmetric')
             M_amg = ml.aspreconditioner(cycle='V')
-            dfine = np.maximum(1e-12, ml.levels[0].A.diagonal())
-            Dm12 = 1.0 / np.sqrt(dfine)
+
             def M_apply(x):
-                y = Dm12 * x
-                y = M_amg @ y
-                return Dm12 * y
-            M = LinearOperator((Nfree, Nfree), matvec=M_apply, rmatvec=M_apply, dtype=float)
+                return M_amg @ x
+
+            M = LinearOperator((Nfree, Nfree), matvec=M_apply,
+                               rmatvec=M_apply, dtype=float)
+
         except Exception as e:
             if verbose:
                 pinfo(f"AMG preconditioner failed: {e}; falling back to Jacobi.")
             no_amg = True
+
     if no_amg:
-        # Jacobi preconditioner using diagonal of A_sym
+        # Jacobi-like fallback preconditioner
         diag_approx = np.maximum(1e-8, np.ones(Nfree))
+
         def M_apply(x):
             return x / diag_approx
-        M = LinearOperator((Nfree, Nfree), matvec=M_apply, rmatvec=M_apply, dtype=float)
+
+        M = LinearOperator((Nfree, Nfree), matvec=M_apply,
+                           rmatvec=M_apply, dtype=float)
 
     # Initial guess for CG: apply preconditioner to RHS
     x0 = M @ b_sym
@@ -942,38 +1006,118 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     # Compute full residual
     r_full = A_full @ psi
     if verbose:
+        # Basic ψ statistics everywhere
+        pstat("ψ (all nodes)", psi)
+
+        # ψ on boundary and axis bands
+        pstat("ψ on boundary band (should be ~1)", psi[band])
+        pstat("ψ on axis band (should be ~0)", psi[axis_band])
+
+        # ψ on free interior nodes (inside, not in bands)
+        free_inside = inside_mask & (~fixed)
+        if np.any(free_inside):
+            pstat("ψ on free interior", psi[free_inside])
+
         pstat("Full residual", r_full)
         print(f"Reduced residual ||r||/||b|| = {np.linalg.norm(r_full[free]) / (np.linalg.norm(b_full[free]) + 1e-30):.3e}")
-    # Quality metric: |t·∇ψ| / |∇ψ|
+    # Quality metric: q = |t·∇ψ| / |∇ψ|, with t = ∇φ / |∇φ|
     psi3 = psi.reshape(nx, ny, nz)
-    # Central differences on interior region
+
+    # Central differences for ∇ψ on the interior region
     dpsidx = (psi3[2:, 1:-1, 1:-1] - psi3[:-2, 1:-1, 1:-1]) / (2 * dx)
     dpsidy = (psi3[1:-1, 2:, 1:-1] - psi3[1:-1, :-2, 1:-1]) / (2 * dy)
     dpsidz = (psi3[1:-1, 1:-1, 2:] - psi3[1:-1, 1:-1, :-2]) / (2 * dz)
-    t_hat_x = G[:, 0].reshape(nx, ny, nz)[1:-1, 1:-1, 1:-1]
-    t_hat_y = G[:, 1].reshape(nx, ny, nz)[1:-1, 1:-1, 1:-1]
-    t_hat_z = G[:, 2].reshape(nx, ny, nz)[1:-1, 1:-1, 1:-1]
-    gnorm_core = np.linalg.norm(G.reshape(nx, ny, nz, 3)[1:-1, 1:-1, 1:-1, :], axis=-1)
-    core_mask = (gnorm_core > 1e-10)
-    par_grad = (t_hat_x * dpsidx + t_hat_y * dpsidy + t_hat_z * dpsidz)[core_mask]
-    grad_mag = np.sqrt(dpsidx ** 2 + dpsidy ** 2 + dpsidz ** 2)[core_mask]
-    q_metric = np.abs(par_grad) / np.maximum(grad_mag, 1e-14)
-    if verbose and q_metric.size > 0:
-        stat01(q_metric)
 
-    figP = plot_psi_maps_RZ_panels(psi3_c, Rs, phis, Zs, jj_list, title="ψ(R,Z)")
-    # if save_figures:
-    #     figP.savefig("solve_flux_maps_RZ_panels.png", dpi=150)
-    plt.show()
+    # Core region for ∇φ
+    G3 = G.reshape(nx, ny, nz, 3)
+    B_core = G3[1:-1, 1:-1, 1:-1, :]          # shape (nx-2, ny-2, nz-2, 3)
+    gnorm_core = np.linalg.norm(B_core, axis=-1)
+    core_mask = (gnorm_core > 1e-10)
+
+    # Normalised field direction t̂
+    t_hat_core = np.zeros_like(B_core)
+    t_hat_core[core_mask] = (
+        B_core[core_mask].T / gnorm_core[core_mask]
+    ).T
+
+    # Parallel and total gradient of ψ
+    par_grad_full = (
+        t_hat_core[..., 0] * dpsidx +
+        t_hat_core[..., 1] * dpsidy +
+        t_hat_core[..., 2] * dpsidz
+    )
+    grad_mag_full = np.sqrt(dpsidx**2 + dpsidy**2 + dpsidz**2)
+
+    par_grad = par_grad_full[core_mask]
+    grad_mag = grad_mag_full[core_mask]
+
+    q_metric = np.abs(par_grad) / np.maximum(grad_mag, 1e-14)
+
+    if verbose and q_metric.size > 0:
+        p = np.percentile(q_metric, [0, 1, 5, 25, 50, 75, 95, 99, 100])
+        print(
+            "[ALIGN] q = |t·∇ψ|/|∇ψ| stats: "
+            f"min={p[0]:.3e} p1={p[1]:.3e} p5={p[2]:.3e} "
+            f"p50={p[4]:.3e} p95={p[6]:.3e} p99={p[7]:.3e} max={p[8]:.3e}"
+        )
+
+    # Optional diagnostic plots
+    if plot:
+        # Histogram of alignment error q_metric
+        if q_metric.size > 0:
+            fig1, ax1 = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+
+            ax1[0].hist(q_metric, bins=80)
+            ax1[0].set_yscale("log")
+            ax1[0].set_xlabel(r"$q = |t\cdot\nabla\psi|/|\nabla\psi|$")
+            ax1[0].set_ylabel("count")
+            ax1[0].set_title("Alignment error histogram")
+
+            # Residual distribution on free interior nodes
+            res_free = r_full[free]
+            ax1[1].hist(np.abs(res_free), bins=80)
+            ax1[1].set_yscale("log")
+            ax1[1].set_xlabel(r"$|r|$")
+            ax1[1].set_ylabel("count")
+            ax1[1].set_title("PDE residual |r| on free nodes")
+
+            fig1.suptitle("FCI ψ diagnostics")
+
+        # A simple ψ slice (x–z plane at mid y) for a quick visual check
+        psi3 = psi.reshape(nx, ny, nz)
+        j_mid = ny // 2
+        fig2, ax2 = plt.subplots(figsize=(5, 4))
+        im = ax2.imshow(
+            psi3[:, j_mid, :].T,
+            origin="lower",
+            extent=[xs[0], xs[-1], zs[0], zs[-1]],
+            aspect="equal",
+        )
+        ax2.set_xlabel("x")
+        ax2.set_ylabel("z")
+        ax2.set_title(r"$\psi(x,z)$ slice at mid $y$")
+        plt.colorbar(im, ax=ax2, shrink=0.8)
+
+        # figP = plot_psi_maps_RZ_panels(psi3_c, Rs, phis, Zs, jj_list, title="ψ(R,Z)")
+        # if save_figures:
+        #     figP.savefig("solve_flux_maps_RZ_panels.png", dpi=150)
+
+        plt.show()
 
     # Prepare result dictionary
     result = {
         'psi': psi,
-        'grid': {'xs': xs, 'ys': ys, 'zs': zs, 'mins': mins, 'maxs': maxs},
+        'grid': {'xs': xs,'ys': ys,'zs': zs,'mins': mins,'maxs': maxs,},
         'inside': inside_mask,
-        'quality': {'parallel_dot_grad': par_grad, 'residual': r_full},
-        'axis': {'R': R_axis, 'Z': Z_axis, 'points': axis_pts},
-    }
+        'bands': {'boundary': band,'axis': axis_band,},
+        'quality': {
+            # q = |t·∇ψ|/|∇ψ| sampled on core region
+            'q_metric': q_metric,
+            # parallel component t·∇ψ at sampled points
+            'parallel_dot_grad': par_grad,
+            # full residual A_full @ psi on all nodes
+            'residual': r_full,},
+        'axis': {'R': R_axis,'Z': Z_axis,'points': axis_pts,},}
     return result
 
 
@@ -982,13 +1126,18 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 ###############################################################################
 
 if __name__ == "__main__":
+    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QH_solution.npz"
+    # default_solution = "wout_SLAM_4_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
+
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
-    parser.add_argument("npz", nargs="?", default="wout_precise_QA_solution.npz",
+    parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                 help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=48, help="Grid resolution per axis (default: 48)")
+    parser.add_argument("--N", type=int, default=128, help="Grid resolution per axis (default: 128)")
     parser.add_argument("--eps", type=float, default=1e-3, help="Perpendicular diffusion weight (default: 1e-3)")
     parser.add_argument("--delta", type=float, default=5e-3, help="Isotropic diffusion floor (default: 5e-3)")
-    parser.add_argument("--band-h", type=float, default=1.5, help="Boundary band thickness multiplier (default: 1.5)")
+    parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier (default: 1.5)")
     parser.add_argument("--axis-band-radius", type=float, default=0.0, help="Axis band radius; 0=auto, <1=fraction of bbox, ≥1=absolute")
     parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=2000, help="CG maximum iterations (default: 2000)")
