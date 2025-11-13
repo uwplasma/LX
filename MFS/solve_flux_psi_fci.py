@@ -18,10 +18,6 @@ plasma simulation codes.
 
 Compared to previous scripts, this version makes several improvements:
 
-  * **Simplified geometry** – the solver works on a single uniform Cartesian
-    grid, independent of whether the underlying surface is toroidal or
-    mirror‑symmetric.  All cylindrical–specific routines have been removed.
-
   * **JAX acceleration** – evaluation of the magnetic potential φ and its
     gradient is vectorised and JIT compiled with JAX.  This yields orders of
     magnitude speed‑ups when evaluating thousands of points.
@@ -77,8 +73,7 @@ The overall workflow is:
 
 This script is intentionally verbose.  Print statements highlight the
 progress through each stage and display intermediate statistics.  It is
-designed both as a working solver and a teaching example of the FCI
-methodology.
+designed be a research-grade FCI solver for fusion plasma applications.
 
 """
 
@@ -101,6 +96,8 @@ from scipy.sparse.linalg import LinearOperator, cg, minres
 from pyamg import smoothed_aggregation_solver
 import diffrax as dfx
 import matplotlib.pyplot as plt
+from scipy.interpolate import RegularGridInterpolator
+from mpl_toolkits.mplot3d import Axes3D  # for 3D plotting later
 import os
 from pathlib import Path
 
@@ -133,6 +130,39 @@ def axis_band_mask(P_axis, Xq, rad):
     return (d[:,0] < rad)
 
 # ----------------------------- Plotting utilities ---------------------------- #
+def build_psi_RZphi_volume(psi3, xs, ys, zs, P, nR=128, nphi=64, nZ=128):
+    """
+    Construct ψ(R,φ,Z) on a regular cylindrical grid using trilinear interpolation
+    from ψ(x,y,z) defined on (xs,ys,zs).
+
+    Returns
+    -------
+    psi_RZphi : array (nR, nphi, nZ)
+    Rs        : array (nR,)
+    phis      : array (nphi,)
+    Zs        : array (nZ,)
+    """
+    # Use boundary points to define R,Z ranges
+    Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
+    Rs = np.linspace(Rb.min(), Rb.max(), nR)
+    Zs = np.linspace(P[:, 2].min(), P[:, 2].max(), nZ)
+    phis = np.linspace(0.0, 2.0 * np.pi, nphi, endpoint=False)
+
+    interp = RegularGridInterpolator((xs, ys, zs), psi3,
+                                     bounds_error=False, fill_value=np.nan)
+
+    psi_RZphi = np.zeros((nR, nphi, nZ))
+    for j, phi in enumerate(phis):
+        # Cylindrical grid at fixed phi
+        R_grid, Z_grid = np.meshgrid(Rs, Zs, indexing="ij")
+        X = R_grid * np.cos(phi)
+        Y = R_grid * np.sin(phi)
+        pts = np.stack([X.ravel(), Y.ravel(), Z_grid.ravel()], axis=-1)
+        vals = interp(pts).reshape(nR, nZ)
+        psi_RZphi[:, j, :] = vals
+
+    return psi_RZphi, Rs, phis, Zs
+
 def plot_psi_maps_RZ_panels(psi3, Rs, phis, Zs, jj_list, title="ψ(R,Z)"):
     fig, axa = plt.subplots(2, 2, figsize=(7, 7), constrained_layout=True)
     axa = axa.ravel()
@@ -145,6 +175,43 @@ def plot_psi_maps_RZ_panels(psi3, Rs, phis, Zs, jj_list, title="ψ(R,Z)"):
         axa[kk].set_title(f"{title} @ φ≈{phis[jj]:+.2f}")
         axa[kk].set_xlabel("R"); axa[kk].set_ylabel("Z")
         plt.colorbar(im, ax=axa[kk], shrink=0.85)
+    return fig
+
+def plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask):
+    """
+    3D visualisation of boundary surface vs magnetic axis, with ψ colour on boundary.
+
+    P        : (M,3) boundary points
+    axis_pts : (Na,3) axis points
+    psi      : (N,) ψ values on grid nodes
+    Xq       : (N,3) grid node coordinates
+    inside_mask : (N,) bool indicating inside-domain nodes
+    """
+    # Map boundary points to nearest grid nodes for ψ colouring
+    nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(Xq)
+    _, idx = nbrs.kneighbors(P)
+    psi_on_P = psi[idx[:, 0]]
+
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    sc = ax.scatter(
+        P[:, 0], P[:, 1], P[:, 2],
+        c=psi_on_P, s=5, alpha=0.8
+    )
+    ax.plot(
+        axis_pts[:, 0], axis_pts[:, 1], axis_pts[:, 2],
+        "k-", linewidth=2.0, label="Magnetic axis"
+    )
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.set_title("Boundary vs magnetic axis (coloured by ψ)")
+    fig.colorbar(sc, ax=ax, shrink=0.7, label=r"$\psi$")
+
+    ax.legend(loc="best")
+
     return fig
 
 ###############################################################################
@@ -487,75 +554,93 @@ def make_linear_operator(nx: int, ny: int, nz: int, dx: float, dy: float, dz: fl
                          inside: np.ndarray, Dfield: np.ndarray, fixed_mask: np.ndarray,
                          fixed_val: np.ndarray) -> LinearOperator:
     """
-    Build a matrix–free LinearOperator for the anisotropic diffusion equation.
+    Build a matrix–free LinearOperator for the anisotropic diffusion equation
 
-    The operator applies
+        A[u] = -div( D ∇u )
 
-        A[u] = -div( D ∇u )  on free nodes
+    using a full-tensor central-difference stencil in the interior:
 
-    and stamps Dirichlet rows on nodes where fixed_mask is True, returning
-    u - fixed_val.  All vectors passed to matvec and rmatvec are full 1D
-    arrays of length N = nx*ny*nz.  The returned vector has the same length.
+      - D is assumed slowly varying over one cell, so we discretise
+        -Σ_{p,q} D_{pq} ∂_p∂_q ψ with 2nd-order central differences.
 
-    Parameters
-    ----------
-    nx, ny, nz : int
-        Grid dimensions.
-    dx, dy, dz : float
-        Grid spacings.
-    inside : array of shape (N,), bool
-        Mask of grid points inside the surface.
-    Dfield : array of shape (N,3,3)
-        Diffusion tensor at each grid point.
-    fixed_mask : array of shape (N,), bool
-        True on nodes with Dirichlet boundary conditions.
-    fixed_val : array of shape (N,), float
-        Fixed values for Dirichlet nodes.
-
-    Returns
-    -------
-    A_full : LinearOperator
-        Matrix–free operator such that A_full @ u_full applies the anisotropic
-        diffusion operator and stamps Dirichlet conditions.
+    Dirichlet rows are stamped as u - fixed_val where fixed_mask is True.
     """
     inside3 = inside.reshape(nx, ny, nz)
     D3 = Dfield.reshape(nx, ny, nz, 3, 3)
     fixed_mask = fixed_mask.astype(bool)
-    free_mask = ~fixed_mask
     rows_fixed = np.where(fixed_mask)[0]
 
+    inv_dx2 = 1.0 / (dx * dx)
+    inv_dy2 = 1.0 / (dy * dy)
+    inv_dz2 = 1.0 / (dz * dz)
+    inv_4dxdy = 1.0 / (4.0 * dx * dy)
+    inv_4dxdz = 1.0 / (4.0 * dx * dz)
+    inv_4dydz = 1.0 / (4.0 * dy * dz)
+
     def matvec(u: np.ndarray) -> np.ndarray:
-        # Reshape for convenience
         u3 = u.reshape(nx, ny, nz)
-        Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
-        # Differences across faces (zero outside domain)
-        dux = np.zeros_like(Tx); duy = np.zeros_like(Ty); duz = np.zeros_like(Tz)
-        mx = inside3[1:, :, :] & inside3[:-1, :, :]
-        my = inside3[:, 1:, :] & inside3[:, :-1, :]
-        mz = inside3[:, :, 1:] & inside3[:, :, :-1]
-        dux[mx] = (u3[1:, :, :] - u3[:-1, :, :])[mx]
-        duy[my] = (u3[:, 1:, :] - u3[:, :-1, :])[my]
-        duz[mz] = (u3[:, :, 1:] - u3[:, :, :-1])[mz]
-        # Fluxes across faces
-        Fx = np.zeros_like(Tx); Fx[mx] = Tx[mx] * dux[mx]
-        Fy = np.zeros_like(Ty); Fy[my] = Ty[my] * duy[my]
-        Fz = np.zeros_like(Tz); Fz[mz] = Tz[mz] * duz[mz]
-        # Divergence on cell centres
-        divF = np.zeros((nx, ny, nz))
-        # x faces
-        divF[1:-1, :, :] += (Fx[1:, :, :] - Fx[:-1, :, :])
-        # y faces
-        divF[:, 1:-1, :] += (Fy[:, 1:, :] - Fy[:, :-1, :])
-        # z faces
-        divF[:, :, 1:-1] += (Fz[:, :, 1:] - Fz[:, :, :-1])
-        # Zero outside interior
-        divF[~inside3] = 0.0
-        out = (-divF).ravel(order="C")
-        # Stamp Dirichlet rows
+
+        # Core region indices where centred differences are defined
+        uc = u3[1:-1, 1:-1, 1:-1]
+        Dc = D3[1:-1, 1:-1, 1:-1, :, :]
+        inside_core = inside3[1:-1, 1:-1, 1:-1]
+
+        # Extract tensor components at cell centres
+        Dxx = Dc[..., 0, 0]
+        Dyy = Dc[..., 1, 1]
+        Dzz = Dc[..., 2, 2]
+        Dxy = Dc[..., 0, 1]
+        Dxz = Dc[..., 0, 2]
+        Dyz = Dc[..., 1, 2]
+
+        # Second derivatives (diagonal terms)
+        d2psi_dx2 = (u3[2:, 1:-1, 1:-1] - 2.0 * uc + u3[:-2, 1:-1, 1:-1]) * inv_dx2
+        d2psi_dy2 = (u3[1:-1, 2:, 1:-1] - 2.0 * uc + u3[1:-1, :-2, 1:-1]) * inv_dy2
+        d2psi_dz2 = (u3[1:-1, 1:-1, 2:] - 2.0 * uc + u3[1:-1, 1:-1, :-2]) * inv_dz2
+
+        # Mixed derivatives (cross terms), standard 4-point central differences
+        d2psi_dxdy = (
+            u3[2:, 2:, 1:-1]   - u3[:-2, 2:, 1:-1]
+            - u3[2:, :-2, 1:-1] + u3[:-2, :-2, 1:-1]
+        ) * inv_4dxdy
+
+        d2psi_dxdz = (
+            u3[2:, 1:-1, 2:]   - u3[:-2, 1:-1, 2:]
+            - u3[2:, 1:-1, :-2] + u3[:-2, 1:-1, :-2]
+        ) * inv_4dxdz
+
+        d2psi_dydz = (
+            u3[1:-1, 2:, 2:]   - u3[1:-1, :-2, 2:]
+            - u3[1:-1, 2:, :-2] + u3[1:-1, :-2, :-2]
+        ) * inv_4dydz
+
+        # Full-tensor diffusion operator in the core
+        L_core = (
+            Dxx * d2psi_dx2 +
+            Dyy * d2psi_dy2 +
+            Dzz * d2psi_dz2 +
+            2.0 * Dxy * d2psi_dxdy +
+            2.0 * Dxz * d2psi_dxdz +
+            2.0 * Dyz * d2psi_dydz
+        )
+
+        # Only apply PDE inside the surface
+        L_core[~inside_core] = 0.0
+
+        # Assemble full array
+        out3 = np.zeros_like(u3)
+        out3[1:-1, 1:-1, 1:-1] = -L_core  # minus sign from -div(D∇ψ)
+        out3[~inside3] = 0.0
+
+        out = out3.ravel(order="C")
+
+        # Dirichlet rows: overwrite with u - fixed_val
         out[rows_fixed] = u[rows_fixed] - fixed_val[rows_fixed]
         return out
+
     N = nx * ny * nz
     return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+
 
 
 ###############################################################################
@@ -566,7 +651,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
               axis_band_radius: float = 0.0, cg_tol: float = 1e-8, cg_maxit: int = 2000,
               verbose: bool = True, plot: bool = False, nfp: int = 2,
               delta: float = 5e-3, no_amg: bool = False,
-              axis_seed_count: int = 0) -> Dict[str, Any]:
+              axis_seed_count: int = 0, save_figures: bool = True) -> Dict[str, Any]:
     """
     Solve the field–aligned flux function ψ via anisotropic diffusion on a uniform grid.
 
@@ -629,7 +714,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     # Build uniform Cartesian grid surrounding the boundary with margin
     mins = P.min(axis=0); maxs = P.max(axis=0); span = maxs - mins
-    mins = mins - 0.05 * span; maxs = maxs + 0.05 * span
+    mins = mins - 0.01 * span; maxs = maxs + 0.01 * span
     nx = ny = nz = int(grid_N)
     xs = np.linspace(mins[0], maxs[0], nx)
     ys = np.linspace(mins[1], maxs[1], ny)
@@ -1061,9 +1146,8 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             f"p50={p[4]:.3e} p95={p[6]:.3e} p99={p[7]:.3e} max={p[8]:.3e}"
         )
 
-    # Optional diagnostic plots
     if plot:
-        # Histogram of alignment error q_metric
+        # Histogram + residual plots (unchanged)
         if q_metric.size > 0:
             fig1, ax1 = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
 
@@ -1073,7 +1157,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             ax1[0].set_ylabel("count")
             ax1[0].set_title("Alignment error histogram")
 
-            # Residual distribution on free interior nodes
             res_free = r_full[free]
             ax1[1].hist(np.abs(res_free), bins=80)
             ax1[1].set_yscale("log")
@@ -1082,25 +1165,35 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             ax1[1].set_title("PDE residual |r| on free nodes")
 
             fig1.suptitle("FCI ψ diagnostics")
+            if save_figures:
+                fig1.savefig("fci_psi_diagnostics.png")
 
-        # A simple ψ slice (x–z plane at mid y) for a quick visual check
-        psi3 = psi.reshape(nx, ny, nz)
-        j_mid = ny // 2
-        fig2, ax2 = plt.subplots(figsize=(5, 4))
-        im = ax2.imshow(
-            psi3[:, j_mid, :].T,
-            origin="lower",
-            extent=[xs[0], xs[-1], zs[0], zs[-1]],
-            aspect="equal",
-        )
-        ax2.set_xlabel("x")
-        ax2.set_ylabel("z")
-        ax2.set_title(r"$\psi(x,z)$ slice at mid $y$")
-        plt.colorbar(im, ax=ax2, shrink=0.8)
+        # --- R–Z–φ panels ---
+        try:
+            psi3 = psi.reshape(nx, ny, nz)
+            psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl = build_psi_RZphi_volume(
+                psi3, xs, ys, zs, P, nR=128, nphi=64, nZ=128
+            )
 
-        # figP = plot_psi_maps_RZ_panels(psi3_c, Rs, phis, Zs, jj_list, title="ψ(R,Z)")
-        # if save_figures:
-        #     figP.savefig("solve_flux_maps_RZ_panels.png", dpi=150)
+            # Choose a few φ indices for panels
+            jj_list = np.linspace(0, len(phis_cyl) - 1, 4, dtype=int)
+            figRZ = plot_psi_maps_RZ_panels(
+                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list, title="ψ(R,Z)"
+            )
+            figRZ.suptitle("ψ(R,Z) at selected toroidal angles")
+            if save_figures:
+                figRZ.savefig("fci_psi_RZ_panels.png")
+
+        except Exception as e:
+            pinfo(f"[WARN] Failed to build RZφ panels: {e}")
+
+        #--- 3D axis and boundary plot ---
+        try:
+            fig3d = plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask)
+            if save_figures:
+                fig3d.savefig("fci_psi_3d_axis_boundary.png")
+        except Exception as e:
+            pinfo(f"[WARN] Failed to plot 3D axis/boundary: {e}")
 
         plt.show()
 
@@ -1126,29 +1219,36 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 ###############################################################################
 
 if __name__ == "__main__":
+    
     default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
     # default_solution = "wout_SLAM_6_coils_solution.npz"
 
+    nfp_default = 2
+    if 'QH' in default_solution:
+        nfp_default = 4
+
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                 help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=128, help="Grid resolution per axis (default: 128)")
-    parser.add_argument("--eps", type=float, default=1e-3, help="Perpendicular diffusion weight (default: 1e-3)")
-    parser.add_argument("--delta", type=float, default=5e-3, help="Isotropic diffusion floor (default: 5e-3)")
-    parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier (default: 1.5)")
+    parser.add_argument("--N", type=int, default=42, help="Grid resolution per axis")
+    parser.add_argument("--eps", type=float, default=2e-2, help="Perpendicular diffusion weight")
+    parser.add_argument("--delta", type=float, default=5e-2, help="Isotropic diffusion floor")
+    parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
     parser.add_argument("--axis-band-radius", type=float, default=0.0, help="Axis band radius; 0=auto, <1=fraction of bbox, ≥1=absolute")
     parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=2000, help="CG maximum iterations (default: 2000)")
-    parser.add_argument("--nfp", type=int, default=2, help="Number of field periods (default: 2)")
+    parser.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods (default: 2)")
     parser.add_argument("--no-amg", action="store_true", help="Disable AMG preconditioner and use Jacobi")
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting (not implemented in this version)")
+    parser.add_argument("--save-figures", action="store_true", default=True, help="Save diagnostic figures to disk.")
     args = parser.parse_args()
     res = solve_fci(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
                     axis_band_radius=args.axis_band_radius, cg_tol=args.cg_tol,
                     cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
-                    nfp=args.nfp, delta=args.delta, no_amg=args.no_amg)
+                    nfp=args.nfp, delta=args.delta, no_amg=args.no_amg,
+                    save_figures=args.save_figures)
     # Print solution statistics on inside nodes (excluding boundary and axis bands)
     psi_all = res['psi']
     inside_mask = res['inside']
@@ -1157,5 +1257,4 @@ if __name__ == "__main__":
     fixed_nodes = (np.abs(psi_all - 1.0) < 1e-10) | (np.abs(psi_all) < 1e-10)
     free_inside = inside_mask & (~fixed_nodes)
     psi_in = psi_all[free_inside]
-    if psi_in.size > 0:
-        pstat("Solution ψ (inside free region)", psi_in)
+    if psi_in.size > 0: pstat("Solution ψ (inside free region)", psi_in)
