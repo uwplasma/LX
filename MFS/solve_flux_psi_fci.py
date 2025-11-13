@@ -1229,6 +1229,12 @@ if __name__ == "__main__":
     if 'QH' in default_solution:
         nfp_default = 4
 
+READ
+# Ok, let's now take the next step and:
+# - instead of assuming D is constant per cell and using a cell-center scheme, solve the exact divergence-form operator.
+# - Get a boringly monotone behavor so that the solution does not overshoot and is monotonically increasing from 0 to 1 from axis to the boundary.
+# - is there any way to have a box in cylindrical coordinates? Seems like we should be wasting a lot of space by using a cartesian box in such a torus
+
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                 help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
