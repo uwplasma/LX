@@ -214,7 +214,7 @@ def collapse_to_axis(grad_phi,
                      R0,
                      Z0,
                      nfp,
-                     nsteps=2048,
+                     nsteps=1000,
                      max_newton=12,
                      tol=1e-8):
     """
@@ -275,8 +275,9 @@ def collapse_to_axis(grad_phi,
     dt0 = float(t1) / float(nsteps)
 
     term = dfx.ODETerm(_fieldline_rhs)
-    solver = dfx.Dopri5()
+    solver = dfx.Dopri8()
     saveat_t1 = dfx.SaveAt(t1=True)
+    stepsize_controller = dfx.PIDController(rtol=1e-4, atol=1e-5)
 
     @jit
     def _integrate_one_turn(RZ0):
@@ -290,6 +291,7 @@ def collapse_to_axis(grad_phi,
             y0=RZ0,
             saveat=saveat_t1,
             max_steps=nsteps * 16,
+            stepsize_controller=stepsize_controller,
         )
         # saveat_t1 gives shape (1,2); take the last (only) entry
         return sol.ys[-1]
@@ -1248,6 +1250,7 @@ def plot_psi_maps_RZ_panels(psi3, Rs, phis, Zs, jj_list, title="ψ(R,Z)"):
     extent = [Rmin, Rmax, Zmin, Zmax]
     for kk, jj in enumerate(jj_list):
         im = axa[kk].imshow(psi3[:, jj, :].T, origin='lower', aspect='equal', extent=extent)
+        axa[kk].contour(psi3[:, jj, :].T, levels=10, colors='white', linewidths=0.5, alpha=1.0, extent=extent)
         axa[kk].set_title(f"{title} @ φ≈{phis[jj]:+.2f}")
         axa[kk].set_xlabel("R"); axa[kk].set_ylabel("Z")
         draw_RZ_box(axa[kk], Rs, Zs)
@@ -2205,7 +2208,7 @@ if __name__ == "__main__":
     ap.add_argument("--save-figures", action="store_true", default=True, help="save figures instead of showing interactively")
     ap.add_argument("--NR", type=int, default=32)
     ap.add_argument("--NZ", type=int, default=32)
-    ap.add_argument("--Nphi", type=int, default=128)
+    ap.add_argument("--Nphi", type=int, default=64)
     ap.add_argument("--debug-probe-p", action="store_true", default=False, help="enable detailed probe prints during CSR build")
     args = ap.parse_args()
     out = main(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
