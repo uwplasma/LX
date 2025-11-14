@@ -1314,6 +1314,9 @@ if __name__ == "__main__":
     # default_solution = "wout_SLAM_4_coils_solution.npz"
     # default_solution = "wout_SLAM_6_coils_solution.npz"
 
+#### ASK CHATGPT TO MAKE GRID IN CYLINDRICAL COORDINATES IF KIND=TORUS, OTHERWISE LEAVE CARTESIAN
+##### SAVE SPACE
+
     nfp_default = 2
     if 'QH' in default_solution:
         nfp_default = 4
