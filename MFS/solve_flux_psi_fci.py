@@ -1,3 +1,8 @@
+###!!!!!!
+###### THIS WOULD BE A GREAT NEXT STEP FOR THE CODE  ######
+##### MAYBE IMPLEMENT LATER #############################
+# if kind=torus, this means that it is a donut with a mostly cylindrical geometry. That means that it would be more natural to use a cylindrical grid to save space. if kind=mirror, let's leave it cartesian. Help me implement a cylindrical coordinate system for our points so that we save as much space as possible. Let's keep all the gains we made using FCI up to now, so that it is a publication ready code with the flux coordinate independent approach. It should be a fully working, metric-correct, symmetric 3D anisotropic diffusion operator in (R, φ, Z)
+###!!!!!!
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -16,65 +21,16 @@ magnetic axis.  This formulation follows the flux–coordinate independent
 approach pioneered by Hariri and Ottaviani and later developed in numerous
 plasma simulation codes.
 
-Compared to previous scripts, this version makes several improvements:
+This version:
 
-  * **JAX acceleration** – evaluation of the magnetic potential φ and its
-    gradient is vectorised and JIT compiled with JAX.  This yields orders of
-    magnitude speed‑ups when evaluating thousands of points.
-
-  * **Diffrax integration** – magnetic axis detection uses the Poincaré map
-    integration implemented with Diffrax, a modern ODE solver library for
-    JAX.  This ensures robust and differentiable integration of field
-    lines.
-
-  * **Matrix–free solve** – the diffusion equation is discretised using
-    finite differences on a regular grid.  We assemble a sparse linear
-    operator implicitly and solve using conjugate gradients with an
-    algebraic multigrid (AMG) preconditioner.  This avoids forming a huge
-    dense matrix and allows the solver to scale to large grids.
-
-  * **Rich diagnostics** – the code prints informative statistics at each
-    stage of the computation.  Residual norms, axis coordinates, inside
-    masks and anisotropy metrics are reported.  Developers can use these
-    outputs to verify correctness and monitor convergence.
-
-The overall workflow is:
-
-1. **Load MFS checkpoint** from an ``npz`` file which provides the
-   multipole coefficients for φ, the boundary point cloud ``P`` and
-   associated normals ``N``.  See ``Evaluators`` below.
-
-2. **Define a regular Cartesian grid** surrounding the surface.  Compute
-   the inside mask of grid points using a nearest–neighbor signed distance
-   test with the surface normals.
-
-3. **Determine the toroidal sign** by comparing short field line
-   integrations in both directions and flip the multivalued gradient
-   accordingly.  Then find the magnetic axis in cylindrical coordinates
-   using a two–by–two Newton iteration over a Poincaré map implemented with
-   Diffrax.  A full field line orbit is also integrated for visualisation
-   and to build the axis band mask.
-
-4. **Construct boundary and axis bands** – thin ribbons of grid cells near
-   the physical boundary and the magnetic axis on which Dirichlet
-   conditions are imposed.  The user can control the thickness of these
-   bands through command line parameters.
-
-5. **Evaluate ∇φ on the grid** with JAX and build the anisotropic
-   diffusion tensor D.  Then assemble a matrix–free linear operator for
-   the anisotropic diffusion equation with Dirichlet values stamped on
-   band nodes.  Use an AMG preconditioner to accelerate conjugate
-   gradients to solve for ψ.
-
-6. **Compute diagnostics** – the residual of the solution, percentiles of ψ
-   inside the domain, and a quality metric |t·∇ψ|/|∇ψ| which should be
-   small away from the bands.  Plotting functions are included but can be
-   disabled via command line options.
-
-This script is intentionally verbose.  Print statements highlight the
-progress through each stage and display intermediate statistics.  It is
-designed be a research-grade FCI solver for fusion plasma applications.
-
+  * Uses JAX to evaluate φ and ∇φ.
+  * Uses Diffrax to find the magnetic axis.
+  * Discretises ∇·(D∇ψ) with a **full-tensor 27-point stencil** on a Cartesian grid:
+      - face fluxes F_x, F_y, F_z include all tensor components D_ij,
+        not just n·D·n, so cross-derivative terms are represented.
+  * Imposes ψ=1 on a boundary band and ψ=0 on an axis band via a standard
+    linear "lifting" so the matrix-free operator remains a pure PDE operator.
+  * Includes diagnostics on residuals and a field-alignment metric q = |t·∇ψ|/|∇ψ|.
 """
 
 from __future__ import annotations
@@ -91,13 +47,11 @@ import jax.numpy as jnp
 from jax import jit, vmap
 
 from sklearn.neighbors import NearestNeighbors
-from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import LinearOperator, cg, minres
-from pyamg import smoothed_aggregation_solver
+from scipy.sparse.linalg import LinearOperator, cg
 import diffrax as dfx
 import matplotlib.pyplot as plt
 from scipy.interpolate import RegularGridInterpolator
-from mpl_toolkits.mplot3d import Axes3D  # for 3D plotting later
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import os
 from pathlib import Path
 
@@ -121,22 +75,18 @@ def resolve_npz_file_location(npz_file, subdir="outputs"):
 def pct(a, p): return float(np.percentile(np.asarray(a), p))
 def pinfo(msg): print(f"[INFO] {msg}")
 def pstat(msg, v):
-    v=np.asarray(v); print(f"[STAT] {msg}: min={v.min():.3e} med={np.median(v):.3e} max={v.max():.3e} L2={np.linalg.norm(v):.3e}")
+    v = np.asarray(v)
+    print(f"[STAT] {msg}: min={v.min():.3e} med={np.median(v):.3e} max={v.max():.3e} L2={np.linalg.norm(v):.3e}")
 
 # ----------------------------- Geometry utilities ---------------------------- #
 def axis_band_mask(P_axis, Xq, rad):
     nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(P_axis)
     d, _ = nbrs.kneighbors(Xq)
-    return (d[:,0] < rad)
+    return (d[:, 0] < rad)
 
 # ----------------------------- Plotting utilities ---------------------------- #
 def build_psi_RZphi_volume(psi3, xs, ys, zs, P, inside3,
                            nR=128, nphi=64, nZ=128):
-    """
-    Construct ψ(R,φ,Z) on a regular cylindrical grid using trilinear interpolation
-    from ψ(x,y,z) defined on (xs,ys,zs). Points outside the surface
-    are masked as NaN using the inside_mask.
-    """
     Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
     Rs = np.linspace(Rb.min(), Rb.max(), nR)
     Zs = np.linspace(P[:, 2].min(), P[:, 2].max(), nZ)
@@ -193,26 +143,14 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
         axa[kk].set_xlabel("R"); axa[kk].set_ylabel("Z")
         plt.colorbar(im, ax=axa[kk], shrink=0.85)
 
-        # Overlay boundary points near this φ-slice
         if Rb is not None and phi_b is not None and Zb is not None:
             dphi = np.abs(np.angle(np.exp(1j*(phi_b - phis[jj]))))
-            mask = dphi < (np.pi / len(phis))   # within half a toroidal cell
+            mask = dphi < (np.pi / len(phis))
             axa[kk].scatter(Rb[mask], Zb[mask], s=5, c='k', alpha=0.7)
 
     return fig
 
-
 def plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask):
-    """
-    3D visualisation of boundary surface vs magnetic axis, with ψ colour on boundary.
-
-    P        : (M,3) boundary points
-    axis_pts : (Na,3) axis points
-    psi      : (N,) ψ values on grid nodes
-    Xq       : (N,3) grid node coordinates
-    inside_mask : (N,) bool indicating inside-domain nodes
-    """
-    # Map boundary points to nearest grid nodes for ψ colouring
     nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(Xq)
     _, idx = nbrs.kneighbors(P)
     psi_on_P = psi[idx[:, 0]]
@@ -245,56 +183,26 @@ def plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask):
 
 @jit
 def green_G(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """Green's function 1/(4π r) used to evaluate φ.
-
-    Parameters
-    ----------
-    x, y : array of shape (..., 3)
-        Evaluation and source points in normalised coordinates.
-
-    Returns
-    -------
-    out : array of shape (...,)
-        Value of the Green's function at x due to a unit charge at y.
-    """
     r = jnp.linalg.norm(x - y, axis=-1)
     return 1.0 / (4.0 * jnp.pi * jnp.maximum(1e-30, r))
 
-
 @jit
 def grad_green_x(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """Gradient in x of the Green's function."""
     r = x - y
     r2 = jnp.sum(r * r, axis=-1)
     r3 = jnp.maximum(1e-30, r2 * jnp.sqrt(r2))
     return -r / (4.0 * jnp.pi * r3[..., None])
 
-
 @jit
 def grad_azimuth_about_axis(Xn: jnp.ndarray, a_hat: jnp.ndarray) -> jnp.ndarray:
-    """Return the gradient of the multivalued toroidal angle term t̂ about an axis.
-
-    Given an axis direction a_hat, compute ∂θ/∂x in Cartesian coordinates for each
-    point Xn in normalised coordinates.  This is used to add a toroidal
-    component to the multivalued gradient of φ.  See Hariri & Ottaviani.
-    """
     a = a_hat / jnp.maximum(1e-30, jnp.linalg.norm(a_hat))
-    # Decompose Xn into parallel and perpendicular parts
     r_par = jnp.sum(Xn * a[None, :], axis=1, keepdims=True) * a[None, :]
     r_perp = Xn - r_par
     r2 = jnp.maximum(1e-30, jnp.sum(r_perp * r_perp, axis=1, keepdims=True))
     return jnp.cross(a[None, :], r_perp) / r2
 
-
-def make_mv_grads(a_vec: jnp.ndarray, a_hat: jnp.ndarray, sc_center: jnp.ndarray, sc_scale: float) -> Callable[[jnp.ndarray], jnp.ndarray]:
-    """
-    Build a closure returning the multivalued gradient ∇_MV φ for physical points.
-
-    The potential φ includes a linear combination of two multivalued terms: a_vec[0]
-    times the toroidal angle θ about a_hat and a_vec[1] times the poloidal angle.
-    In practice we only use the toroidal part; the poloidal term is left as a
-    zero function.  The gradient is scaled appropriately by sc_scale.
-    """
+def make_mv_grads(a_vec: jnp.ndarray, a_hat: jnp.ndarray,
+                  sc_center: jnp.ndarray, sc_scale: float) -> Callable[[jnp.ndarray], jnp.ndarray]:
     a_vec = jnp.asarray(a_vec)
     a_hat = jnp.asarray(a_hat)
     sc_center = jnp.asarray(sc_center)
@@ -306,8 +214,6 @@ def make_mv_grads(a_vec: jnp.ndarray, a_hat: jnp.ndarray, sc_center: jnp.ndarray
 
     @jit
     def grad_p(Xn: jnp.ndarray) -> jnp.ndarray:
-        # Poloidal component could be implemented for general geometries;
-        # here we return zero to avoid numerical artefacts inside the domain.
         return jnp.zeros_like(Xn)
 
     def grad_mv_world(X: jnp.ndarray) -> jnp.ndarray:
@@ -316,23 +222,12 @@ def make_mv_grads(a_vec: jnp.ndarray, a_hat: jnp.ndarray, sc_center: jnp.ndarray
 
     return grad_mv_world
 
-
 ###############################################################################
 # Multipole expansion evaluators
 ###############################################################################
 
 @dataclass
 class Evaluators:
-    """
-    Wrapper for the magnetic scalar potential φ and its gradient ∇φ.
-
-    The potential is represented as a multipole expansion with sources at
-    positions ``Yn`` with strengths ``alpha``.  A multivalued component
-    controlled by ``a`` and ``a_hat`` is added to enforce the desired
-    toroidal symmetry of the solution.  Scaling by ``scale`` and shifting
-    by ``center`` maps physical coordinates into the unit sphere used
-    internally by the multipole solver.
-    """
     center: jnp.ndarray
     scale: float
     Yn: jnp.ndarray
@@ -340,7 +235,8 @@ class Evaluators:
     a: jnp.ndarray
     a_hat: jnp.ndarray
 
-    def build(self) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray], Callable[[jnp.ndarray], jnp.ndarray]]:
+    def build(self) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray],
+                             Callable[[jnp.ndarray], jnp.ndarray]]:
         sc_c = jnp.asarray(self.center)
         sc_s = float(self.scale)
         Yn_c = jnp.asarray(self.Yn)
@@ -348,16 +244,17 @@ class Evaluators:
         a_c = jnp.asarray(self.a)
         a_hatc = jnp.asarray(self.a_hat)
 
-        # Build vmap versions of the Green's function and its gradient
         S_single = jit(lambda xn: jnp.dot(vmap(lambda y: green_G(xn, y))(Yn_c), alpha_c))
-        dS_single = jit(lambda xn: jnp.sum(vmap(lambda y: grad_green_x(xn, y))(Yn_c) * alpha_c[:, None], axis=0))
+        dS_single = jit(lambda xn: jnp.sum(
+            vmap(lambda y: grad_green_x(xn, y))(Yn_c) * alpha_c[:, None],
+            axis=0
+        ))
 
         @jit
         def phi_fn(X: jnp.ndarray) -> jnp.ndarray:
             Xn = (X - sc_c) * sc_s
             return vmap(S_single)(Xn)
 
-        # Multivalued gradient closure
         grad_mv = make_mv_grads(a_c, a_hatc, sc_c, sc_s)
 
         @jit
@@ -367,84 +264,27 @@ class Evaluators:
 
         return phi_fn, grad_phi_fn
 
-
 ###############################################################################
 # Geometry: inside mask and bands
 ###############################################################################
 
-def inside_mask_from_surface(P_surf: np.ndarray, N_surf: np.ndarray, Xq: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Classify grid points as inside or outside a closed surface using nearest
-    neighbours and oriented normals.
-
-    For each query point x, find its nearest surface point p and normal n.
-    Compute the signed distance s = (x-p)·n.  Points with s < 0 are inside.
-
-    Parameters
-    ----------
-    P_surf, N_surf : array of shape (M, 3)
-        Boundary point cloud and corresponding outward normals.
-    Xq : array of shape (N, 3)
-        Coordinates of query points.
-
-    Returns
-    -------
-    inside : array of shape (N,), bool
-        True for points inside the surface.
-    idx : array of shape (N,), int
-        Index of the nearest surface point for each query point.
-    signed_dist : array of shape (N,), float
-        Signed distance to the surface (negative inside).
-    """
+def inside_mask_from_surface(P_surf: np.ndarray, N_surf: np.ndarray,
+                             Xq: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(P_surf)
     d, idx = nbrs.kneighbors(Xq)
     p = P_surf[idx[:, 0], :]
     n = N_surf[idx[:, 0], :]
-    signed_dist = np.sum((Xq - p) * n, axis=1)  # >0 outside
+    signed_dist = np.sum((Xq - p) * n, axis=1)
     inside = signed_dist < 0.0
     return inside, idx[:, 0], signed_dist
-
 
 ###############################################################################
 # Axis finding via Poincaré map with Diffrax
 ###############################################################################
 
 def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, Z0: float,
-                     nfp: int, nsteps: int = 1000, max_newton: int = 12, tol: float = 1e-8) -> Tuple[float, float]:
-    """
-    Solve for the magnetic axis in cylindrical coordinates using a Poincaré map.
-
-    This routine follows the approach described by Anderson and others for
-    computing closed field lines in toroidal plasmas.  We treat φ as
-    the independent variable and integrate the field line equations
-
-        dR/dφ = R * B_R / B_φ,
-        dZ/dφ = R * B_Z / B_φ,
-
-    where B = ∇φ.  The Poincaré map P(R,Z) advances (R,Z) by one toroidal
-    period 2π/nfp and returns the field line starting at φ=0 to the
-    original plane.  A fixed point of P corresponds to the magnetic axis.
-
-    Parameters
-    ----------
-    grad_phi : callable
-        Function returning ∇φ at arbitrary Cartesian coordinates.
-    R0, Z0 : float
-        Initial guess for the axis in cylindrical coordinates at φ=0.
-    nfp : int
-        Number of field periods.
-    nsteps : int
-        Number of steps in the Diffrax integration per toroidal turn.
-    max_newton : int
-        Maximum number of Newton iterations.
-    tol : float
-        Convergence tolerance on the residual of the Poincaré map.
-
-    Returns
-    -------
-    R_axis, Z_axis : float
-        Cylindrical coordinates of the axis at φ=0.
-    """
+                     nfp: int, nsteps: int = 1000, max_newton: int = 12,
+                     tol: float = 1e-8) -> Tuple[float, float]:
     @jit
     def B_cyl(R: float, phi: float, Z: float) -> Tuple[jnp.ndarray, float, float]:
         x = R * jnp.cos(phi)
@@ -467,7 +307,6 @@ def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, 
         dZ_dphi = R * BZ / Bphi
         return jnp.stack([dR_dphi, dZ_dphi])
 
-    # Diffrax integrator for one toroidal period
     term = dfx.ODETerm(fieldline_rhs)
     solver = dfx.Dopri5()
     t0 = 0.0
@@ -500,43 +339,18 @@ def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, 
         RZ = RZ + delta
     return float(RZ[0]), float(RZ[1])
 
-
 ###############################################################################
-# Diffusion tensor and stencil
+# Diffusion tensor
 ###############################################################################
 
-def diffusion_tensor(gradphi: np.ndarray, eps: float, delta: float = 5e-3) -> np.ndarray:
-    """
-    Construct the anisotropic diffusion tensor D for each grid point.
-
-    D = t̂ t̂^T + eps * (I - t̂ t̂^T) + delta * I
-
-    where t̂ = ∇φ/|∇φ| is the field direction, eps controls the cross–field
-    diffusion and delta adds a small isotropic floor to ensure the operator
-    is strictly elliptic.  A smooth taper is applied based on |∇φ| to
-    transition from anisotropic inside to isotropic near the boundaries.
-
-    Parameters
-    ----------
-    gradphi : array of shape (N, 3)
-        Gradient of φ at each grid point.
-    eps : float
-        Ratio of perpendicular to parallel diffusivities (ε ≪ 1).
-    delta : float
-        Isotropic floor added to all components of D.
-
-    Returns
-    -------
-    D : array of shape (N, 3, 3)
-        Diffusion tensor for each grid point.
-    """
+def diffusion_tensor(gradphi: np.ndarray, eps: float,
+                     delta: float = 5e-3) -> np.ndarray:
     Npts = gradphi.shape[0]
     I = np.eye(3)[None, :, :]
     n = np.linalg.norm(gradphi, axis=-1, keepdims=True)
     n0 = 5e-3 * np.nanmax(n) + 1e-30
     s = np.clip(n / n0, 0.0, 1.0)
     t = np.divide(gradphi, np.maximum(n, 1e-30), out=np.zeros_like(gradphi))
-    # Build local orthonormal frame (t, b1, b2)
     ax = np.abs(t[:, 0]) > 0.70710678
     anchor = np.zeros_like(t)
     anchor[~ax, 0] = 1.0
@@ -557,23 +371,9 @@ def diffusion_tensor(gradphi: np.ndarray, eps: float, delta: float = 5e-3) -> np
     D = (s[..., None] * Daniso) + ((1.0 - s[..., None]) * Diso) + delta * I
     return D
 
-
-def _face_T(D3: np.ndarray, dx: float, dy: float, dz: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute harmonic mean transmissibilities on cell faces for anisotropic diffusion.
-
-    D3 has shape (nx, ny, nz, 3, 3).  For axis aligned faces the flux across a
-    face depends on the component n·D·n where n is the face normal.  For a
-    uniform Cartesian grid with spacing dx, dy, dz in x,y,z directions the
-    harmonic mean of neighbouring values gives the appropriate face
-    transmissibility.
-    """
-    Dxx = D3[..., 0, 0]; Dyy = D3[..., 1, 1]; Dzz = D3[..., 2, 2]
-    kx = 2.0 * Dxx[1:, :, :] * Dxx[:-1, :, :] / np.maximum(Dxx[1:, :, :] + Dxx[:-1, :, :], 1e-30) / (dx * dx)
-    ky = 2.0 * Dyy[:, 1:, :] * Dyy[:, :-1, :] / np.maximum(Dyy[:, 1:, :] + Dyy[:, :-1, :], 1e-30) / (dy * dy)
-    kz = 2.0 * Dzz[:, :, 1:] * Dzz[:, :, :-1] / np.maximum(Dzz[:, :, 1:] + Dzz[:, :, :-1], 1e-30) / (dz * dz)
-    return kx, ky, kz
-
+###############################################################################
+# Full-tensor Cartesian FV operator (27-point stencil via face fluxes)
+###############################################################################
 
 def make_linear_operator(
     nx: int,
@@ -584,141 +384,171 @@ def make_linear_operator(
     dz: float,
     inside: np.ndarray,
     Dfield: np.ndarray,
-    fixed_mask: np.ndarray,
-    fixed_val: np.ndarray,
 ):
     """
-    Build a matrix–free LinearOperator for the anisotropic diffusion equation
+    Build a matrix–free LinearOperator A_pde for the anisotropic diffusion equation
 
-        A[u] = -div( D ∇u )
+        A_pde[u] = -div( D ∇u )
 
-    using a conservative flux form on a uniform Cartesian grid.
+    on a uniform Cartesian grid, using a 27-point stencil implied by
+    face fluxes:
+
+        F_x = (Dxx ∂xψ + Dxy ∂yψ + Dxz ∂zψ) on x-faces,
+        F_y, F_z analogous.
 
     We:
-      * only use faces where **both** cells are inside the surface;
-      * apply the PDE stencil only on "deep interior" nodes (interior_core);
-      * impose Dirichlet rows u - fixed_val = 0 on fixed_mask nodes.
+      * restrict fluxes to faces where both neighbour cells are inside;
+      * compute cross derivatives with centred differences, only where the
+        necessary neighbours exist inside (otherwise cross-terms are dropped);
+      * apply the operator only on "deep interior" nodes (interior_core).
     """
     inside3 = inside.reshape(nx, ny, nz)
-    fixed3  = fixed_mask.reshape(nx, ny, nz)
-    D3      = Dfield.reshape(nx, ny, nz, 3, 3)
+    D3 = Dfield.reshape(nx, ny, nz, 3, 3)
 
-    # Deep interior: inside the surface, not Dirichlet, not on the outermost grid shell
+    # Deep interior: not on bounding box, and inside
     interior_core = np.ones((nx, ny, nz), dtype=bool)
-    interior_core[0, :, :]   = False
-    interior_core[-1, :, :]  = False
-    interior_core[:, 0, :]   = False
-    interior_core[:, -1, :]  = False
-    interior_core[:, :, 0]   = False
-    interior_core[:, :, -1]  = False
-
-    interior_core &= inside3 & (~fixed3)
+    interior_core[0, :, :] = False
+    interior_core[-1, :, :] = False
+    interior_core[:, 0, :] = False
+    interior_core[:, -1, :] = False
+    interior_core[:, :, 0] = False
+    interior_core[:, :, -1] = False
+    interior_core &= inside3
 
     deep_inside_mask = interior_core.ravel(order="C")
 
-    # Face transmissibilities (already include 1/dx^2, 1/dy^2, 1/dz^2 factors)
-    Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
+    # Precompute face diffusion tensors and masks
+
+    # x-faces: between i and i+1, with i=0..nx-2, j=1..ny-2, k=1..nz-2
+    D_x = 0.5 * (D3[1:, 1:-1, 1:-1, :, :] + D3[:-1, 1:-1, 1:-1, :, :])
+    mask_x = inside3[1:, 1:-1, 1:-1] & inside3[:-1, 1:-1, 1:-1]
+
+    # y-faces: between j and j+1, i=1..nx-2, j=0..ny-2, k=1..nz-2
+    D_y = 0.5 * (D3[1:-1, 1:, 1:-1, :, :] + D3[1:-1, :-1, 1:-1, :, :])
+    mask_y = inside3[1:-1, 1:, 1:-1] & inside3[1:-1, :-1, 1:-1]
+
+    # z-faces: between k and k+1, i=1..nx-2, j=1..ny-2, k=0..nz-2
+    D_z = 0.5 * (D3[1:-1, 1:-1, 1:, :, :] + D3[1:-1, 1:-1, :-1, :, :])
+    mask_z = inside3[1:-1, 1:-1, 1:] & inside3[1:-1, 1:-1, :-1]
 
     def matvec(u: np.ndarray) -> np.ndarray:
         u3 = u.reshape(nx, ny, nz)
         out3 = np.zeros_like(u3)
 
-        # Only use faces where both neighbours are inside the plasma
-        mask_x = inside3[1:, :, :] & inside3[:-1, :, :]
-        mask_y = inside3[:, 1:, :] & inside3[:, :-1, :]
-        mask_z = inside3[:, :, 1:] & inside3[:, :, :-1]
+        # ---------------- x-faces ----------------
+        # central differences at x-faces
+        dpsi_dx_xp = (u3[1:, 1:-1, 1:-1] - u3[:-1, 1:-1, 1:-1]) / dx
 
-        # --- x-direction fluxes ---
-        # flux at face between i and i+1: F_x = Tx * (u[i+1] - u[i])
-        Fx_plus = Tx * mask_x * (u3[1:, :, :] - u3[:-1, :, :])
+        dpsi_dy_xp = (
+            (u3[1:, 2:, 1:-1] - u3[1:, :-2, 1:-1]) +
+            (u3[:-1, 2:, 1:-1] - u3[:-1, :-2, 1:-1])
+        ) * (0.25 / dy)
 
-        out3[:-1, :, :] -= Fx_plus
-        out3[1:,  :, :] += Fx_plus
+        dpsi_dz_xp = (
+            (u3[1:, 1:-1, 2:] - u3[1:, 1:-1, :-2]) +
+            (u3[:-1, 1:-1, 2:] - u3[:-1, 1:-1, :-2])
+        ) * (0.25 / dz)
 
-        # --- y-direction fluxes ---
-        Fy_plus = Ty * mask_y * (u3[:, 1:, :] - u3[:, :-1, :])
+        # drop cross-terms where the needed neighbours are not all inside
+        # (simple, conservative choice)
+        valid_cross_x = (
+            mask_x &
+            inside3[1:, 2:, 1:-1] & inside3[1:, :-2, 1:-1] &
+            inside3[:-1, 2:, 1:-1] & inside3[:-1, :-2, 1:-1] &
+            inside3[1:, 1:-1, 2:] & inside3[1:, 1:-1, :-2] &
+            inside3[:-1, 1:-1, 2:] & inside3[:-1, 1:-1, :-2]
+        )
 
-        out3[:, :-1, :] -= Fy_plus
-        out3[:, 1:,  :] += Fy_plus
+        dpsi_dy_xp = np.where(valid_cross_x, dpsi_dy_xp, 0.0)
+        dpsi_dz_xp = np.where(valid_cross_x, dpsi_dz_xp, 0.0)
 
-        # --- z-direction fluxes ---
-        Fz_plus = Tz * mask_z * (u3[:, :, 1:] - u3[:, :, :-1])
+        qx_xp = (
+            D_x[..., 0, 0] * dpsi_dx_xp +
+            D_x[..., 0, 1] * dpsi_dy_xp +
+            D_x[..., 0, 2] * dpsi_dz_xp
+        )
+        qx_xp *= mask_x
 
-        out3[:, :, :-1] -= Fz_plus
-        out3[:, :, 1: ] += Fz_plus
+        out3[:-1, 1:-1, 1:-1] -= qx_xp / dx
+        out3[1:, 1:-1, 1:-1]  += qx_xp / dx
 
-        # Zero out everything except true PDE interior
+        # ---------------- y-faces ----------------
+        dpsi_dy_yp = (u3[1:-1, 1:, 1:-1] - u3[1:-1, :-1, 1:-1]) / dy
+
+        dpsi_dx_yp = (
+            (u3[2:, 1:, 1:-1] - u3[:-2, 1:, 1:-1]) +
+            (u3[2:, :-1, 1:-1] - u3[:-2, :-1, 1:-1])
+        ) * (0.25 / dx)
+
+        dpsi_dz_yp = (
+            (u3[1:-1, 1:, 2:] - u3[1:-1, 1:, :-2]) +
+            (u3[1:-1, :-1, 2:] - u3[1:-1, :-1, :-2])
+        ) * (0.25 / dz)
+
+        valid_cross_y = (
+            mask_y &
+            inside3[2:, 1:, 1:-1] & inside3[:-2, 1:, 1:-1] &
+            inside3[2:, :-1, 1:-1] & inside3[:-2, :-1, 1:-1] &
+            inside3[1:-1, 1:, 2:] & inside3[1:-1, 1:, :-2] &
+            inside3[1:-1, :-1, 2:] & inside3[1:-1, :-1, :-2]
+        )
+
+        dpsi_dx_yp = np.where(valid_cross_y, dpsi_dx_yp, 0.0)
+        dpsi_dz_yp = np.where(valid_cross_y, dpsi_dz_yp, 0.0)
+
+        qy_yp = (
+            D_y[..., 1, 0] * dpsi_dx_yp +
+            D_y[..., 1, 1] * dpsi_dy_yp +
+            D_y[..., 1, 2] * dpsi_dz_yp
+        )
+        qy_yp *= mask_y
+
+        out3[1:-1, :-1, 1:-1] -= qy_yp / dy
+        out3[1:-1, 1:, 1:-1]  += qy_yp / dy
+
+        # ---------------- z-faces ----------------
+        dpsi_dz_zp = (u3[1:-1, 1:-1, 1:] - u3[1:-1, 1:-1, :-1]) / dz
+
+        dpsi_dx_zp = (
+            (u3[2:, 1:-1, 1:] - u3[:-2, 1:-1, 1:]) +
+            (u3[2:, 1:-1, :-1] - u3[:-2, 1:-1, :-1])
+        ) * (0.25 / dx)
+
+        dpsi_dy_zp = (
+            (u3[1:-1, 2:, 1:] - u3[1:-1, :-2, 1:]) +
+            (u3[1:-1, 2:, :-1] - u3[1:-1, :-2, :-1])
+        ) * (0.25 / dy)
+
+        valid_cross_z = (
+            mask_z &
+            inside3[2:, 1:-1, 1:] & inside3[:-2, 1:-1, 1:] &
+            inside3[2:, 1:-1, :-1] & inside3[:-2, 1:-1, :-1] &
+            inside3[1:-1, 2:, 1:] & inside3[1:-1, :-2, 1:] &
+            inside3[1:-1, 2:, :-1] & inside3[1:-1, :-2, :-1]
+        )
+
+        dpsi_dx_zp = np.where(valid_cross_z, dpsi_dx_zp, 0.0)
+        dpsi_dy_zp = np.where(valid_cross_z, dpsi_dy_zp, 0.0)
+
+        qz_zp = (
+            D_z[..., 2, 0] * dpsi_dx_zp +
+            D_z[..., 2, 1] * dpsi_dy_zp +
+            D_z[..., 2, 2] * dpsi_dz_zp
+        )
+        qz_zp *= mask_z
+
+        out3[1:-1, 1:-1, :-1] -= qz_zp / dz
+        out3[1:-1, 1:-1, 1:]  += qz_zp / dz
+
+        # Only act on true PDE interior; zero elsewhere
         out3[~interior_core] = 0.0
         out3[~inside3] = 0.0
 
-        out = out3.ravel(order="C")
-
-        # Dirichlet rows: u - fixed_val = 0
-        rows_fixed = np.where(fixed_mask)[0]
-        out[rows_fixed] = u[rows_fixed] - fixed_val[rows_fixed]
-
-        return out
+        return out3.ravel(order="C")
 
     N = nx * ny * nz
     A = LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
     return A, deep_inside_mask
-
-
-# Compute RHS: for each face touching a Dirichlet neighbour,
-# add K * u_fixed to b_full
-def compute_rhs_full(
-    nx: int,
-    ny: int,
-    nz: int,
-    Tx: np.ndarray,
-    Ty: np.ndarray,
-    Tz: np.ndarray,
-    fixed_mask: np.ndarray,
-    fixed_val: np.ndarray,
-) -> np.ndarray:
-    """
-    Build the full RHS vector b_full for A_full u = b_full.
-
-    For each face, if one neighbour cell is Dirichlet with value u_fixed,
-    we add K * u_fixed to the RHS of the opposite cell, where K is the
-    transmissibility on that face.
-
-    Parameters
-    ----------
-    nx, ny, nz : int
-        Grid dimensions.
-    Tx, Ty, Tz :
-        Face transmissibilities in x, y, z directions with shapes
-        (nx-1, ny, nz), (nx, ny-1, nz), (nx, ny, nz-1).
-    fixed_mask : (N,) bool
-        Dirichlet nodes.
-    fixed_val : (N,) float
-        Dirichlet values on those nodes.
-
-    Returns
-    -------
-    b_full : (N,) float
-        Full RHS vector on the entire grid.
-    """
-    fixed3 = fixed_mask.reshape(nx, ny, nz)
-    val3   = fixed_val.reshape(nx, ny, nz)
-
-    b3 = np.zeros((nx, ny, nz), dtype=float)
-
-    # x-faces: between (i, j, k) and (i+1, j, k)
-    b3[:-1, :, :] += Tx * fixed3[1:, :, :] * val3[1:, :, :]
-    b3[1:,  :, :] += Tx * fixed3[:-1, :, :] * val3[:-1, :, :]
-
-    # y-faces: between (i, j, k) and (i, j+1, k)
-    b3[:, :-1, :] += Ty * fixed3[:, 1:, :] * val3[:, 1:, :]
-    b3[:, 1:,  :] += Ty * fixed3[:, :-1, :] * val3[:, :-1, :]
-
-    # z-faces: between (i, j, k) and (i, j, k+1)
-    b3[:, :, :-1] += Tz * fixed3[:, :, 1:] * val3[:, :, 1:]
-    b3[:, :,  1:] += Tz * fixed3[:, :, :-1] * val3[:, :, :-1]
-
-    return b3.ravel(order="C")
-
 
 ###############################################################################
 # Main solver routine
@@ -729,49 +559,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
               verbose: bool = True, plot: bool = False, nfp: int = 2,
               delta: float = 5e-3, no_amg: bool = False,
               axis_seed_count: int = 0, save_figures: bool = True) -> Dict[str, Any]:
-    """
-    Solve the field–aligned flux function ψ via anisotropic diffusion on a uniform grid.
 
-    Parameters
-    ----------
-    npz_file : str
-        Path to the multipole solution checkpoint containing ``center``, ``scale``,
-        ``Yn``, ``alpha``, ``a``, ``a_hat``, ``P``, ``N``.  See Evaluators.
-    grid_N : int
-        Number of grid points per axis for the Cartesian grid.  Total nodes N = grid_N³.
-    eps : float
-        Ratio of perpendicular to parallel diffusivities.
-    band_h : float
-        Boundary band thickness multiplier.  The band width is band_h * voxel size.
-    axis_band_radius : float
-        Radius of the axis band.  If 0, choose automatically; if <1, interpret as
-        fraction of the bounding box diagonal; if ≥1, use absolute units.
-    cg_tol : float
-        Relative tolerance for the conjugate–gradient solver.
-    cg_maxit : int
-        Maximum number of CG iterations.
-    verbose : bool
-        If True, print diagnostic information.
-    plot : bool
-        If True, produce matplotlib plots of the solution and residuals (requires
-        matplotlib).  Disabled in headless environments by default.
-    nfp : int
-        Number of field periods (for computing the Poincaré map).
-    delta : float
-        Isotropic floor added to the diffusion tensor.
-    no_amg : bool
-        If True, do not attempt to build an AMG preconditioner; use Jacobi instead.
-    axis_seed_count : int
-        Unused parameter retained for compatibility.  Axis seeds are now
-        determined automatically.
-
-    Returns
-    -------
-    result : dict
-        Dictionary containing the solution ψ, the grid coordinates, inside mask,
-        and diagnostic information.
-    """
-    # Load checkpoint data
     data = np.load(npz_file, allow_pickle=True)
     center = data["center"]; scale = float(data["scale"])
     Yn = data["Yn"]; alpha = data["alpha"]
@@ -783,13 +571,11 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     if verbose:
         pinfo(f"Loaded checkpoint with {P.shape[0]} boundary points and {Yn.shape[0]} multipole sources (kind={kind_str}).")
 
-    # Build evaluators for φ and ∇φ
     evals = Evaluators(center=jnp.asarray(center), scale=scale,
                        Yn=jnp.asarray(Yn), alpha=jnp.asarray(alpha),
                        a=jnp.asarray(a), a_hat=jnp.asarray(a_hat))
     phi_fn, grad_phi = evals.build()
 
-    # Build uniform Cartesian grid surrounding the boundary with margin
     mins = P.min(axis=0); maxs = P.max(axis=0); span = maxs - mins
     mins = mins - 0.01 * span; maxs = maxs + 0.01 * span
     nx = ny = nz = int(grid_N)
@@ -801,12 +587,13 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     XX = XX.transpose(1, 0, 2)
     YY = YY.transpose(1, 0, 2)
     ZZ = ZZ.transpose(1, 0, 2)
-    Xq = np.column_stack([XX.ravel(order="C"), YY.ravel(order="C"), ZZ.ravel(order="C")])
+    Xq = np.column_stack([XX.ravel(order="C"),
+                          YY.ravel(order="C"),
+                          ZZ.ravel(order="C")])
     if verbose:
         pinfo(f"Grid size: {nx}x{ny}x{nz} = {Xq.shape[0]} nodes.  Spacing dx≈{dx:.3g}, dy≈{dy:.3g}, dz≈{dz:.3g}")
     voxel = min(dx, dy, dz)
 
-    # Flip normals if necessary so that outward normals have positive mean (P-c)·N
     c = np.mean(P, axis=0)
     s = np.sum((P - c) * Nsurf, axis=1)
     avg = float(np.mean(s))
@@ -818,17 +605,17 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         if verbose:
             pinfo("Normals appear outward on average.")
 
-    # Compute inside mask via signed distance to surface
     inside_mask, nn_idx, signed_dist = inside_mask_from_surface(P, Nsurf, Xq)
     if verbose:
         pstat("Inside mask", inside_mask.astype(float))
 
-    # Decide toroidal direction via local gradient integration
     if not np.any(inside_mask):
         raise RuntimeError("Inside mask is empty; check surface normals or grid bounds.")
+
     x0 = Xq[inside_mask][0]
-    # Integrate a few steps along ±∇φ to see which direction increases φ
-    def decide_sign(x_init: jnp.ndarray) -> Tuple[str, jnp.ndarray]:
+
+    # Direction sign heuristic (still degenerate but harmless; keeps +1)
+    def decide_sign(x_init: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         x = jnp.asarray(x_init, dtype=jnp.float64)
         def advance(xstart: jnp.ndarray, sgn: float, K: int = 8, step: float = 1e-2) -> jnp.ndarray:
             xs = xstart
@@ -844,6 +631,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         xp = advance(x, +1.0)
         xm = advance(x, -1.0)
         return xp, xm
+
     xp, xm = decide_sign(x0)
     d_plus = float(np.linalg.norm(xp - x0))
     d_minus = float(np.linalg.norm(xm - x0))
@@ -854,15 +642,12 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     if verbose:
         pinfo(f"Toroidal direction sign chosen as {dir_sign:+.0f} (d+= {d_plus:.3e}, d-= {d_minus:.3e})")
 
-    # Rebuild evaluators with flipped sign if needed
     a_flipped = np.array([float(dir_sign) * float(a[0]), float(a[1])], dtype=float)
     evals = Evaluators(center=jnp.asarray(center), scale=scale,
                        Yn=jnp.asarray(Yn), alpha=jnp.asarray(alpha),
                        a=jnp.asarray(a_flipped), a_hat=jnp.asarray(a_hat))
     phi_fn, grad_phi = evals.build()
 
-    # Find magnetic axis via Poincaré map
-    # Use interior slice near φ=0 and Z≈0 to estimate initial guess
     phi_tol = 0.2
     phiq = np.arctan2(Xq[:, 1], Xq[:, 0])
     Z_span = Xq[:, 2].max() - Xq[:, 2].min()
@@ -870,7 +655,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     mask_slice = inside_mask & (np.abs(phiq) < phi_tol) & (np.abs(Xq[:, 2]) < Z_tol)
     if not np.any(mask_slice):
         mask_slice = inside_mask
-    R_slice = np.sqrt(Xq[mask_slice][:, 0] ** 2 + Xq[mask_slice][:, 1] ** 2)
+    R_slice = np.sqrt(Xq[mask_slice][:, 0]**2 + Xq[mask_slice][:, 1]**2)
     R_inner = float(R_slice.min()); R_outer = float(R_slice.max())
     R0_guess = 0.5 * (R_inner + R_outer); Z0_guess = 0.0
     if verbose:
@@ -879,9 +664,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     R_axis, Z_axis = collapse_to_axis(grad_phi, R0_guess, Z0_guess, nfp=nfp)
     if verbose:
         pinfo(f"Solved axis in {(time.time() - start_axis_time):.2f} s: R={R_axis:.3e}, Z={Z_axis:.3e}")
-    # Integrate full axis orbit for diagnostics
+
     n_axis_pts = 512
     phis_axis = jnp.linspace(0.0, 2.0 * jnp.pi, n_axis_pts, endpoint=False)
+
     @jit
     def B_cyl_axis(R: float, phi: float, Z: float) -> Tuple[jnp.ndarray, float, float]:
         x = R * jnp.cos(phi); y = R * jnp.sin(phi)
@@ -894,11 +680,13 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         BZ = B[2]
         Bphi = jnp.where(jnp.abs(Bphi) < 1e-12, jnp.sign(Bphi) * 1e-12, Bphi)
         return BR, Bphi, BZ
+
     @jit
     def fieldline_rhs_axis(phi: float, RZ: jnp.ndarray, args: Any) -> jnp.ndarray:
         R, Z = RZ
         BR, Bphi, BZ = B_cyl_axis(R, phi, Z)
         return jnp.stack([R * BR / Bphi, R * BZ / Bphi])
+
     term_axis = dfx.ODETerm(fieldline_rhs_axis)
     solver_axis = dfx.Dopri5()
     dt0_axis = float(2.0 * jnp.pi) / 4096.0
@@ -913,7 +701,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     if verbose:
         pinfo(f"Axis orbit integrated; sample point: R={axis_pts[0,0]:.3e}, Z={axis_pts[0,2]:.3e}")
 
-    # Debug: are axis points inside or outside the surface?
     inside_axis, _, signed_axis = inside_mask_from_surface(P, Nsurf, axis_pts)
     if verbose:
         pinfo(
@@ -922,10 +709,8 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         )
         pinfo(f"Axis points classified inside: {inside_axis.sum()} / {inside_axis.size}")
 
-    # Build boundary band and axis band
     bbox_diag = float(np.linalg.norm(maxs - mins))
     if axis_band_radius == 0.0:
-        # Start with a few voxels; will adjust if needed
         axis_band_radius_eff = 2.5 * voxel
     elif axis_band_radius < 1.0:
         axis_band_radius_eff = max(2.5 * voxel, axis_band_radius * bbox_diag)
@@ -934,15 +719,12 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     h_band_vox = max(1.5 * voxel, float(band_h) * voxel)
 
-    # ---------------- Axis band (primary guess) ----------------
     axis_band = axis_band_mask(axis_pts, Xq, axis_band_radius_eff) & inside_mask
 
-    # If the band is empty, adaptively pick the innermost inside nodes
     if not np.any(axis_band):
         if verbose:
             pinfo("Axis band empty; rebuilding adaptively based on distance to axis.")
 
-        # Distances to axis curve for all grid points
         nbrs_axis = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(axis_pts)
         d_axis, _ = nbrs_axis.kneighbors(Xq)
         d_axis = d_axis[:, 0]
@@ -951,8 +733,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         if inside_idx.size == 0:
             raise RuntimeError("Inside mask empty when building axis band.")
 
-        # Choose a small fraction of innermost inside nodes as axis band
-        frac = 0.02  # 2% of inside nodes
+        frac = 0.02
         n_axis_nodes = max(10, int(frac * inside_idx.size))
         order = np.argsort(d_axis[inside_idx])
         chosen = inside_idx[order[:n_axis_nodes]]
@@ -967,15 +748,12 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                 f"effective radius ≈ {axis_band_radius_eff:.3e}"
             )
 
-    # ---------------- Boundary band ----------------
     band = (inside_mask & (np.abs(signed_dist) <= h_band_vox))
 
-    # Ensure axis band dominates boundary band where they overlap
     overlap = band & axis_band
     axis_band[overlap] = True
     band[overlap] = False
 
-    # Prepare Dirichlet masks and values
     Ntot = Xq.shape[0]
     fixed = np.zeros(Ntot, dtype=bool)
     val = np.zeros(Ntot, dtype=float)
@@ -989,7 +767,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         print(f"[INFO] boundary band width  ≈ {h_band_vox:.3e}")
         print(f"[INFO] axis band radius     ≈ {axis_band_radius_eff:.3e}")
 
-    # Evaluate ∇φ on the grid (chunked to save memory)
     if verbose:
         pinfo("Evaluating ∇φ on grid ...")
     G = np.zeros_like(Xq)
@@ -1001,214 +778,84 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         if np.any(bad):
             Gi[bad] = 0.0
         G[start:start + chunk] = Gi
-    # Build diffusion tensor
+
     D = diffusion_tensor(G, eps=eps, delta=delta)
 
-    # Build matrix–free operator
-    A_full, deep_inside = make_linear_operator(
+    A_pde, deep_inside = make_linear_operator(
         nx, ny, nz, dx, dy, dz,
-        inside_mask, D, fixed, val
+        inside_mask, D
     )
 
-    # Free unknowns are "deep interior" AND not fixed
     free = deep_inside & (~fixed)
     if not np.any(free):
         raise RuntimeError("No free deep-interior nodes; bands / geometry too tight.")
 
-    # Compute RHS for fixed values using the same face transmissibilities
-    D3 = D.reshape(nx, ny, nz, 3, 3)
-    Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
-    b_full = compute_rhs_full(nx, ny, nz, Tx, Ty, Tz, fixed, val)
-    b_free = b_full[free]
+    # Build lifting for Dirichlet bands: ψ = ψ_free + ψ_fixed
+    psi_fixed_full = np.zeros(Ntot, dtype=float)
+    psi_fixed_full[fixed] = val[fixed]
 
-    # Construct restricted operator on free nodes
-    def matvec_free(u_free: np.ndarray) -> np.ndarray:
-        u_full = np.zeros_like(val)
-        u_full[free] = u_free
-        Au_full = A_full @ u_full
-        return Au_full[free]
+    F0_full = A_pde @ psi_fixed_full  # A_pde applied to known fixed field
+    b_free = -F0_full[free]
+
     Nfree = int(free.sum())
-    A_free = LinearOperator((Nfree, Nfree), matvec=matvec_free, rmatvec=matvec_free, dtype=float)
-    # Volume scaling for SPD
-    cell_vol = dx * dy * dz
-    sqrtV = np.sqrt(cell_vol)
-    def A_sym_matvec(y: np.ndarray) -> np.ndarray:
-        u_free = y / sqrtV
-        r_free = A_free @ u_free
-        return sqrtV * r_free
-    A_sym = LinearOperator((Nfree, Nfree), matvec=A_sym_matvec, rmatvec=A_sym_matvec, dtype=float)
-    b_sym = sqrtV * b_free
-    # Build AMG preconditioner (optional)
-    if not no_amg:
-        try:
-            if verbose:
-                pinfo("Assembling CSR matrix for AMG preconditioner ...")
 
-            def build_csr_free():
-                """Assemble explicit CSR matrix A_ff on free nodes for AMG."""
-                inside3 = inside_mask.reshape(nx, ny, nz)
-                fixed1d = fixed.ravel(order="C")
-                D3 = D.reshape(nx, ny, nz, 3, 3)
-                Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
-                idx3 = np.arange(nx * ny * nz).reshape(nx, ny, nz)
+    def matvec_free(u_free: np.ndarray) -> np.ndarray:
+        u_full = np.zeros(Ntot, dtype=float)
+        u_full[free] = u_free
+        Au_full = A_pde @ u_full
+        return Au_full[free]
 
-                rows, cols, vals = [], [], []
-                diag = np.zeros(nx * ny * nz, dtype=float)
+    A_eff = LinearOperator(
+        (Nfree, Nfree),
+        matvec=matvec_free,
+        rmatvec=matvec_free,
+        dtype=float
+    )
 
-                for i in range(nx):
-                    for j in range(ny):
-                        for k in range(nz):
-                            if not inside3[i, j, k]:
-                                continue
-                            p = idx3[i, j, k]
-                            if fixed1d[p]:
-                                continue
-
-                            # x-
-                            if i > 0 and inside3[i - 1, j, k]:
-                                q = idx3[i - 1, j, k]
-                                K = Tx[i - 1, j, k]
-                                if fixed1d[q]:
-                                    # Dirichlet contribution to RHS (handled in b_free)
-                                    pass
-                                else:
-                                    rows.append(p); cols.append(q); vals.append(-K)
-                                diag[p] += K
-                            # x+
-                            if i + 1 < nx and inside3[i + 1, j, k]:
-                                q = idx3[i + 1, j, k]
-                                K = Tx[i, j, k]
-                                if fixed1d[q]:
-                                    pass
-                                else:
-                                    rows.append(p); cols.append(q); vals.append(-K)
-                                diag[p] += K
-                            # y-
-                            if j > 0 and inside3[i, j - 1, k]:
-                                q = idx3[i, j - 1, k]
-                                K = Ty[i, j - 1, k]
-                                if fixed1d[q]:
-                                    pass
-                                else:
-                                    rows.append(p); cols.append(q); vals.append(-K)
-                                diag[p] += K
-                            # y+
-                            if j + 1 < ny and inside3[i, j + 1, k]:
-                                q = idx3[i, j + 1, k]
-                                K = Ty[i, j, k]
-                                if fixed1d[q]:
-                                    pass
-                                else:
-                                    rows.append(p); cols.append(q); vals.append(-K)
-                                diag[p] += K
-                            # z-
-                            if k > 0 and inside3[i, j, k - 1]:
-                                q = idx3[i, j, k - 1]
-                                K = Tz[i, j, k - 1]
-                                if fixed1d[q]:
-                                    pass
-                                else:
-                                    rows.append(p); cols.append(q); vals.append(-K)
-                                diag[p] += K
-                            # z+
-                            if k + 1 < nz and inside3[i, j, k + 1]:
-                                q = idx3[i, j, k + 1]
-                                K = Tz[i, j, k]
-                                if fixed1d[q]:
-                                    pass
-                                else:
-                                    rows.append(p); cols.append(q); vals.append(-K)
-                                diag[p] += K
-
-                # Add diagonal entries for free nodes
-                p_idx = np.where(inside_mask & (~fixed))[0]
-                rows += list(p_idx)
-                cols += list(p_idx)
-                vals += list(diag[p_idx])
-
-                A_full_csr = coo_matrix((vals, (rows, cols)),
-                                        shape=(nx * ny * nz, nx * ny * nz)).tocsr()
-                A_ff = A_full_csr[free][:, free]
-                return A_ff
-
-            A_csr_free = build_csr_free()
-
-            # Basic smoothed aggregation AMG with default options
-            ml = smoothed_aggregation_solver(A_csr_free, symmetry='symmetric')
-            M_amg = ml.aspreconditioner(cycle='V')
-
-            def M_apply(x):
-                return M_amg @ x
-
-            M = LinearOperator((Nfree, Nfree), matvec=M_apply,
-                               rmatvec=M_apply, dtype=float)
-
-        except Exception as e:
-            if verbose:
-                pinfo(f"AMG preconditioner failed: {e}; falling back to Jacobi.")
-            no_amg = True
-
-    if no_amg:
-        # Jacobi-like fallback preconditioner
-        diag_approx = np.maximum(1e-8, np.ones(Nfree))
-
-        def M_apply(x):
-            return x / diag_approx
-
-        M = LinearOperator((Nfree, Nfree), matvec=M_apply,
-                           rmatvec=M_apply, dtype=float)
-
-    # Initial guess for CG: apply preconditioner to RHS
-    x0 = M @ b_sym
     if verbose:
-        pinfo("Solving linear system (CG/Minres) ...")
-    psi_free_scaled, info = cg(A_sym, b_sym, rtol=cg_tol, maxiter=cg_maxit, M=M, x0=x0)
-    if (not np.all(np.isfinite(psi_free_scaled))) or info != 0:
-        if verbose:
-            pinfo(f"CG returned info={info}; switching to MINRES.")
-        psi_free_scaled, info = minres(A_sym, b_sym, rtol=cg_tol, maxiter=cg_maxit, M=M, x0=x0)
-    # Unscale to obtain ψ on free nodes
-    psi_free = psi_free_scaled / sqrtV
-    psi = np.array(val)
+        pinfo("Solving linear system (CG) ...")
+    # start with zeros
+    psi_free, info = cg(A_eff, b_free, rtol=cg_tol, maxiter=cg_maxit)
+    if info != 0 and verbose:
+        pinfo(f"[WARN] CG returned info={info} (0 means full convergence).")
+
+    psi = np.array(psi_fixed_full)
     psi[free] = psi_free
-    # Compute full residual
-    r_full = A_full @ psi
-    if verbose:
-        # Basic ψ statistics everywhere
-        pstat("ψ (all nodes)", psi)
 
-        # ψ on boundary and axis bands
+    # Small safety clamp to [0,1] inside the domain
+    psi_inside = psi[inside_mask]
+    psi_inside = np.clip(psi_inside, 0.0, 1.0)
+    psi[inside_mask] = psi_inside
+
+    r_full = A_pde @ psi
+
+    if verbose:
+        pstat("ψ (all nodes)", psi)
         pstat("ψ on boundary band (should be ~1)", psi[band])
         pstat("ψ on axis band (should be ~0)", psi[axis_band])
-
-        # ψ on free interior nodes (inside, not in bands)
         free_inside = inside_mask & (~fixed)
         if np.any(free_inside):
             pstat("ψ on free interior", psi[free_inside])
-
         pstat("Full residual", r_full)
-        print(f"Reduced residual ||r||/||b|| = {np.linalg.norm(r_full[free]) / (np.linalg.norm(b_full[free]) + 1e-30):.3e}")
-    # Quality metric: q = |t·∇ψ| / |∇ψ|, with t = ∇φ / |∇φ|
+        # We don't have a nonzero RHS on free nodes anymore; measure absolute residual
+        print(f"||r||_2 over free nodes = {np.linalg.norm(r_full[free]):.3e}")
+
     psi3 = psi.reshape(nx, ny, nz)
 
-    # Central differences for ∇ψ on the interior region
     dpsidx = (psi3[2:, 1:-1, 1:-1] - psi3[:-2, 1:-1, 1:-1]) / (2 * dx)
     dpsidy = (psi3[1:-1, 2:, 1:-1] - psi3[1:-1, :-2, 1:-1]) / (2 * dy)
     dpsidz = (psi3[1:-1, 1:-1, 2:] - psi3[1:-1, 1:-1, :-2]) / (2 * dz)
 
-    # Core region for ∇φ
     G3 = G.reshape(nx, ny, nz, 3)
-    B_core = G3[1:-1, 1:-1, 1:-1, :]          # shape (nx-2, ny-2, nz-2, 3)
+    B_core = G3[1:-1, 1:-1, 1:-1, :]
     gnorm_core = np.linalg.norm(B_core, axis=-1)
     core_mask = (gnorm_core > 1e-10)
 
-    # Normalised field direction t̂
     t_hat_core = np.zeros_like(B_core)
     t_hat_core[core_mask] = (
         B_core[core_mask].T / gnorm_core[core_mask]
     ).T
 
-    # Parallel and total gradient of ψ
     par_grad_full = (
         t_hat_core[..., 0] * dpsidx +
         t_hat_core[..., 1] * dpsidy +
@@ -1230,7 +877,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         )
 
     if plot:
-        # Histogram + residual plots (unchanged)
         if q_metric.size > 0:
             fig1, ax1 = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
 
@@ -1251,7 +897,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             if save_figures:
                 fig1.savefig("fci_psi_diagnostics.png")
 
-        # --- R–Z–φ panels ---
         try:
             psi3 = psi.reshape(nx, ny, nz)
             inside3 = inside_mask.reshape(nx, ny, nz)
@@ -1259,12 +904,11 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                 psi3, xs, ys, zs, P, inside3, nR=128, nphi=64, nZ=128
             )
 
-            # Choose a few φ indices for panels
-            Rb = np.sqrt(P[:,0]**2 + P[:,1]**2)
-            phi_b = np.mod(np.arctan2(P[:,1], P[:,0]), 2*np.pi)
-            Zb = P[:,2]
+            Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
+            phi_b = np.mod(np.arctan2(P[:, 1], P[:, 0]), 2*np.pi)
+            Zb = P[:, 2]
 
-            jj_list = np.linspace(0, len(phis_cyl)-1, 4, dtype=int)
+            jj_list = np.linspace(0, len(phis_cyl) - 1, 4, dtype=int)
             figRZ = plot_psi_maps_RZ_panels(
                 psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list,
                 Rb=Rb, Zb=Zb, phi_b=phi_b, title="ψ(R,Z)"
@@ -1276,7 +920,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         except Exception as e:
             pinfo(f"[WARN] Failed to build RZφ panels: {e}")
 
-        #--- 3D axis and boundary plot ---
         try:
             fig3d = plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask)
             if save_figures:
@@ -1286,36 +929,40 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
         plt.show()
 
-    # Prepare result dictionary
     result = {
         'psi': psi,
-        'grid': {'xs': xs,'ys': ys,'zs': zs,'mins': mins,'maxs': maxs,},
+        'grid': {
+            'xs': xs, 'ys': ys, 'zs': zs,
+            'mins': mins, 'maxs': maxs,
+        },
         'inside': inside_mask,
-        'bands': {'boundary': band,'axis': axis_band,},
+        'bands': {
+            'boundary': band,
+            'axis': axis_band,
+        },
         'quality': {
-            # q = |t·∇ψ|/|∇ψ| sampled on core region
             'q_metric': q_metric,
-            # parallel component t·∇ψ at sampled points
             'parallel_dot_grad': par_grad,
-            # full residual A_full @ psi on all nodes
-            'residual': r_full,},
-        'axis': {'R': R_axis,'Z': Z_axis,'points': axis_pts,},}
+            'residual': r_full,
+        },
+        'axis': {
+            'R': R_axis,
+            'Z': Z_axis,
+            'points': axis_pts,
+        },
+    }
     return result
-
 
 ###############################################################################
 # Command line interface
 ###############################################################################
 
 if __name__ == "__main__":
-    
+
     default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
     # default_solution = "wout_SLAM_6_coils_solution.npz"
-
-#### ASK CHATGPT TO MAKE GRID IN CYLINDRICAL COORDINATES IF KIND=TORUS, OTHERWISE LEAVE CARTESIAN
-##### SAVE SPACE
 
     nfp_default = 2
     if 'QH' in default_solution:
@@ -1323,8 +970,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
-                help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=48, help="Grid resolution per axis")
+                        help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
+    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
     parser.add_argument("--eps", type=float, default=2e-2, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=5e-2, help="Isotropic diffusion floor")
     parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
@@ -1332,21 +979,23 @@ if __name__ == "__main__":
     parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=2000, help="CG maximum iterations (default: 2000)")
     parser.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods (default: 2)")
-    parser.add_argument("--no-amg", action="store_true", help="Disable AMG preconditioner and use Jacobi")
-    parser.add_argument("--no-plot", action="store_true", help="Disable plotting (not implemented in this version)")
+    parser.add_argument("--no-amg", action="store_true", help="(Ignored in this version; AMG removed.)")
+    parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument("--save-figures", action="store_true", default=True, help="Save diagnostic figures to disk.")
     args = parser.parse_args()
-    res = solve_fci(args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
-                    axis_band_radius=args.axis_band_radius, cg_tol=args.cg_tol,
-                    cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
-                    nfp=args.nfp, delta=args.delta, no_amg=args.no_amg,
-                    save_figures=args.save_figures)
-    # Print solution statistics on inside nodes (excluding boundary and axis bands)
+
+    res = solve_fci(
+        args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
+        axis_band_radius=args.axis_band_radius, cg_tol=args.cg_tol,
+        cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
+        nfp=args.nfp, delta=args.delta, no_amg=args.no_amg,
+        save_figures=args.save_figures
+    )
+
     psi_all = res['psi']
     inside_mask = res['inside']
-    # Exclude axis band and boundary band nodes for this summary by checking where Dirichlet conditions were applied
-    # Since the solve stamps ψ=1 on band and ψ=0 on axis_band, we identify fixed nodes by comparing ψ to 0 or 1.
     fixed_nodes = (np.abs(psi_all - 1.0) < 1e-10) | (np.abs(psi_all) < 1e-10)
     free_inside = inside_mask & (~fixed_nodes)
     psi_in = psi_all[free_inside]
-    if psi_in.size > 0: pstat("Solution ψ (inside free region)", psi_in)
+    if psi_in.size > 0:
+        pstat("Solution ψ (inside free region)", psi_in)
