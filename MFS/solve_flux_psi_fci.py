@@ -130,52 +130,77 @@ def axis_band_mask(P_axis, Xq, rad):
     return (d[:,0] < rad)
 
 # ----------------------------- Plotting utilities ---------------------------- #
-def build_psi_RZphi_volume(psi3, xs, ys, zs, P, nR=128, nphi=64, nZ=128):
+def build_psi_RZphi_volume(psi3, xs, ys, zs, P, inside3,
+                           nR=128, nphi=64, nZ=128):
     """
     Construct ψ(R,φ,Z) on a regular cylindrical grid using trilinear interpolation
-    from ψ(x,y,z) defined on (xs,ys,zs).
-
-    Returns
-    -------
-    psi_RZphi : array (nR, nphi, nZ)
-    Rs        : array (nR,)
-    phis      : array (nphi,)
-    Zs        : array (nZ,)
+    from ψ(x,y,z) defined on (xs,ys,zs). Points outside the surface
+    are masked as NaN using the inside_mask.
     """
-    # Use boundary points to define R,Z ranges
     Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
     Rs = np.linspace(Rb.min(), Rb.max(), nR)
     Zs = np.linspace(P[:, 2].min(), P[:, 2].max(), nZ)
-    phis = np.linspace(0.0, 2.0 * np.pi, nphi, endpoint=False)
+    phis = np.linspace(0.0, 2.0*np.pi, nphi, endpoint=False)
 
-    interp = RegularGridInterpolator((xs, ys, zs), psi3,
-                                     bounds_error=False, fill_value=np.nan)
+    interp_psi = RegularGridInterpolator(
+        (xs, ys, zs), psi3,
+        bounds_error=False, fill_value=np.nan
+    )
+    interp_inside = RegularGridInterpolator(
+        (xs, ys, zs), inside3.astype(float),
+        bounds_error=False, fill_value=0.0
+    )
 
     psi_RZphi = np.zeros((nR, nphi, nZ))
+    mask_RZphi = np.zeros((nR, nphi, nZ), dtype=bool)
+
     for j, phi in enumerate(phis):
-        # Cylindrical grid at fixed phi
         R_grid, Z_grid = np.meshgrid(Rs, Zs, indexing="ij")
         X = R_grid * np.cos(phi)
         Y = R_grid * np.sin(phi)
         pts = np.stack([X.ravel(), Y.ravel(), Z_grid.ravel()], axis=-1)
-        vals = interp(pts).reshape(nR, nZ)
-        psi_RZphi[:, j, :] = vals
 
-    return psi_RZphi, Rs, phis, Zs
+        vals = interp_psi(pts).reshape(nR, nZ)
+        inside_vals = interp_inside(pts).reshape(nR, nZ) > 0.5
 
-def plot_psi_maps_RZ_panels(psi3, Rs, phis, Zs, jj_list, title="ψ(R,Z)"):
+        psi_RZphi[:, j, :] = np.where(inside_vals, vals, np.nan)
+        mask_RZphi[:, j, :] = inside_vals
+
+    return psi_RZphi, Rs, phis, Zs, mask_RZphi
+
+def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
+                            Rb=None, Zb=None, phi_b=None,
+                            title="ψ(R,Z)"):
     fig, axa = plt.subplots(2, 2, figsize=(7, 7), constrained_layout=True)
     axa = axa.ravel()
-    Rmin, Rmax = float(np.min(Rs)), float(np.max(Rs))
-    Zmin, Zmax = float(np.min(Zs)), float(np.max(Zs))
+    Rmin, Rmax = float(np.nanmin(Rs)), float(np.nanmax(Rs))
+    Zmin, Zmax = float(np.nanmin(Zs)), float(np.nanmax(Zs))
     extent = [Rmin, Rmax, Zmin, Zmax]
+
     for kk, jj in enumerate(jj_list):
-        im = axa[kk].imshow(psi3[:, jj, :].T, origin='lower', aspect='equal', extent=extent)
-        axa[kk].contour(psi3[:, jj, :].T, levels=10, colors='white', linewidths=0.5, alpha=1.0, extent=extent)
+        psi_slice = psi_RZphi[:, jj, :].T  # shape (nZ, nR)
+        im = axa[kk].imshow(
+            psi_slice,
+            origin='lower',
+            aspect='equal',
+            extent=extent
+        )
+        axa[kk].contour(
+            Rs, Zs, psi_RZphi[:, jj, :].T,
+            levels=10, colors='white', linewidths=0.5, alpha=1.0
+        )
         axa[kk].set_title(f"{title} @ φ≈{phis[jj]:+.2f}")
         axa[kk].set_xlabel("R"); axa[kk].set_ylabel("Z")
         plt.colorbar(im, ax=axa[kk], shrink=0.85)
+
+        # Overlay boundary points near this φ-slice
+        if Rb is not None and phi_b is not None and Zb is not None:
+            dphi = np.abs(np.angle(np.exp(1j*(phi_b - phis[jj]))))
+            mask = dphi < (np.pi / len(phis))   # within half a toroidal cell
+            axa[kk].scatter(Rb[mask], Zb[mask], s=5, c='k', alpha=0.7)
+
     return fig
+
 
 def plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask):
     """
@@ -1171,14 +1196,20 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         # --- R–Z–φ panels ---
         try:
             psi3 = psi.reshape(nx, ny, nz)
-            psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl = build_psi_RZphi_volume(
-                psi3, xs, ys, zs, P, nR=128, nphi=64, nZ=128
+            inside3 = inside_mask.reshape(nx, ny, nz)
+            psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, mask_RZphi = build_psi_RZphi_volume(
+                psi3, xs, ys, zs, P, inside3, nR=128, nphi=64, nZ=128
             )
 
             # Choose a few φ indices for panels
-            jj_list = np.linspace(0, len(phis_cyl) - 1, 4, dtype=int)
+            Rb = np.sqrt(P[:,0]**2 + P[:,1]**2)
+            phi_b = np.mod(np.arctan2(P[:,1], P[:,0]), 2*np.pi)
+            Zb = P[:,2]
+
+            jj_list = np.linspace(0, len(phis_cyl)-1, 4, dtype=int)
             figRZ = plot_psi_maps_RZ_panels(
-                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list, title="ψ(R,Z)"
+                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                Rb=Rb, Zb=Zb, phi_b=phi_b, title="ψ(R,Z)"
             )
             figRZ.suptitle("ψ(R,Z) at selected toroidal angles")
             if save_figures:
@@ -1228,12 +1259,6 @@ if __name__ == "__main__":
     nfp_default = 2
     if 'QH' in default_solution:
         nfp_default = 4
-
-READ
-# Ok, let's now take the next step and:
-# - instead of assuming D is constant per cell and using a cell-center scheme, solve the exact divergence-form operator.
-# - Get a boringly monotone behavor so that the solution does not overshoot and is monotonically increasing from 0 to 1 from axis to the boundary.
-# - is there any way to have a box in cylindrical coordinates? Seems like we should be wasting a lot of space by using a cartesian box in such a torus
 
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
