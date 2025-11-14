@@ -122,7 +122,7 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
                             Rb=None, Zb=None, phi_b=None,
                             R_axis=None, Z_axis=None, phi_axis=None,
                             title="ψ(R,Z)"):
-    fig, axa = plt.subplots(2, 2, figsize=(7, 7), constrained_layout=True)
+    fig, axa = plt.subplots(2, 2, figsize=(6, 6), constrained_layout=True)
     axa = axa.ravel()
     Rmin, Rmax = float(np.nanmin(Rs)), float(np.nanmax(Rs))
     Zmin, Zmax = float(np.nanmin(Zs)), float(np.nanmax(Zs))
@@ -148,23 +148,21 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
         if Rb is not None and phi_b is not None and Zb is not None:
             dphi_b = np.abs(np.angle(np.exp(1j * (phi_b - phis[jj]))))
             # mask_b = dphi_b < (np.pi / len(phis))
-            mask_b = dphi_b < 4.2 * 2.0 * np.pi / len(phis)
+            mask_b = dphi_b < 0.05#2.0 * 2.0 * np.pi / len(phis)
             axa[kk].scatter(
                 Rb[mask_b], Zb[mask_b],
-                s=15, c='k', alpha=1.0,
-                zorder=5,                      # <<< ensure on top
-                label="boundary" if kk == 0 else None,
+                s=10, c='k', alpha=1.0,
+                zorder=5, label="boundary" if kk == 0 else None,
             )
 
         # magnetic axis overlay (markers above everything)
         if R_axis is not None and phi_axis is not None and Z_axis is not None:
             dphi_a = np.abs(np.angle(np.exp(1j * (phi_axis - phis[jj]))))
-            mask_a = dphi_a < 0.5 * 2.0 * np.pi / len(phis)
+            mask_a = dphi_a < 0.2 * 2.0 * np.pi / len(phis)
             axa[kk].scatter(
                 R_axis[mask_a], Z_axis[mask_a],
                 s=30, c='white', marker='.',
-                zorder=6,                      # <<< above boundary points
-                label="axis" if kk == 0 else None,
+                zorder=6, label="axis" if kk == 0 else None,
             )
     # one legend
     handles, labels = axa[0].get_legend_handles_labels()
@@ -172,6 +170,13 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
 
     return fig
 
+def fix_matplotlib_3d(ax):
+    x_limits = ax.get_xlim3d(); y_limits = ax.get_ylim3d(); z_limits = ax.get_zlim3d()
+    x_range = abs(x_limits[1]-x_limits[0]); x_mid = np.mean(x_limits)
+    y_range = abs(y_limits[1]-y_limits[0]); y_mid = np.mean(y_limits)
+    z_range = abs(z_limits[1]-z_limits[0]); z_mid = np.mean(z_limits)
+    R = 0.5 * max([x_range, y_range, z_range])
+    ax.set_xlim3d([x_mid-R, x_mid+R]); ax.set_ylim3d([y_mid-R, y_mid+R]); ax.set_zlim3d([z_mid-R, z_mid+R])
 
 def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf):
     interp_psi = RegularGridInterpolator((xs, ys, zs), psi3,
@@ -202,6 +207,7 @@ def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf):
 
     fig.colorbar(sc_bnd, ax=ax, shrink=0.7, label=r"$\psi$")
     ax.legend(loc="best")
+    fix_matplotlib_3d(ax)
     plt.tight_layout()
 
     return fig
@@ -264,8 +270,7 @@ class Evaluators:
     a: jnp.ndarray
     a_hat: jnp.ndarray
 
-    def build(self) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray],
-                             Callable[[jnp.ndarray], jnp.ndarray]]:
+    def build(self):
         sc_c = jnp.asarray(self.center)
         sc_s = float(self.scale)
         Yn_c = jnp.asarray(self.Yn)
@@ -279,11 +284,6 @@ class Evaluators:
             axis=0
         ))
 
-        @jit
-        def phi_fn(X: jnp.ndarray) -> jnp.ndarray:
-            Xn = (X - sc_c) * sc_s
-            return vmap(S_single)(Xn)
-
         grad_mv = make_mv_grads(a_c, a_hatc, sc_c, sc_s)
 
         @jit
@@ -291,7 +291,7 @@ class Evaluators:
             Xn = (X - sc_c) * sc_s
             return grad_mv(X) + sc_s * vmap(dS_single)(Xn)
 
-        return phi_fn, grad_phi_fn
+        return grad_phi_fn
 
 ###############################################################################
 # Geometry: inside mask and bands
@@ -372,32 +372,44 @@ def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, 
 # Diffusion tensor
 ###############################################################################
 
-def diffusion_tensor(gradphi: np.ndarray, eps: float,
-                     delta: float = 5e-3) -> np.ndarray:
-    Npts = gradphi.shape[0]
+def diffusion_tensor(gradphi: np.ndarray,
+                     eps: float,
+                     delta: float = 0.0,
+                     b_floor: float = 1e-12) -> np.ndarray:
+    """
+    Build D = P_par + eps * P_perp + delta * I, with
+
+        P_par  = b ⊗ b,   b = gradφ / |gradφ|
+        P_perp = I - P_par
+
+    If |gradφ| is too small (below b_floor), we fall back to an isotropic tensor.
+
+    eps   : κ_perp / κ_par (anisotropy ratio)
+    delta : small extra isotropic diffusion (optional)
+    """
     I = np.eye(3)[None, :, :]
-    n = np.linalg.norm(gradphi, axis=-1, keepdims=True)
-    n0 = 5e-3 * np.nanmax(n) + 1e-30
-    s = np.clip(n / n0, 0.0, 1.0)
-    t = np.divide(gradphi, np.maximum(n, 1e-30), out=np.zeros_like(gradphi))
-    ax = np.abs(t[:, 0]) > 0.70710678
-    anchor = np.zeros_like(t)
-    anchor[~ax, 0] = 1.0
-    anchor[ax, 1] = 1.0
-    b1 = np.cross(t, anchor)
-    nb1 = np.linalg.norm(b1, axis=-1, keepdims=True)
-    ok = nb1[:, 0] > 1e-15
-    b1[ok] /= nb1[ok]
-    b1[~ok] = 0.0
-    b2 = np.cross(t, b1)
-    R = np.stack([t, b1, b2], axis=-1)  # shape (N,3,3)
-    Lam = np.zeros((1, 3, 3), dtype=float)
-    Lam[..., 0, 0] = 1.0
-    Lam[..., 1, 1] = eps
-    Lam[..., 2, 2] = eps
-    Daniso = R @ Lam @ np.swapaxes(R, -1, -2)
-    Diso = np.eye(3)[None, :, :]
-    D = (s[..., None] * Daniso) + ((1.0 - s[..., None]) * Diso) + delta * I
+    g = gradphi
+    n = np.linalg.norm(g, axis=-1, keepdims=True)
+
+    # where |gradφ| is large enough, define b = gradφ/|gradφ|
+    good = n[..., 0] > b_floor
+    b = np.zeros_like(g)
+    b[good] = g[good] / n[good]
+
+    # projectors
+    P_par = np.einsum("ni,nj->nij", b, b)     # b ⊗ b
+    P_perp = I - P_par
+
+    # anisotropic tensor
+    D = P_par + eps * P_perp
+
+    # optional isotropic floor
+    if delta != 0.0:
+        D = D + delta * I
+
+    # where |gradφ| is tiny, just use I (isotropic) to avoid singular projector
+    D[~good] = I[0]
+
     return D
 
 ###############################################################################
@@ -419,46 +431,34 @@ def make_linear_operator(
 
         A_pde[u] = -div( D ∇u )
 
-    on a uniform Cartesian grid, using a 27-point stencil implied by
-    face fluxes:
+    on a uniform Cartesian grid.
 
-        F_x = (Dxx ∂xψ + Dxy ∂yψ + Dxz ∂zψ) on x-faces,
-        F_y, F_z analogous.
-
-    We:
-      * restrict fluxes to faces where both neighbour cells are inside;
-      * compute cross derivatives with centred differences, only where the
-        necessary neighbours exist inside (otherwise cross-terms are dropped);
-      * apply the operator only on "deep interior" nodes (interior_core).
+    Changes vs the previous version:
+      * The PDE is enforced on **all nodes inside the torus** (inside==True),
+        not just a shrunken 'interior_core'.
+      * Fluxes across faces are computed wherever both cells are inside.
+      * Cross-terms are dropped only when the *specific* neighbours needed
+        for that derivative are outside, not all-or-nothing.
     """
     inside3 = inside.reshape(nx, ny, nz)
     D3 = Dfield.reshape(nx, ny, nz, 3, 3)
 
-    # Deep interior: not on bounding box, and inside
-    interior_core = np.ones((nx, ny, nz), dtype=bool)
-    interior_core[0, :, :] = False
-    interior_core[-1, :, :] = False
-    interior_core[:, 0, :] = False
-    interior_core[:, -1, :] = False
-    interior_core[:, :, 0] = False
-    interior_core[:, :, -1] = False
-    interior_core &= inside3
+    # Masks for cells in the physical domain (inside the torus)
+    domain_mask = inside3
 
-    deep_inside_mask = interior_core.ravel(order="C")
-
-    # Precompute face diffusion tensors and masks
+    # --- Face diffusion tensors and masks (same structure as before) ---
 
     # x-faces: between i and i+1, with i=0..nx-2, j=1..ny-2, k=1..nz-2
     D_x = 0.5 * (D3[1:, 1:-1, 1:-1, :, :] + D3[:-1, 1:-1, 1:-1, :, :])
-    mask_x = inside3[1:, 1:-1, 1:-1] & inside3[:-1, 1:-1, 1:-1]
+    mask_x = domain_mask[1:, 1:-1, 1:-1] & domain_mask[:-1, 1:-1, 1:-1]
 
     # y-faces: between j and j+1, i=1..nx-2, j=0..ny-2, k=1..nz-2
     D_y = 0.5 * (D3[1:-1, 1:, 1:-1, :, :] + D3[1:-1, :-1, 1:-1, :, :])
-    mask_y = inside3[1:-1, 1:, 1:-1] & inside3[1:-1, :-1, 1:-1]
+    mask_y = domain_mask[1:-1, 1:, 1:-1] & domain_mask[1:-1, :-1, 1:-1]
 
     # z-faces: between k and k+1, i=1..nx-2, j=1..ny-2, k=0..nz-2
     D_z = 0.5 * (D3[1:-1, 1:-1, 1:, :, :] + D3[1:-1, 1:-1, :-1, :, :])
-    mask_z = inside3[1:-1, 1:-1, 1:] & inside3[1:-1, 1:-1, :-1]
+    mask_z = domain_mask[1:-1, 1:-1, 1:] & domain_mask[1:-1, 1:-1, :-1]
 
     def matvec(u: np.ndarray) -> np.ndarray:
         u3 = u.reshape(nx, ny, nz)
@@ -468,6 +468,7 @@ def make_linear_operator(
         # central differences at x-faces
         dpsi_dx_xp = (u3[1:, 1:-1, 1:-1] - u3[:-1, 1:-1, 1:-1]) / dx
 
+        # cross derivatives: d/dy, d/dz at x-faces
         dpsi_dy_xp = (
             (u3[1:, 2:, 1:-1] - u3[1:, :-2, 1:-1]) +
             (u3[:-1, 2:, 1:-1] - u3[:-1, :-2, 1:-1])
@@ -478,18 +479,20 @@ def make_linear_operator(
             (u3[:-1, 1:-1, 2:] - u3[:-1, 1:-1, :-2])
         ) * (0.25 / dz)
 
-        # drop cross-terms where the needed neighbours are not all inside
-        # (simple, conservative choice)
-        valid_cross_x = (
-            mask_x &
-            inside3[1:, 2:, 1:-1] & inside3[1:, :-2, 1:-1] &
-            inside3[:-1, 2:, 1:-1] & inside3[:-1, :-2, 1:-1] &
-            inside3[1:, 1:-1, 2:] & inside3[1:, 1:-1, :-2] &
-            inside3[:-1, 1:-1, 2:] & inside3[:-1, 1:-1, :-2]
+        # Only drop cross-terms that genuinely lack neighbours.
+        # For d/dy at x-face we need 4 neighbours:
+        valid_dy_x = (
+            domain_mask[1:, 2:, 1:-1] & domain_mask[1:, :-2, 1:-1] &
+            domain_mask[:-1, 2:, 1:-1] & domain_mask[:-1, :-2, 1:-1]
+        )
+        # For d/dz at x-face we need 4 neighbours:
+        valid_dz_x = (
+            domain_mask[1:, 1:-1, 2:] & domain_mask[1:, 1:-1, :-2] &
+            domain_mask[:-1, 1:-1, 2:] & domain_mask[:-1, 1:-1, :-2]
         )
 
-        dpsi_dy_xp = np.where(valid_cross_x, dpsi_dy_xp, 0.0)
-        dpsi_dz_xp = np.where(valid_cross_x, dpsi_dz_xp, 0.0)
+        dpsi_dy_xp = np.where(valid_dy_x & mask_x, dpsi_dy_xp, 0.0)
+        dpsi_dz_xp = np.where(valid_dz_x & mask_x, dpsi_dz_xp, 0.0)
 
         qx_xp = (
             D_x[..., 0, 0] * dpsi_dx_xp +
@@ -514,16 +517,19 @@ def make_linear_operator(
             (u3[1:-1, :-1, 2:] - u3[1:-1, :-1, :-2])
         ) * (0.25 / dz)
 
-        valid_cross_y = (
-            mask_y &
-            inside3[2:, 1:, 1:-1] & inside3[:-2, 1:, 1:-1] &
-            inside3[2:, :-1, 1:-1] & inside3[:-2, :-1, 1:-1] &
-            inside3[1:-1, 1:, 2:] & inside3[1:-1, 1:, :-2] &
-            inside3[1:-1, :-1, 2:] & inside3[1:-1, :-1, :-2]
+        # For d/dx at y-face: need i±1 neighbours
+        valid_dx_y = (
+            domain_mask[2:, 1:, 1:-1] & domain_mask[:-2, 1:, 1:-1] &
+            domain_mask[2:, :-1, 1:-1] & domain_mask[:-2, :-1, 1:-1]
+        )
+        # For d/dz at y-face: need k±1 neighbours
+        valid_dz_y = (
+            domain_mask[1:-1, 1:, 2:] & domain_mask[1:-1, 1:, :-2] &
+            domain_mask[1:-1, :-1, 2:] & domain_mask[1:-1, :-1, :-2]
         )
 
-        dpsi_dx_yp = np.where(valid_cross_y, dpsi_dx_yp, 0.0)
-        dpsi_dz_yp = np.where(valid_cross_y, dpsi_dz_yp, 0.0)
+        dpsi_dx_yp = np.where(valid_dx_y & mask_y, dpsi_dx_yp, 0.0)
+        dpsi_dz_yp = np.where(valid_dz_y & mask_y, dpsi_dz_yp, 0.0)
 
         qy_yp = (
             D_y[..., 1, 0] * dpsi_dx_yp +
@@ -548,16 +554,19 @@ def make_linear_operator(
             (u3[1:-1, 2:, :-1] - u3[1:-1, :-2, :-1])
         ) * (0.25 / dy)
 
-        valid_cross_z = (
-            mask_z &
-            inside3[2:, 1:-1, 1:] & inside3[:-2, 1:-1, 1:] &
-            inside3[2:, 1:-1, :-1] & inside3[:-2, 1:-1, :-1] &
-            inside3[1:-1, 2:, 1:] & inside3[1:-1, :-2, 1:] &
-            inside3[1:-1, 2:, :-1] & inside3[1:-1, :-2, :-1]
+        # For d/dx at z-face: need i±1 neighbours
+        valid_dx_z = (
+            domain_mask[2:, 1:-1, 1:] & domain_mask[:-2, 1:-1, 1:] &
+            domain_mask[2:, 1:-1, :-1] & domain_mask[:-2, 1:-1, :-1]
+        )
+        # For d/dy at z-face: need j±1 neighbours
+        valid_dy_z = (
+            domain_mask[1:-1, 2:, 1:] & domain_mask[1:-1, :-2, 1:] &
+            domain_mask[1:-1, 2:, :-1] & domain_mask[1:-1, :-2, :-1]
         )
 
-        dpsi_dx_zp = np.where(valid_cross_z, dpsi_dx_zp, 0.0)
-        dpsi_dy_zp = np.where(valid_cross_z, dpsi_dy_zp, 0.0)
+        dpsi_dx_zp = np.where(valid_dx_z & mask_z, dpsi_dx_zp, 0.0)
+        dpsi_dy_zp = np.where(valid_dy_z & mask_z, dpsi_dy_zp, 0.0)
 
         qz_zp = (
             D_z[..., 2, 0] * dpsi_dx_zp +
@@ -569,14 +578,18 @@ def make_linear_operator(
         out3[1:-1, 1:-1, :-1] -= qz_zp / dz
         out3[1:-1, 1:-1, 1:]  += qz_zp / dz
 
-        # Only act on true PDE interior; zero elsewhere
-        out3[~interior_core] = 0.0
-        out3[~inside3] = 0.0
+        # Enforce PDE only in the physical domain (inside the torus).
+        # Outside nodes get zero operator (no equation).
+        out3[~domain_mask] = 0.0
 
         return out3.ravel(order="C")
 
     N = nx * ny * nz
     A = LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+
+    # Deep-inside mask for the solver: all nodes in the physical domain
+    deep_inside_mask = domain_mask.ravel(order="C")
+
     return A, deep_inside_mask
 
 ###############################################################################
@@ -584,10 +597,9 @@ def make_linear_operator(
 ###############################################################################
 
 def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float = 1.5,
-              axis_band_radius: float = 0.0, cg_tol: float = 1e-8, cg_maxit: int = 2000,
+              cg_tol: float = 1e-8, cg_maxit: int = 2000,
               verbose: bool = True, plot: bool = False, nfp: int = 2,
-              delta: float = 5e-3, no_amg: bool = False,
-              axis_seed_count: int = 0, save_figures: bool = True) -> Dict[str, Any]:
+              delta: float = 5e-3, save_figures: bool = True) -> Dict[str, Any]:
 
     data = np.load(npz_file, allow_pickle=True)
     center = data["center"]; scale = float(data["scale"])
@@ -596,14 +608,13 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     P = data["P"]; Nsurf = data["N"]
     kind = str(data["kind"])
     kind_str = kind.strip().lower()
-    kind_is_torus = (kind_str == "torus")
     if verbose:
         pinfo(f"Loaded checkpoint with {P.shape[0]} boundary points and {Yn.shape[0]} multipole sources (kind={kind_str}).")
 
     evals = Evaluators(center=jnp.asarray(center), scale=scale,
                        Yn=jnp.asarray(Yn), alpha=jnp.asarray(alpha),
                        a=jnp.asarray(a), a_hat=jnp.asarray(a_hat))
-    phi_fn, grad_phi = evals.build()
+    grad_phi = evals.build()
 
     mins = P.min(axis=0); maxs = P.max(axis=0); span = maxs - mins
     mins = mins - 0.01 * span; maxs = maxs + 0.01 * span
@@ -675,7 +686,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     evals = Evaluators(center=jnp.asarray(center), scale=scale,
                        Yn=jnp.asarray(Yn), alpha=jnp.asarray(alpha),
                        a=jnp.asarray(a_flipped), a_hat=jnp.asarray(a_hat))
-    phi_fn, grad_phi = evals.build()
+    grad_phi = evals.build()
 
     phi_tol = 0.2
     phiq = np.arctan2(Xq[:, 1], Xq[:, 0])
@@ -707,7 +718,8 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         BR = jnp.dot(B, eR)
         Bphi = jnp.dot(B, ephi)
         BZ = B[2]
-        Bphi = jnp.where(jnp.abs(Bphi) < 1e-12, jnp.sign(Bphi) * 1e-12, Bphi)
+        Bphi_floor = 1e-7 * jnp.linalg.norm(B) + 1e-14
+        Bphi = jnp.where(jnp.abs(Bphi) < Bphi_floor, jnp.sign(Bphi) * Bphi_floor, Bphi)
         return BR, Bphi, BZ
 
     @jit
@@ -738,8 +750,9 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         )
         pinfo(f"Axis points classified inside: {inside_axis.sum()} / {inside_axis.size}")
 
-    bbox_diag = float(np.linalg.norm(maxs - mins))
-    h_band_vox = max(1.5 * voxel, float(band_h) * voxel)
+    # bbox_diag = float(np.linalg.norm(maxs - mins))
+    # h_band_vox = max(1.5 * voxel, float(band_h) * voxel)
+    h_band_vox = float(band_h) * voxel
 
     # --- build axis band from nearest neighbours to axis ---
     inside_idx = np.where(inside_mask)[0]
@@ -752,9 +765,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     # How many grid nodes per axis point to pin?
     n_per_axis_pt = 1  # 1 is usually enough; you can try 2–3 if you want a fatter tube
 
-    nbrs_axis = NearestNeighbors(
-        n_neighbors=n_per_axis_pt, algorithm="kd_tree"
-    ).fit(X_inside)
+    nbrs_axis = NearestNeighbors(n_neighbors=n_per_axis_pt, algorithm="kd_tree").fit(X_inside)
     d_axis, idx_near = nbrs_axis.kneighbors(axis_pts)
 
     chosen = inside_idx[idx_near.ravel()]
@@ -765,10 +776,8 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     axis_band_radius_eff = float(d_axis.max())
 
     if verbose:
-        pinfo(
-            f"Axis band built from nearest neighbours: "
-            f"{axis_band.sum()} nodes, effective radius ≈ {axis_band_radius_eff:.3e}"
-        )
+        pinfo(f"Axis band built from nearest neighbours: "
+              f"{axis_band.sum()} nodes, effective radius ≈ {axis_band_radius_eff:.3e}")
 
     if not np.any(axis_band):
         if verbose:
@@ -950,9 +959,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                 fig1.savefig("fci_psi_diagnostics.png")
 
         try:
+            time0 = time.time()
             psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, mask_RZphi = build_psi_RZphi_volume(
-                psi3, xs, ys, zs, P, inside3, nR=128, nphi=512, nZ=128
-            )
+                psi3, xs, ys, zs, P, inside3, nR=128, nphi=256, nZ=128)
+            pinfo(f"Built ψ(R,Z,φ) volume in {(time.time() - time0):.2f} s.")
 
             Rb    = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
             phi_b = np.mod(np.arctan2(P[:, 1], P[:, 0]), 2*np.pi)
@@ -966,7 +976,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             jj_list = np.linspace(0, int((len(phis_cyl) - 1)/nfp), 4, dtype=int, endpoint=False)
             power = 2
             figRZ = plot_psi_maps_RZ_panels(
-                np.pow(psi_RZphi, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                jnp.pow(psi_RZphi, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
                 Rb=Rb, Zb=Zb, phi_b=phi_b,
                 R_axis=R_axis, Z_axis=Z_axis, phi_axis=phi_axis,
                 title=rf"$\psi(R,Z)^{power}$"
@@ -1027,10 +1037,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
 if __name__ == "__main__":
 
-    # default_solution = "wout_precise_QA_solution.npz"
+    default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    default_solution = "wout_SLAM_6_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
 
     nfp_default = 2
     if 'QH' in default_solution:
@@ -1041,23 +1051,19 @@ if __name__ == "__main__":
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
     parser.add_argument("--eps", type=float, default=1e-3, help="Perpendicular diffusion weight")
-    parser.add_argument("--delta", type=float, default=1e-2, help="Isotropic diffusion floor")
-    parser.add_argument("--band-h", type=float, default=0.5, help="Boundary band thickness multiplier")
-    parser.add_argument("--axis-band-radius", type=float, default=0.0, help="Axis band radius; 0=auto, <1=fraction of bbox, ≥1=absolute")
+    parser.add_argument("--delta", type=float, default=1e-4, help="Isotropic diffusion floor")
+    parser.add_argument("--band-h", type=float, default=2.0, help="Boundary band thickness multiplier")
     parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=2000, help="CG maximum iterations (default: 2000)")
     parser.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods (default: 2)")
-    parser.add_argument("--no-amg", action="store_true", help="(Ignored in this version; AMG removed.)")
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument("--save-figures", action="store_true", default=True, help="Save diagnostic figures to disk.")
     args = parser.parse_args()
 
     res = solve_fci(
         args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
-        axis_band_radius=args.axis_band_radius, cg_tol=args.cg_tol,
-        cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
-        nfp=args.nfp, delta=args.delta, no_amg=args.no_amg,
-        save_figures=args.save_figures
+        cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
+        nfp=args.nfp, delta=args.delta, save_figures=args.save_figures
     )
 
     psi_all = res['psi']
