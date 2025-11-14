@@ -150,10 +150,13 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
 
     return fig
 
-def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs):
+def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf):
     interp_psi = RegularGridInterpolator((xs, ys, zs), psi3,
                                          bounds_error=False, fill_value=np.nan)
-    psi_on_P = interp_psi(P)
+    # psi_on_P = interp_psi(P)
+    eps_n = 0.5 * voxel  # half a cell inwards
+    P_in = P - eps_n * Nsurf   # move into the domain
+    psi_on_P = interp_psi(P_in)  # now you’re sampling where ψ≈1 by construction
 
     fig = plt.figure(figsize=(7, 6))
     ax = fig.add_subplot(111, projection="3d")
@@ -707,13 +710,13 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     bbox_diag = float(np.linalg.norm(maxs - mins))
     if axis_band_radius == 0.0:
-        axis_band_radius_eff = 2.5 * voxel
+        axis_band_radius_eff = 1.0 * voxel
     elif axis_band_radius < 1.0:
-        axis_band_radius_eff = max(2.5 * voxel, axis_band_radius * bbox_diag)
+        axis_band_radius_eff = max(1.0 * voxel, axis_band_radius * bbox_diag)
     else:
-        axis_band_radius_eff = max(2.5 * voxel, float(axis_band_radius))
+        axis_band_radius_eff = max(1.0 * voxel, float(axis_band_radius))
 
-    h_band_vox = max(1.5 * voxel, float(band_h) * voxel)
+    h_band_vox = max(0.5 * voxel, float(band_h) * voxel)
 
     axis_band = axis_band_mask(axis_pts, Xq, axis_band_radius_eff) & inside_mask
 
@@ -723,7 +726,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
         nbrs_axis = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(axis_pts)
         d_axis, _ = nbrs_axis.kneighbors(Xq)
-        d_axis = d_axis[:, 0]
+        d_axis = d_axis[:, 0]  # true Euclidean distance to nearest axis point
 
         inside_idx = np.where(inside_mask)[0]
         if inside_idx.size == 0:
@@ -897,7 +900,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             psi3 = psi.reshape(nx, ny, nz)
             inside3 = inside_mask.reshape(nx, ny, nz)
             psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, mask_RZphi = build_psi_RZphi_volume(
-                psi3, xs, ys, zs, P, inside3, nR=128, nphi=64, nZ=128
+                psi3, xs, ys, zs, P, inside3, nR=128, nphi=512, nZ=128
             )
 
             Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
@@ -906,7 +909,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
             jj_list = np.linspace(0, len(phis_cyl) - 1, 4, dtype=int)
             figRZ = plot_psi_maps_RZ_panels(
-                np.sqrt(psi_RZphi), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list,
                 Rb=Rb, Zb=Zb, phi_b=phi_b, title="ψ(R,Z)"
             )
             figRZ.suptitle("ψ(R,Z) at selected toroidal angles")
@@ -918,7 +921,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
         try:
             psi3 = psi.reshape(nx, ny, nz)
-            fig3d = plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs)
+            fig3d = plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf)
             if save_figures:
                 fig3d.savefig("fci_psi_3d_axis_boundary.png")
         except Exception as e:
@@ -984,10 +987,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=56, help="Grid resolution per axis")
-    parser.add_argument("--eps", type=float, default=2e-2, help="Perpendicular diffusion weight")
-    parser.add_argument("--delta", type=float, default=5e-2, help="Isotropic diffusion floor")
-    parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
+    parser.add_argument("--N", type=int, default=128, help="Grid resolution per axis")
+    parser.add_argument("--eps", type=float, default=1e-4, help="Perpendicular diffusion weight")
+    parser.add_argument("--delta", type=float, default=1e-3, help="Isotropic diffusion floor")
+    parser.add_argument("--band-h", type=float, default=0.5, help="Boundary band thickness multiplier")
     parser.add_argument("--axis-band-radius", type=float, default=0.0, help="Axis band radius; 0=auto, <1=fraction of bbox, ≥1=absolute")
     parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=2000, help="CG maximum iterations (default: 2000)")
