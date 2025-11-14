@@ -575,97 +575,149 @@ def _face_T(D3: np.ndarray, dx: float, dy: float, dz: float) -> Tuple[np.ndarray
     return kx, ky, kz
 
 
-def make_linear_operator(nx: int, ny: int, nz: int, dx: float, dy: float, dz: float,
-                         inside: np.ndarray, Dfield: np.ndarray, fixed_mask: np.ndarray,
-                         fixed_val: np.ndarray) -> LinearOperator:
+def make_linear_operator(
+    nx: int,
+    ny: int,
+    nz: int,
+    dx: float,
+    dy: float,
+    dz: float,
+    inside: np.ndarray,
+    Dfield: np.ndarray,
+    fixed_mask: np.ndarray,
+    fixed_val: np.ndarray,
+):
     """
     Build a matrix–free LinearOperator for the anisotropic diffusion equation
 
         A[u] = -div( D ∇u )
 
-    using a full-tensor central-difference stencil in the interior:
+    using a conservative flux form on a uniform Cartesian grid.
 
-      - D is assumed slowly varying over one cell, so we discretise
-        -Σ_{p,q} D_{pq} ∂_p∂_q ψ with 2nd-order central differences.
-
-    Dirichlet rows are stamped as u - fixed_val where fixed_mask is True.
+    We:
+      * only use faces where **both** cells are inside the surface;
+      * apply the PDE stencil only on "deep interior" nodes (interior_core);
+      * impose Dirichlet rows u - fixed_val = 0 on fixed_mask nodes.
     """
     inside3 = inside.reshape(nx, ny, nz)
-    D3 = Dfield.reshape(nx, ny, nz, 3, 3)
-    fixed_mask = fixed_mask.astype(bool)
-    rows_fixed = np.where(fixed_mask)[0]
+    fixed3  = fixed_mask.reshape(nx, ny, nz)
+    D3      = Dfield.reshape(nx, ny, nz, 3, 3)
 
-    inv_dx2 = 1.0 / (dx * dx)
-    inv_dy2 = 1.0 / (dy * dy)
-    inv_dz2 = 1.0 / (dz * dz)
-    inv_4dxdy = 1.0 / (4.0 * dx * dy)
-    inv_4dxdz = 1.0 / (4.0 * dx * dz)
-    inv_4dydz = 1.0 / (4.0 * dy * dz)
+    # Deep interior: inside the surface, not Dirichlet, not on the outermost grid shell
+    interior_core = np.ones((nx, ny, nz), dtype=bool)
+    interior_core[0, :, :]   = False
+    interior_core[-1, :, :]  = False
+    interior_core[:, 0, :]   = False
+    interior_core[:, -1, :]  = False
+    interior_core[:, :, 0]   = False
+    interior_core[:, :, -1]  = False
+
+    interior_core &= inside3 & (~fixed3)
+
+    deep_inside_mask = interior_core.ravel(order="C")
+
+    # Face transmissibilities (already include 1/dx^2, 1/dy^2, 1/dz^2 factors)
+    Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
 
     def matvec(u: np.ndarray) -> np.ndarray:
         u3 = u.reshape(nx, ny, nz)
-
-        # Core region indices where centred differences are defined
-        uc = u3[1:-1, 1:-1, 1:-1]
-        Dc = D3[1:-1, 1:-1, 1:-1, :, :]
-        inside_core = inside3[1:-1, 1:-1, 1:-1]
-
-        # Extract tensor components at cell centres
-        Dxx = Dc[..., 0, 0]
-        Dyy = Dc[..., 1, 1]
-        Dzz = Dc[..., 2, 2]
-        Dxy = Dc[..., 0, 1]
-        Dxz = Dc[..., 0, 2]
-        Dyz = Dc[..., 1, 2]
-
-        # Second derivatives (diagonal terms)
-        d2psi_dx2 = (u3[2:, 1:-1, 1:-1] - 2.0 * uc + u3[:-2, 1:-1, 1:-1]) * inv_dx2
-        d2psi_dy2 = (u3[1:-1, 2:, 1:-1] - 2.0 * uc + u3[1:-1, :-2, 1:-1]) * inv_dy2
-        d2psi_dz2 = (u3[1:-1, 1:-1, 2:] - 2.0 * uc + u3[1:-1, 1:-1, :-2]) * inv_dz2
-
-        # Mixed derivatives (cross terms), standard 4-point central differences
-        d2psi_dxdy = (
-            u3[2:, 2:, 1:-1]   - u3[:-2, 2:, 1:-1]
-            - u3[2:, :-2, 1:-1] + u3[:-2, :-2, 1:-1]
-        ) * inv_4dxdy
-
-        d2psi_dxdz = (
-            u3[2:, 1:-1, 2:]   - u3[:-2, 1:-1, 2:]
-            - u3[2:, 1:-1, :-2] + u3[:-2, 1:-1, :-2]
-        ) * inv_4dxdz
-
-        d2psi_dydz = (
-            u3[1:-1, 2:, 2:]   - u3[1:-1, :-2, 2:]
-            - u3[1:-1, 2:, :-2] + u3[1:-1, :-2, :-2]
-        ) * inv_4dydz
-
-        # Full-tensor diffusion operator in the core
-        L_core = (
-            Dxx * d2psi_dx2 +
-            Dyy * d2psi_dy2 +
-            Dzz * d2psi_dz2 +
-            2.0 * Dxy * d2psi_dxdy +
-            2.0 * Dxz * d2psi_dxdz +
-            2.0 * Dyz * d2psi_dydz
-        )
-
-        # Only apply PDE inside the surface
-        L_core[~inside_core] = 0.0
-
-        # Assemble full array
         out3 = np.zeros_like(u3)
-        out3[1:-1, 1:-1, 1:-1] = -L_core  # minus sign from -div(D∇ψ)
+
+        # Only use faces where both neighbours are inside the plasma
+        mask_x = inside3[1:, :, :] & inside3[:-1, :, :]
+        mask_y = inside3[:, 1:, :] & inside3[:, :-1, :]
+        mask_z = inside3[:, :, 1:] & inside3[:, :, :-1]
+
+        # --- x-direction fluxes ---
+        # flux at face between i and i+1: F_x = Tx * (u[i+1] - u[i])
+        Fx_plus = Tx * mask_x * (u3[1:, :, :] - u3[:-1, :, :])
+
+        out3[:-1, :, :] -= Fx_plus
+        out3[1:,  :, :] += Fx_plus
+
+        # --- y-direction fluxes ---
+        Fy_plus = Ty * mask_y * (u3[:, 1:, :] - u3[:, :-1, :])
+
+        out3[:, :-1, :] -= Fy_plus
+        out3[:, 1:,  :] += Fy_plus
+
+        # --- z-direction fluxes ---
+        Fz_plus = Tz * mask_z * (u3[:, :, 1:] - u3[:, :, :-1])
+
+        out3[:, :, :-1] -= Fz_plus
+        out3[:, :, 1: ] += Fz_plus
+
+        # Zero out everything except true PDE interior
+        out3[~interior_core] = 0.0
         out3[~inside3] = 0.0
 
         out = out3.ravel(order="C")
 
-        # Dirichlet rows: overwrite with u - fixed_val
+        # Dirichlet rows: u - fixed_val = 0
+        rows_fixed = np.where(fixed_mask)[0]
         out[rows_fixed] = u[rows_fixed] - fixed_val[rows_fixed]
+
         return out
 
     N = nx * ny * nz
-    return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+    A = LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+    return A, deep_inside_mask
 
+
+# Compute RHS: for each face touching a Dirichlet neighbour,
+# add K * u_fixed to b_full
+def compute_rhs_full(
+    nx: int,
+    ny: int,
+    nz: int,
+    Tx: np.ndarray,
+    Ty: np.ndarray,
+    Tz: np.ndarray,
+    fixed_mask: np.ndarray,
+    fixed_val: np.ndarray,
+) -> np.ndarray:
+    """
+    Build the full RHS vector b_full for A_full u = b_full.
+
+    For each face, if one neighbour cell is Dirichlet with value u_fixed,
+    we add K * u_fixed to the RHS of the opposite cell, where K is the
+    transmissibility on that face.
+
+    Parameters
+    ----------
+    nx, ny, nz : int
+        Grid dimensions.
+    Tx, Ty, Tz :
+        Face transmissibilities in x, y, z directions with shapes
+        (nx-1, ny, nz), (nx, ny-1, nz), (nx, ny, nz-1).
+    fixed_mask : (N,) bool
+        Dirichlet nodes.
+    fixed_val : (N,) float
+        Dirichlet values on those nodes.
+
+    Returns
+    -------
+    b_full : (N,) float
+        Full RHS vector on the entire grid.
+    """
+    fixed3 = fixed_mask.reshape(nx, ny, nz)
+    val3   = fixed_val.reshape(nx, ny, nz)
+
+    b3 = np.zeros((nx, ny, nz), dtype=float)
+
+    # x-faces: between (i, j, k) and (i+1, j, k)
+    b3[:-1, :, :] += Tx * fixed3[1:, :, :] * val3[1:, :, :]
+    b3[1:,  :, :] += Tx * fixed3[:-1, :, :] * val3[:-1, :, :]
+
+    # y-faces: between (i, j, k) and (i, j+1, k)
+    b3[:, :-1, :] += Ty * fixed3[:, 1:, :] * val3[:, 1:, :]
+    b3[:, 1:,  :] += Ty * fixed3[:, :-1, :] * val3[:, :-1, :]
+
+    # z-faces: between (i, j, k) and (i, j, k+1)
+    b3[:, :, :-1] += Tz * fixed3[:, :, 1:] * val3[:, :, 1:]
+    b3[:, :,  1:] += Tz * fixed3[:, :, :-1] * val3[:, :, :-1]
+
+    return b3.ravel(order="C")
 
 
 ###############################################################################
@@ -929,7 +981,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     val = np.zeros(Ntot, dtype=float)
     fixed[band] = True; val[band] = 1.0
     fixed[axis_band] = True; val[axis_band] = 0.0
-    free = inside_mask & (~fixed)
 
     if verbose:
         print(f"[INFO] #inside nodes        : {inside_mask.sum()} / {Ntot}")
@@ -938,8 +989,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         print(f"[INFO] boundary band width  ≈ {h_band_vox:.3e}")
         print(f"[INFO] axis band radius     ≈ {axis_band_radius_eff:.3e}")
 
-    if not np.any(free):
-        raise RuntimeError("No free interior nodes; bands cover the entire domain.")
     # Evaluate ∇φ on the grid (chunked to save memory)
     if verbose:
         pinfo("Evaluating ∇φ on grid ...")
@@ -954,15 +1003,24 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         G[start:start + chunk] = Gi
     # Build diffusion tensor
     D = diffusion_tensor(G, eps=eps, delta=delta)
+
     # Build matrix–free operator
-    A_full = make_linear_operator(nx, ny, nz, dx, dy, dz, inside_mask, D, fixed, val)
-    # Compute RHS for fixed values
-    def compute_rhs_full() -> np.ndarray:
-        u_full = np.array(val, copy=True)
-        r_full = A_full @ u_full
-        return -r_full
-    b_full = compute_rhs_full()
+    A_full, deep_inside = make_linear_operator(
+        nx, ny, nz, dx, dy, dz,
+        inside_mask, D, fixed, val
+    )
+
+    # Free unknowns are "deep interior" AND not fixed
+    free = deep_inside & (~fixed)
+    if not np.any(free):
+        raise RuntimeError("No free deep-interior nodes; bands / geometry too tight.")
+
+    # Compute RHS for fixed values using the same face transmissibilities
+    D3 = D.reshape(nx, ny, nz, 3, 3)
+    Tx, Ty, Tz = _face_T(D3, dx, dy, dz)
+    b_full = compute_rhs_full(nx, ny, nz, Tx, Ty, Tz, fixed, val)
     b_free = b_full[free]
+
     # Construct restricted operator on free nodes
     def matvec_free(u_free: np.ndarray) -> np.ndarray:
         u_full = np.zeros_like(val)
@@ -1263,7 +1321,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                 help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=42, help="Grid resolution per axis")
+    parser.add_argument("--N", type=int, default=48, help="Grid resolution per axis")
     parser.add_argument("--eps", type=float, default=2e-2, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=5e-2, help="Isotropic diffusion floor")
     parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
