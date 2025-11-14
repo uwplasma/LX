@@ -120,6 +120,7 @@ def build_psi_RZphi_volume(psi3, xs, ys, zs, P, inside3,
 
 def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
                             Rb=None, Zb=None, phi_b=None,
+                            R_axis=None, Z_axis=None, phi_axis=None,
                             title="ψ(R,Z)"):
     fig, axa = plt.subplots(2, 2, figsize=(7, 7), constrained_layout=True)
     axa = axa.ravel()
@@ -128,52 +129,81 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
     extent = [Rmin, Rmax, Zmin, Zmax]
 
     for kk, jj in enumerate(jj_list):
-        psi_slice = psi_RZphi[:, jj, :].T  # shape (nZ, nR)
-        im = axa[kk].imshow(
-            psi_slice,
-            origin='lower',
-            aspect='equal',
-            extent=extent
-        )
-        axa[kk].contour(
-            Rs, Zs, psi_RZphi[:, jj, :].T,
-            levels=10, colors='white', linewidths=0.5, alpha=1.0
-        )
-        axa[kk].set_title(f"{title} @ φ≈{phis[jj]:+.2f}")
+        # psi_slice = psi_RZphi[:, jj, :].T  # shape (nZ, nR)
+        raw_slice = psi_RZphi[:, jj, :].T  # (nZ, nR)
+        psi_slice = np.ma.masked_invalid(raw_slice)
+        
+        im = axa[kk].imshow(psi_slice, origin='lower', aspect='equal', extent=extent)
+        
+        # make outside-domain transparent/white
+        im.cmap.set_bad("white", alpha=0.0)
+        
+        axa[kk].contour(Rs, Zs, psi_slice, levels=10, colors='white', linewidths=0.5, alpha=1.0)
+        axa[kk].set_title(f"{title}: φ≈{phis[jj]:+.2f}")
         axa[kk].set_xlabel("R"); axa[kk].set_ylabel("Z")
+        im.set_clim(0, 1)
         plt.colorbar(im, ax=axa[kk], shrink=0.85)
 
+        # boundary overlay (markers above contours/images)
         if Rb is not None and phi_b is not None and Zb is not None:
-            dphi = np.abs(np.angle(np.exp(1j*(phi_b - phis[jj]))))
-            mask = dphi < (np.pi / len(phis))
-            axa[kk].scatter(Rb[mask], Zb[mask], s=5, c='k', alpha=0.7)
+            dphi_b = np.abs(np.angle(np.exp(1j * (phi_b - phis[jj]))))
+            # mask_b = dphi_b < (np.pi / len(phis))
+            mask_b = dphi_b < 4.2 * 2.0 * np.pi / len(phis)
+            axa[kk].scatter(
+                Rb[mask_b], Zb[mask_b],
+                s=15, c='k', alpha=1.0,
+                zorder=5,                      # <<< ensure on top
+                label="boundary" if kk == 0 else None,
+            )
+
+        # magnetic axis overlay (markers above everything)
+        if R_axis is not None and phi_axis is not None and Z_axis is not None:
+            dphi_a = np.abs(np.angle(np.exp(1j * (phi_axis - phis[jj]))))
+            mask_a = dphi_a < 0.5 * 2.0 * np.pi / len(phis)
+            axa[kk].scatter(
+                R_axis[mask_a], Z_axis[mask_a],
+                s=30, c='white', marker='.',
+                zorder=6,                      # <<< above boundary points
+                label="axis" if kk == 0 else None,
+            )
+    # one legend
+    handles, labels = axa[0].get_legend_handles_labels()
+    if handles: fig.legend(handles, labels, loc="center", framealpha=0.7, facecolor='lightgray')
 
     return fig
+
 
 def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf):
     interp_psi = RegularGridInterpolator((xs, ys, zs), psi3,
                                          bounds_error=False, fill_value=np.nan)
-    # psi_on_P = interp_psi(P)
-    eps_n = 0.5 * voxel  # half a cell inwards
-    P_in = P - eps_n * Nsurf   # move into the domain
-    psi_on_P = interp_psi(P_in)  # now you’re sampling where ψ≈1 by construction
 
-    fig = plt.figure(figsize=(7, 6))
+    psi_on_P = interp_psi(P)
+    psi_axis = interp_psi(axis_pts)
+
+    fig = plt.figure(figsize=(8, 6))
     ax = fig.add_subplot(111, projection="3d")
 
-    sc = ax.scatter(
-        P[:, 0], P[:, 1], P[:, 2],
-        c=psi_on_P, s=5, alpha=0.8
-    )
-    ax.plot(
-        axis_pts[:, 0], axis_pts[:, 1], axis_pts[:, 2],
-        "k-", linewidth=2.0, label="Magnetic axis"
-    )
+    # Boundary coloured by ψ ~ 1
+    sc_bnd = ax.scatter(
+        P[:, 0], P[:, 1], P[:, 2],# c=psi_on_P,
+        s=0.3, alpha=0.7, edgecolor="b", label="boundary",)
 
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-    ax.set_title("Boundary vs magnetic axis (coloured by ψ)")
-    fig.colorbar(sc, ax=ax, shrink=0.7, label=r"$\psi$")
+    # Axis coloured by ψ ~ 0
+    sc_axis = ax.scatter(
+        axis_pts[:, 0], axis_pts[:, 1], axis_pts[:, 2],# c=psi_axis,
+        s=0.3, alpha=0.9, edgecolor="k", label="magnetic axis",)
+
+    sc_bnd.set_clim(0, 1)
+    sc_axis.set_clim(0, 1)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    # ax.set_title("Boundary vs magnetic axis (coloured by ψ)")
+
+    fig.colorbar(sc_bnd, ax=ax, shrink=0.7, label=r"$\psi$")
     ax.legend(loc="best")
+    plt.tight_layout()
+
     return fig
 
 ###############################################################################
@@ -709,16 +739,36 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         pinfo(f"Axis points classified inside: {inside_axis.sum()} / {inside_axis.size}")
 
     bbox_diag = float(np.linalg.norm(maxs - mins))
-    if axis_band_radius == 0.0:
-        axis_band_radius_eff = 1.0 * voxel
-    elif axis_band_radius < 1.0:
-        axis_band_radius_eff = max(1.0 * voxel, axis_band_radius * bbox_diag)
-    else:
-        axis_band_radius_eff = max(1.0 * voxel, float(axis_band_radius))
+    h_band_vox = max(1.5 * voxel, float(band_h) * voxel)
 
-    h_band_vox = max(0.5 * voxel, float(band_h) * voxel)
+    # --- build axis band from nearest neighbours to axis ---
+    inside_idx = np.where(inside_mask)[0]
+    if inside_idx.size == 0:
+        raise RuntimeError("Inside mask empty when building axis band.")
 
-    axis_band = axis_band_mask(axis_pts, Xq, axis_band_radius_eff) & inside_mask
+    # Work only with interior nodes for the KD-tree
+    X_inside = Xq[inside_idx]
+
+    # How many grid nodes per axis point to pin?
+    n_per_axis_pt = 1  # 1 is usually enough; you can try 2–3 if you want a fatter tube
+
+    nbrs_axis = NearestNeighbors(
+        n_neighbors=n_per_axis_pt, algorithm="kd_tree"
+    ).fit(X_inside)
+    d_axis, idx_near = nbrs_axis.kneighbors(axis_pts)
+
+    chosen = inside_idx[idx_near.ravel()]
+    chosen = np.unique(chosen)
+
+    axis_band = np.zeros_like(inside_mask, dtype=bool)
+    axis_band[chosen] = True
+    axis_band_radius_eff = float(d_axis.max())
+
+    if verbose:
+        pinfo(
+            f"Axis band built from nearest neighbours: "
+            f"{axis_band.sum()} nodes, effective radius ≈ {axis_band_radius_eff:.3e}"
+        )
 
     if not np.any(axis_band):
         if verbose:
@@ -874,6 +924,9 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             f"min={p[0]:.3e} p1={p[1]:.3e} p5={p[2]:.3e} "
             f"p50={p[4]:.3e} p95={p[6]:.3e} p99={p[7]:.3e} max={p[8]:.3e}"
         )
+    
+    psi3 = psi.reshape(nx, ny, nz)
+    inside3 = inside_mask.reshape(nx, ny, nz)
 
     if plot:
         if q_metric.size > 0:
@@ -897,22 +950,28 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                 fig1.savefig("fci_psi_diagnostics.png")
 
         try:
-            psi3 = psi.reshape(nx, ny, nz)
-            inside3 = inside_mask.reshape(nx, ny, nz)
             psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, mask_RZphi = build_psi_RZphi_volume(
                 psi3, xs, ys, zs, P, inside3, nR=128, nphi=512, nZ=128
             )
 
-            Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
+            Rb    = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
             phi_b = np.mod(np.arctan2(P[:, 1], P[:, 0]), 2*np.pi)
-            Zb = P[:, 2]
+            Zb    = P[:, 2]
 
-            jj_list = np.linspace(0, len(phis_cyl) - 1, 4, dtype=int)
+            # magnetic axis in cylindrical coords
+            R_axis   = np.sqrt(axis_pts[:, 0]**2 + axis_pts[:, 1]**2)
+            phi_axis = np.mod(np.arctan2(axis_pts[:, 1], axis_pts[:, 0]), 2*np.pi)
+            Z_axis   = axis_pts[:, 2]
+
+            jj_list = np.linspace(0, int((len(phis_cyl) - 1)/nfp), 4, dtype=int, endpoint=False)
+            power = 2
             figRZ = plot_psi_maps_RZ_panels(
-                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list,
-                Rb=Rb, Zb=Zb, phi_b=phi_b, title="ψ(R,Z)"
+                np.pow(psi_RZphi, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                Rb=Rb, Zb=Zb, phi_b=phi_b,
+                R_axis=R_axis, Z_axis=Z_axis, phi_axis=phi_axis,
+                title=rf"$\psi(R,Z)^{power}$"
             )
-            figRZ.suptitle("ψ(R,Z) at selected toroidal angles")
+            # figRZ.suptitle(rf"$\psi(R,Z)^{power}$ at selected toroidal angles")
             if save_figures:
                 figRZ.savefig("fci_psi_RZ_panels.png")
 
@@ -920,24 +979,31 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             pinfo(f"[WARN] Failed to build RZφ panels: {e}")
 
         try:
-            psi3 = psi.reshape(nx, ny, nz)
-            fig3d = plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf)
+            # X_bnd = P
+            # logical mask of boundary band in 3D indices
+            band3 = band.reshape(nx, ny, nz)
+            P_bnd_grid = np.column_stack(np.nonzero(band3))  # (i,j,k) indices
+            X_bnd = np.column_stack([xs[P_bnd_grid[:,0]],
+                                     ys[P_bnd_grid[:,1]],
+                                     zs[P_bnd_grid[:,2]]])
+            fig3d = plot_3d_axis_boundary_interp(X_bnd, axis_pts, psi3, xs, ys, zs, voxel, Nsurf)
             if save_figures:
                 fig3d.savefig("fci_psi_3d_axis_boundary.png")
         except Exception as e:
             pinfo(f"[WARN] Failed to plot 3D axis/boundary: {e}")
 
-        R = np.sqrt(Xq[:,0]**2 + Xq[:,1]**2)
-        R_axis_line = np.sqrt(axis_pts[:,0]**2 + axis_pts[:,1]**2).mean()
-        dist_to_axis = np.abs(R - R_axis_line)    # crude measure
-
         try:
-            mask_core = inside_mask & (~fixed)
+            nbrs_axis = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(axis_pts)
+            d_axis, _ = nbrs_axis.kneighbors(Xq)
+            dist_to_axis = d_axis[:, 0]   # true Euclidean distance to magnetic axis
+            # For diagnostics we want to see the axis band as well,
+            # so we exclude only the boundary band (ψ=1), not the axis band (ψ=0).
+            mask_diag = inside_mask & (~band)
             plt.figure()
-            plt.scatter(dist_to_axis[mask_core], psi[mask_core], s=2, alpha=0.3)
-            plt.xlabel("distance to axis (rough)")
+            plt.scatter(dist_to_axis[mask_diag], psi[mask_diag], s=2, alpha=0.3)
+            plt.xlabel("distance to axis")
             plt.ylabel("ψ")
-            plt.title("ψ vs distance to axis (inside free region)")
+            plt.title("ψ vs distance to axis (inside domain, excluding boundary band)")
             if save_figures:
                 plt.savefig("fci_psi_vs_distance_to_axis.png")
         except Exception as e:
@@ -947,25 +1013,11 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     result = {
         'psi': psi,
-        'grid': {
-            'xs': xs, 'ys': ys, 'zs': zs,
-            'mins': mins, 'maxs': maxs,
-        },
+        'grid': {'xs': xs, 'ys': ys, 'zs': zs,'mins': mins, 'maxs': maxs,},
         'inside': inside_mask,
-        'bands': {
-            'boundary': band,
-            'axis': axis_band,
-        },
-        'quality': {
-            'q_metric': q_metric,
-            'parallel_dot_grad': par_grad,
-            'residual': r_full,
-        },
-        'axis': {
-            'R': R_axis,
-            'Z': Z_axis,
-            'points': axis_pts,
-        },
+        'bands': {'boundary': band,'axis': axis_band,},
+        'quality': {'q_metric': q_metric,'parallel_dot_grad': par_grad,'residual': r_full,},
+        'axis': {'R': R_axis,'Z': Z_axis,'points': axis_pts,},
     }
     return result
 
@@ -975,10 +1027,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
 if __name__ == "__main__":
 
-    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    # default_solution = "wout_SLAM_6_coils_solution.npz"
+    default_solution = "wout_SLAM_6_coils_solution.npz"
 
     nfp_default = 2
     if 'QH' in default_solution:
@@ -987,9 +1039,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=128, help="Grid resolution per axis")
-    parser.add_argument("--eps", type=float, default=1e-4, help="Perpendicular diffusion weight")
-    parser.add_argument("--delta", type=float, default=1e-3, help="Isotropic diffusion floor")
+    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
+    parser.add_argument("--eps", type=float, default=1e-3, help="Perpendicular diffusion weight")
+    parser.add_argument("--delta", type=float, default=1e-2, help="Isotropic diffusion floor")
     parser.add_argument("--band-h", type=float, default=0.5, help="Boundary band thickness multiplier")
     parser.add_argument("--axis-band-radius", type=float, default=0.0, help="Axis band radius; 0=auto, <1=fraction of bbox, ≥1=absolute")
     parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")

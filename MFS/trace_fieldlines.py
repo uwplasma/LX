@@ -721,10 +721,10 @@ def main(mfs_npz: str,
 
 if __name__ == "__main__":
     ### Solutions available in the repo (uncomment one to use as default)
-    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    # default_solution = "wout_SLAM_6_coils_solution.npz"
+    default_solution = "wout_SLAM_6_coils_solution.npz"
 
     nfp_default = 2; tfinal_default = 1200.0; seeds_default = None; n_save_default = 10
     if 'QH' in default_solution: nfp_default = 4

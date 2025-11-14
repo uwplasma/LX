@@ -1279,11 +1279,11 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
 
     # Choose your policy:
     # 1) Most robust in practice: enforce on Γ₋ only
-    # constraints = [(c_int, -d_int)]
+    constraints = [(c_bdry, -d_bdry)]
     # 2) Enforce on both Γ and Γ₋ (two constraints):
     # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)]
     # 3) Enforce on Γ, Γ₋, and end-caps (four constraints):
-    constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints  # <-- NEW
+    # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints  # <-- NEW
 
     alpha = augmented_lagrangian_solve(
         A, W, g_raw, lam=lambda_reg_opt, constraints=constraints,
@@ -1358,10 +1358,11 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     )
 
 if __name__ == "__main__":
-    # default_normals = "wout_precise_QA"
-    # default_normals = "wout_precise_QH"
-    # file_name = "wout_SLAM_6_coils"
-    file_name = "wout_SLAM_4_coils"
+    # file_name = "wout_precise_QA"
+    # file_name = "wout_precise_QH"
+    file_name = "wout_SLAM_6_coils"
+    # file_name = "wout_SLAM_4_coils"
+    # file_name = "sflm_rm4"
     candidate_xyz, candidate_normals = get_candidates(file_name, subdir="inputs")
     ap = argparse.ArgumentParser()
     ap.add_argument("xyz", nargs="?", default=candidate_xyz,
