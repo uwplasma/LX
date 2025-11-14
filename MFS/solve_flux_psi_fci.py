@@ -150,10 +150,10 @@ def plot_psi_maps_RZ_panels(psi_RZphi, Rs, phis, Zs, jj_list,
 
     return fig
 
-def plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask):
-    nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(Xq)
-    _, idx = nbrs.kneighbors(P)
-    psi_on_P = psi[idx[:, 0]]
+def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs):
+    interp_psi = RegularGridInterpolator((xs, ys, zs), psi3,
+                                         bounds_error=False, fill_value=np.nan)
+    psi_on_P = interp_psi(P)
 
     fig = plt.figure(figsize=(7, 6))
     ax = fig.add_subplot(111, projection="3d")
@@ -167,14 +167,10 @@ def plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask):
         "k-", linewidth=2.0, label="Magnetic axis"
     )
 
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.set_title("Boundary vs magnetic axis (coloured by ψ)")
     fig.colorbar(sc, ax=ax, shrink=0.7, label=r"$\psi$")
-
     ax.legend(loc="best")
-
     return fig
 
 ###############################################################################
@@ -318,7 +314,7 @@ def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, 
     @jit
     def integrate_one_turn(RZ0: jnp.ndarray) -> jnp.ndarray:
         sol = dfx.diffeqsolve(term, solver, t0=t0, t1=t1, dt0=dt0, y0=RZ0,
-                              saveat=saveat_t1, max_steps=nsteps * 16,
+                              saveat=saveat_t1, max_steps=200_000,
                               stepsize_controller=stepsize_controller)
         return sol.ys[-1]
 
@@ -910,7 +906,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
             jj_list = np.linspace(0, len(phis_cyl) - 1, 4, dtype=int)
             figRZ = plot_psi_maps_RZ_panels(
-                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                np.sqrt(psi_RZphi), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
                 Rb=Rb, Zb=Zb, phi_b=phi_b, title="ψ(R,Z)"
             )
             figRZ.suptitle("ψ(R,Z) at selected toroidal angles")
@@ -921,11 +917,28 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             pinfo(f"[WARN] Failed to build RZφ panels: {e}")
 
         try:
-            fig3d = plot_3d_axis_boundary(P, axis_pts, psi, Xq, inside_mask)
+            psi3 = psi.reshape(nx, ny, nz)
+            fig3d = plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs)
             if save_figures:
                 fig3d.savefig("fci_psi_3d_axis_boundary.png")
         except Exception as e:
             pinfo(f"[WARN] Failed to plot 3D axis/boundary: {e}")
+
+        R = np.sqrt(Xq[:,0]**2 + Xq[:,1]**2)
+        R_axis_line = np.sqrt(axis_pts[:,0]**2 + axis_pts[:,1]**2).mean()
+        dist_to_axis = np.abs(R - R_axis_line)    # crude measure
+
+        try:
+            mask_core = inside_mask & (~fixed)
+            plt.figure()
+            plt.scatter(dist_to_axis[mask_core], psi[mask_core], s=2, alpha=0.3)
+            plt.xlabel("distance to axis (rough)")
+            plt.ylabel("ψ")
+            plt.title("ψ vs distance to axis (inside free region)")
+            if save_figures:
+                plt.savefig("fci_psi_vs_distance_to_axis.png")
+        except Exception as e:
+            pinfo(f"[WARN] Failed to plot ψ vs distance to axis: {e}")
 
         plt.show()
 
@@ -971,7 +984,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
+    parser.add_argument("--N", type=int, default=56, help="Grid resolution per axis")
     parser.add_argument("--eps", type=float, default=2e-2, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=5e-2, help="Isotropic diffusion floor")
     parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
