@@ -41,6 +41,14 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import animation
+plt.rcParams.update({
+    "font.size": 12,
+    "text.usetex": False,   # True if you have LaTeX installed
+    "axes.labelsize": 12,
+    "axes.titlesize": 14,
+    "legend.fontsize": 11,
+})
 
 # ---------------------------- Grid & spectral tools ---------------------------- #
 
@@ -142,41 +150,61 @@ def directional_derivative_vec(A, grad_Bx, grad_By, grad_Bz):
 
 def init_equilibrium(Nx, Ny, Nz, Lx, Ly, Lz):
     """
-    Define initial v(x,y,z) and B(x,y,z) in real space.
+    Harris-sheet-like slab tearing equilibrium in a periodic box.
 
-    Here:
-      - Background field B0 = (0, 0, B0)
-      - Small helical perturbation in B and v to seed dynamics
+    Equilibrium:
+      B_y(x) = B0 * tanh((x - Lx/2)/a)
+      B_z    = B_g (guide field)
+      B_x    = 0
 
-    You can replace this with:
-      - slab tearing equilibrium,
-      - local Miller geometry, etc.
+    Perturbation:
+      δA_z = eps_B * cos(k_y y) * cos(k_z z)
+      => δB_x = ∂δA_z/∂y = -eps_B * k_y * sin(k_y y) * cos(k_z z)
+         δB_y = -∂δA_z/∂x = 0
+         δB_z = 0
+
+    Initial velocity v = 0.
     """
     X, Y, Z = make_grid(Nx, Ny, Nz, Lx, Ly, Lz)
 
-    B0 = 1.0
+    # Equilibrium parameters
+    B0 = 1.0       # reversing field amplitude
+    a  = Lx / 16.0 # current sheet half-width
+    B_g = 0.2      # guide field
 
-    # Background uniform field along z
-    Bx0 = jnp.zeros_like(X)
-    By0 = jnp.zeros_like(X)
-    Bz0 = B0 * jnp.ones_like(X)
+    # Harris-sheet B_y(x)
+    sx = (X - 0.5 * Lx) / a
+    By0 = B0 * jnp.tanh(sx)
+    Bx0 = jnp.zeros_like(By0)
+    Bz0 = B_g * jnp.ones_like(By0)
 
-    # Add small helical perturbation
-    m, n = 1, 1
-    eps_B = 0.05
-    phase = m * Y / Ly * 2*jnp.pi + n * Z / Lz * 2*jnp.pi
-    Bx0 = Bx0 + eps_B * jnp.sin(phase)
-    By0 = By0 + eps_B * jnp.cos(phase)
+    # Tearing perturbation
+    m_y = 1
+    m_z = 0  # classical 2D tearing, no variation in z
+    k_y = 2.0 * jnp.pi * m_y / Ly
+    k_z = 2.0 * jnp.pi * m_z / Lz  # = 0
 
-    B0_real = jnp.stack([Bx0, By0, Bz0], axis=0)
+    eps_B = 0.01  # perturbation amplitude
+    phase_y = k_y * Y
+    phase_z = k_z * Z  # zero if m_z = 0
 
-    # Small incompressible-like velocity perturbation
-    eps_v = 0.05
-    vx0 = eps_v * jnp.cos(phase)
-    vy0 = eps_v * jnp.sin(phase)
-    vz0 = eps_v * jnp.cos(2*phase)
+    # δA_z and δB
+    # δA_z = eps_B * cos(k_y y) * cos(k_z z)
+    # δB_x = ∂δA_z/∂y = -eps_B * k_y * sin(k_y y) * cos(k_z z)
+    delta_Bx = -eps_B * k_y * jnp.sin(phase_y) * jnp.cos(phase_z)
+    delta_By = jnp.zeros_like(delta_Bx)
+    delta_Bz = jnp.zeros_like(delta_Bx)
 
-    v0_real = jnp.stack([vx0, vy0, vz0], axis=0)
+    Bx = Bx0 + delta_Bx
+    By = By0 + delta_By
+    Bz = Bz0 + delta_Bz
+
+    B0_real = jnp.stack([Bx, By, Bz], axis=0)
+
+    # Initial velocity: at rest (small numerical noise + Lorentz force
+    # will drive flows as tearing develops)
+    v0_real = jnp.zeros_like(B0_real)
+
     return v0_real, B0_real
 
 # --------------------------------- RHS builder -------------------------------- #
@@ -470,6 +498,55 @@ def main():
     plt.close(fig)
 
     print("[DONE] Diagnostics saved to mhd_energy_invariants.png")
+    
+    # --------------------------- Tearing-mode movie --------------------------- #
+
+    # Reconstruct B in real space on each saved frame
+    # and build a 2D movie of Bx(x,y) at mid-plane z = 0.
+    from matplotlib import animation
+
+    print("[MOVIE] Building tearing-mode Bx(x,y,z=0) movie ...")
+
+    mid_z = Nz // 2
+    Bx_slices = []
+
+    for i in range(len(ts_np)):
+        B_hat_i = B_hat_frames[i]              # (3, Nx, Ny, Nz)
+        B_i = np.fft.ifftn(np.array(B_hat_i), axes=(1, 2, 3)).real
+        Bx_slices.append(B_i[0, :, :, mid_z])  # Bx at z = const
+
+    Bx_slices = np.array(Bx_slices)           # (n_frames, Nx, Ny)
+    Bx_min = float(Bx_slices.min())
+    Bx_max = float(Bx_slices.max())
+
+    fig2, ax2 = plt.subplots(figsize=(5, 4), dpi=150)
+    im = ax2.imshow(
+        Bx_slices[0].T,
+        origin="lower",
+        extent=[0, Lx, 0, Ly],
+        vmin=Bx_min,
+        vmax=Bx_max,
+        aspect="equal",
+    )
+    ax2.set_xlabel("x")
+    ax2.set_ylabel("y")
+    ax2.set_title(r"$B_x(x,y,z=0)$")
+    cbar = fig2.colorbar(im, ax=ax2)
+    cbar.set_label(r"$B_x$")
+
+    def update_frame(i):
+        im.set_data(Bx_slices[i].T)
+        ax2.set_title(r"$B_x(x,y,z=0)$" + f", t={ts_np[i]:.3f}")
+        return (im,)
+
+    ani = animation.FuncAnimation(
+        fig2, update_frame, frames=len(ts_np), interval=100, blit=True
+    )
+    writer = animation.FFMpegWriter(fps=10, bitrate=2000)
+    ani.save("mhd_tearing_Bx_xy.mp4", writer=writer)
+    plt.close(fig2)
+    print("[MOVIE] Saved tearing movie to mhd_tearing_Bx_xy.mp4")
+
 
 if __name__ == "__main__":
     main()
