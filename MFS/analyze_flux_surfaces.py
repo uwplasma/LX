@@ -31,6 +31,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from fractions import Fraction
+import pyvista as pv
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -429,7 +430,6 @@ def build_psi_interpolant(psi_npz_path: str) -> Dict[str, Any]:
             Z = X[..., 2]
             pts = np.stack([R, phi_wrapped, Z], axis=-1)
             return interp(pts)
-
     else:
         xs = np.asarray(data["xs"])
         ys = np.asarray(data["ys"])
@@ -453,8 +453,352 @@ def build_psi_interpolant(psi_npz_path: str) -> Dict[str, Any]:
             X = np.asarray(X)
             return interp(X)
 
+    # Optional: magnetic axis information if present in the NPZ
+    for key in ["R_axis", "Z_axis", "axis_points"]:
+        if key in data.files:
+            info[key] = np.asarray(data[key])
+
     info["psi_eval"] = psi_eval
     return info
+
+def _set_axes_equal_3d(ax):
+    """Set 3D axes to equal scale (so spheres / tori aren't distorted)."""
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+
+    x_range = x_limits[1] - x_limits[0]
+    y_range = y_limits[1] - y_limits[0]
+    z_range = z_limits[1] - z_limits[0]
+    max_range = max(x_range, y_range, z_range)
+
+    x_mid = 0.5 * (x_limits[0] + x_limits[1])
+    y_mid = 0.5 * (y_limits[0] + y_limits[1])
+    z_mid = 0.5 * (z_limits[0] + z_limits[1])
+
+    ax.set_xlim3d([x_mid - max_range/2, x_mid + max_range/2])
+    ax.set_ylim3d([y_mid - max_range/2, y_mid + max_range/2])
+    ax.set_zlim3d([z_mid - max_range/2, z_mid + max_range/2])
+
+
+def plot_3d_flux_surfaces_and_fieldlines(
+    psi_info: Dict[str, Any],
+    grad_info: Dict[str, Any],
+    Y: np.ndarray,
+    psi_seed: np.ndarray,
+    n_surfaces: int = 1,
+    max_pts_per_surface: int = 6000,
+    phi_center: float = np.pi,
+    delta_phi_boundary: float = 0.8,
+    delta_phi_surface_max: float = 0.6,
+    delta_phi_fieldline: Optional[float] = None,
+):
+    """
+    3D visualization using PyVista:
+
+      * boundary (P from MFS checkpoint)
+      * one or several ψ≈const surfaces (isosurfaces from the cylindrical ψ grid)
+      * field lines (Y: (S,T,3))
+
+    Cutaway:
+      - We "open" the geometry by removing points whose cylindrical angle φ lies
+        within a window of width delta_phi around phi_center.
+      - The boundary uses delta_phi_boundary (largest opening).
+      - Each ψ-surface uses a smaller opening (delta_phi_surface_max decreasing
+        towards the core).
+      - Field lines are given the *same* opening as the ψ-surface whose ψ-level
+        is closest to their seed ψ (optionally scaled by delta_phi_fieldline).
+      - If axis_points are present in psi_info, the magnetic axis is shown.
+    """
+    import pyvista as pv
+
+    grid_type = psi_info["grid_type"]
+    if grid_type != "cylindrical":
+        print("[3D] ψ-grid is not cylindrical; skipping 3D isosurface plot.")
+        return
+
+    # ------------------------------------------------------------------ #
+    # Angle utilities
+    # ------------------------------------------------------------------ #
+
+    def angular_distance(phi: np.ndarray, center: float) -> np.ndarray:
+        """Signed minimal angular distance from 'center' on the circle."""
+        # Result in (-π, π]
+        return np.angle(np.exp(1j * (phi - center)))
+
+    def angular_mask(phi: np.ndarray, center: float, delta_phi: float) -> np.ndarray:
+        """
+        Keep points whose angle φ is OUTSIDE a window of width delta_phi
+        centered at 'center'.
+
+        If delta_phi <= 0, no cut is applied (all True).
+        """
+        if delta_phi is None or delta_phi <= 0.0:
+            return np.ones_like(phi, dtype=bool)
+        d = np.abs(angular_distance(phi, center))
+        return d > 0.5 * delta_phi
+
+    # ------------------------------------------------------------------ #
+    # Basic ψ info
+    # ------------------------------------------------------------------ #
+
+    psi3 = psi_info["psi3"]                     # shape (nR, nphi, nZ)
+    inside3 = psi_info["inside"].reshape(psi3.shape)
+    Rs = psi_info["Rs"]
+    phis_grid = psi_info["phis"]
+    Zs = psi_info["Zs"]
+
+    psi_inside = psi3[inside3 & np.isfinite(psi3)]
+    if psi_inside.size == 0:
+        print("[3D] No valid interior ψ values; skipping 3D view.")
+        return
+
+    psi_min = float(np.nanmin(psi_inside))
+    psi_max = float(np.nanmax(psi_inside))
+
+    margin = 0.05 * (psi_max - psi_min)
+    psi_lo = psi_min + margin
+    psi_hi = psi_max - margin
+
+    psi_seed_valid = psi_seed[np.isfinite(psi_seed)]
+    if psi_seed_valid.size > 0:
+        psi_seed_clip = np.clip(psi_seed_valid, psi_lo, psi_hi)
+    else:
+        psi_seed_clip = np.array([])
+
+    # ------------------------------------------------------------------ #
+    # Choose ψ levels for isosurfaces
+    # ------------------------------------------------------------------ #
+
+    if n_surfaces <= 0:
+        print("[3D] n_surfaces <= 0; nothing to show.")
+        return
+
+    if n_surfaces == 1:
+        # Single surface: choose one close to the boundary
+        psi_levels = np.array([psi_hi], dtype=float)
+    else:
+        if psi_seed_clip.size >= 2:
+            psi_levels = np.linspace(psi_seed_clip.min(), psi_seed_clip.max(), n_surfaces)
+        else:
+            psi_levels = np.linspace(psi_lo, psi_hi, n_surfaces)
+
+    print("[3D] ψ levels for isosurfaces:", psi_levels)
+
+    # ------------------------------------------------------------------ #
+    # Δφ per surface: from large (outer) to smaller (inner)
+    # ------------------------------------------------------------------ #
+
+    if n_surfaces == 1:
+        delta_phi_surfaces = np.array([delta_phi_surface_max], dtype=float)
+    else:
+        # Inner surface: smallest opening; outer surface: largest opening
+        delta_phi_surfaces = np.linspace(
+            0.3 * delta_phi_surface_max,  # inner
+            delta_phi_surface_max,        # outer
+            n_surfaces,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Build structured grid in (x,y,z) for ψ
+    # ------------------------------------------------------------------ #
+
+    R3, PHI3, Z3 = np.meshgrid(Rs, phis_grid, Zs, indexing="ij")  # (nR, nphi, nZ)
+    X3 = R3 * np.cos(PHI3)
+    Y3c = R3 * np.sin(PHI3)
+    Z3c = Z3
+
+    grid = pv.StructuredGrid(
+        X3.astype(np.float64),
+        Y3c.astype(np.float64),
+        Z3c.astype(np.float64),
+    )
+
+    psi_scalar = np.where(inside3 & np.isfinite(psi3), psi3, np.nan)
+    grid["psi"] = psi_scalar.ravel(order="F")
+
+    # ------------------------------------------------------------------ #
+    # Boundary from MFS (with a big opening)
+    # ------------------------------------------------------------------ #
+
+    P = grad_info["P"]  # (Nb, 3)
+    boundary = pv.PolyData(P.astype(np.float64))
+
+    phi_b = np.arctan2(P[:, 1], P[:, 0])
+    mask_b = angular_mask(phi_b, phi_center, delta_phi_boundary)
+    if np.any(mask_b):
+        boundary_cut = boundary.extract_points(np.where(mask_b)[0])
+    else:
+        print("[3D] Angular mask removed all boundary points; showing full boundary.")
+        boundary_cut = boundary
+
+    # ------------------------------------------------------------------ #
+    # PyVista plotter (larger window)
+    # ------------------------------------------------------------------ #
+
+    pl = pv.Plotter(window_size=(1400, 900))
+
+    # Boundary as semi-transparent blue-ish points
+    pl.add_mesh(
+        boundary_cut,
+        color="#51a0d8",
+        opacity=0.95,
+        point_size=6.0,
+        render_points_as_spheres=True,
+    )
+
+    # Color palette for surfaces
+    surface_colors = [
+        "#1f77b4",  # blue
+        "#ff7f0e",  # orange
+        "#2ca02c",  # green
+        "#d62728",  # red
+        "#9467bd",  # purple
+        "#8c564b",  # brown
+        "#e377c2",  # pink
+        "#7f7f7f",  # grey
+        "#bcbd22",  # yellow-green
+        "#17becf",  # teal
+    ]
+
+    # ------------------------------------------------------------------ #
+    # ψ≈const surfaces with angular cuts
+    # ------------------------------------------------------------------ #
+
+    for i, lev in enumerate(psi_levels):
+        try:
+            surf = grid.contour(isosurfaces=[float(lev)], scalars="psi")
+        except Exception as e:
+            print(f"[3D] contour failed at level {lev}: {e}")
+            continue
+
+        if surf.n_points == 0:
+            print(f"[3D] No points in isosurface at ψ={lev:.3e}")
+            continue
+
+        pts = np.asarray(surf.points)
+        phi_s = np.arctan2(pts[:, 1], pts[:, 0])
+        delta_phi_here = float(delta_phi_surfaces[i])
+
+        mask_s = angular_mask(phi_s, phi_center, delta_phi_here)
+        if np.any(mask_s):
+            surf = surf.extract_points(np.where(mask_s)[0])
+        else:
+            print(f"[3D] Angular mask removed all points for ψ={lev:.3e}; skipping.")
+            continue
+
+        if surf.n_points > max_pts_per_surface:
+            surf = surf.extract_points(
+                np.random.choice(surf.n_points, size=max_pts_per_surface, replace=False)
+            )
+
+        color = surface_colors[i % len(surface_colors)]
+        pl.add_mesh(
+            surf,
+            color=color,
+            opacity=0.7,
+            show_scalar_bar=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Magnetic axis (if present) – full, not cut
+    # ------------------------------------------------------------------ #
+
+    axis_pts = psi_info.get("axis_points", None)
+    if axis_pts is not None:
+        axis_pts = np.asarray(axis_pts)
+        if axis_pts.ndim == 2 and axis_pts.shape[1] == 3:
+            axis_line = pv.lines_from_points(axis_pts.astype(np.float64))
+            pl.add_mesh(axis_line, color="red", line_width=4.0)
+        else:
+            print("[3D] axis_points present but not of shape (N,3); skipping axis plot.")
+
+    # ------------------------------------------------------------------ #
+    # Field lines (black) with per-surface angular cuts
+    # ------------------------------------------------------------------ #
+
+    S, T, _ = Y.shape
+
+    # Map each field line to nearest ψ-level, then use that surface's Δφ
+    fieldline_delta_phi = np.zeros(S, dtype=float)
+    fieldline_has_surface = np.zeros(S, dtype=bool)
+
+    if psi_levels.size > 0:
+        psi_min_lvl = float(psi_levels.min())
+        psi_max_lvl = float(psi_levels.max())
+        # small tolerance in ψ-space, relative to span
+        tol_psi = 1e-3 * max(1.0, psi_max_lvl - psi_min_lvl)
+
+        for i in range(S):
+            psi_i = psi_seed[i] if i < len(psi_seed) else np.nan
+            if not np.isfinite(psi_i):
+                # NaN or outside ψ grid: no associated surface
+                continue
+
+            # Only keep lines whose seed ψ lies in the range spanned by
+            # the plotted surfaces. Lines near the boundary (ψ above psi_max_lvl)
+            # or outside the core (ψ below psi_min_lvl) are dropped.
+            if (psi_i < psi_min_lvl - tol_psi) or (psi_i > psi_max_lvl + tol_psi):
+                # This is typically a boundary-hugging field line → skip it
+                continue
+
+            j = int(np.argmin(np.abs(psi_i - psi_levels)))
+            j = max(0, min(j, n_surfaces - 1))
+            base = float(delta_phi_surfaces[j])
+
+            # If delta_phi_fieldline is provided, treat it as a multiplier
+            if delta_phi_fieldline is not None:
+                # Normalise by outermost opening so delta_phi_fieldline≈1 keeps base
+                scale = float(delta_phi_fieldline) / float(delta_phi_surface_max)
+                fieldline_delta_phi[i] = base * scale
+            else:
+                fieldline_delta_phi[i] = base
+
+            fieldline_has_surface[i] = True
+
+        n_valid = int(fieldline_has_surface.sum())
+        print(f"[3D] Field lines with ψ in surface range: {n_valid}/{S}")
+
+    for i in range(S):
+        # Skip lines that do not have a matching ψ-surface
+        if not fieldline_has_surface[i]:
+            continue
+
+        Yi = Y[i, :, :]
+        if not np.any(np.isfinite(Yi)):
+            continue
+
+        phi_line = np.arctan2(Yi[:, 1], Yi[:, 0])
+        delta_phi_line = float(fieldline_delta_phi[i])
+
+        # Safety: if somehow Δφ ended up non-positive, just skip
+        if delta_phi_line <= 0.0:
+            continue
+
+        mask_line = angular_mask(phi_line, phi_center, delta_phi_line)
+
+        if not np.any(mask_line):
+            continue
+
+        idx = np.where(mask_line)[0]
+
+        # Split into contiguous segments so we don't connect across the opening
+        splits = np.where(np.diff(idx) > 1)[0]
+        start = 0
+        segments = []
+        for s in splits:
+            segments.append(idx[start : s + 1])
+            start = s + 1
+        segments.append(idx[start:])
+
+        for seg in segments:
+            if seg.size < 2:
+                continue
+            pts_seg = Yi[seg, :]
+            line = pv.lines_from_points(pts_seg.astype(np.float64))
+            pl.add_mesh(line, color="black", line_width=0.7, opacity=0.4)
+
+    return pl
 
 # ---------------------------- Main analysis ---------------------------- #
 
@@ -562,7 +906,8 @@ def analyze(
     # ---------- Plot ψ(s) ----------
     base_label = Path(mfs_npz).with_suffix("").name
     fig1, ax1 = plt.subplots()
-    for i in range(S):
+    for ii in range(S):
+        i = S-ii-1  # plot in reverse order so lower seeds are on top
         psi_i = psi_lines[i, :]
         psi_mean = np.nanmean(psi_i)
         dpsi = psi_i - psi_mean
@@ -572,8 +917,9 @@ def analyze(
         ax1.plot(
             s_lines[i, :],
             dpsi_rel,
-            lw=0.8,
-            label=f"seed {i}" if i < 8 else None,
+            lw=0.5,
+            label=f"seed {i+1}" if i < 8 else None,
+            linestyle=".-",
         )
 
     ax1.set_xlabel(r"Field-line arclength $s$ [arb. units]")
@@ -604,17 +950,22 @@ def analyze(
     psi_min = float(np.nanmin(psi_inside))
     psi_max = float(np.nanmax(psi_inside))
 
-    # Use ψ at the seed positions as contour levels
-    psi_seed_for_levels = np.clip(psi_seed_valid, psi_min, psi_max)
+    # Keep contour levels away from the very inner/outer bands
+    level_margin = 0.02 * (psi_max - psi_min)
+    psi_lo = psi_min + level_margin
+    psi_hi = psi_max - level_margin
+
+    # Use ψ at the seed positions as contour levels, but clipped to [psi_lo, psi_hi]
+    psi_seed_for_levels = np.clip(psi_seed_valid, psi_lo, psi_hi)
     levs = np.unique(np.sort(psi_seed_for_levels))
 
     # Fallback in case something weird happens
     if levs.size < 2:
-        levs = np.linspace(psi_min, psi_max, max(4, nseed))
+        levs = np.linspace(psi_lo, psi_hi, max(4, nseed))
 
     print("[DEBUG] ψ contour levels for overlay (from seeds):", levs)
 
-    fig2, axs2 = plt.subplots(2, 2, figsize=(7.0, 7.0), constrained_layout=True)
+    fig2, axs2 = plt.subplots(2, 2, figsize=(8.0, 6.0), constrained_layout=True)
     axs2 = axs2.ravel()
 
     for k, phi0 in enumerate(np.asarray(phis)):
@@ -632,7 +983,17 @@ def analyze(
             psi_slice = psi3[:, jphi, :].T          # (nZ, nR)
             inside_slice = inside3[:, jphi, :].T    # (nZ, nR)
 
-            psi_plot = np.where(inside_slice, psi_slice, np.nan)
+            # Erode mask by one cell to stay away from the sharp boundary edge
+            mask_interior = inside_slice.copy()
+            # vertical neighbors
+            mask_interior[0, :]  &= inside_slice[1, :]
+            mask_interior[-1, :] &= inside_slice[-2, :]
+            # horizontal neighbors
+            mask_interior[:, 0]  &= inside_slice[:, 1]
+            mask_interior[:, -1] &= inside_slice[:, -2]
+
+            # Use a masked array so contours don't try to cross masked regions
+            psi_plot = np.ma.masked_where(~mask_interior, psi_slice)
 
             im = ax.imshow(
                 psi_plot,
@@ -640,8 +1001,11 @@ def analyze(
                 aspect="equal",
                 extent=[Rs.min(), Rs.max(), Zs.min(), Zs.max()],
             )
+
+            # Build explicit (R,Z) grid for contour — shape (nZ, nR)
+            RR, ZZ = np.meshgrid(Rs, Zs, indexing="xy")
             cs = ax.contour(
-                Rs, Zs, psi_plot,
+                RR, ZZ, psi_plot,
                 levels=levs,
                 colors="black",
                 linewidths=1.5,
@@ -696,8 +1060,8 @@ def analyze(
                     continue
                 ax.scatter(
                     Rk[mask_s], Zk[mask_s],
-                    s=0.5,
-                    alpha=0.9,
+                    s=0.4,
+                    alpha=1.0,
                     rasterized=True,
                     label=f"seed {sidx}" if (k == 0 and sidx < 4) else None,
                 )
@@ -715,6 +1079,40 @@ def analyze(
         out2 = f"{base_label}_psi_poincare_overlay.png"
         fig2.savefig(out2)
         print(f"[SAVE] Saved Poincaré + ψ-overlay figure to {out2}")
+        
+    # ---------- 3D visualization: boundary, ψ-surfaces, and field lines ----------
+    try:
+        pl = plot_3d_flux_surfaces_and_fieldlines(
+            psi_info=psi_info,
+            grad_info=grad_info,
+            Y=Y,
+            psi_seed=psi_seed,
+            n_surfaces=3,                # e.g., 3 nested ψ surfaces
+            phi_center=1.0,            # cut around φ = π, π+π
+            delta_phi_boundary=1.2,      # wider opening for boundary
+            delta_phi_surface_max=1.2,   # inner surfaces shrink to 0
+            delta_phi_fieldline=0.9,
+        )
+
+        # Make the object fill more of the window
+        pl.camera_position = "iso"   # nice 3D view; or "xy", "xz", "yz"
+        pl.camera.zoom(1.8)          # increase to fill more, decrease if too tight
+        # Render interactively but keep the window open
+        pl.show(auto_close=False)
+        pl.camera.zoom(1.1)          # tiny extra zoom now that the title is gone
+        # Take screenshot of the current view (tight framing, little white border)
+        pl.screenshot(f"{base_label}_3d_visualization.png")
+        pl.close()
+
+        print("[3D] Finished PyVista 3D visualization.")
+    except TypeError as e:
+        if "theme" in str(e) and "DataSetMapper" in str(e):
+            print("[3D] PyVista/VTK version mismatch: VTK is too old for this PyVista. "
+                "Please upgrade both: pip install --upgrade 'vtk>=9.2' 'pyvista>=0.43'")
+        else:
+            print(f"[3D] Failed to build 3D visualization (TypeError): {e}")
+    except Exception as e:
+        print(f"[3D] Failed to build 3D visualization: {e}")
 
     plt.show()
 
@@ -729,11 +1127,15 @@ if __name__ == "__main__":
     # default_solution = "wout_SLAM_6_coils_solution.npz"
     # default_solution = "knot_tube_solution.npz"
     
-    default_psi_npz = "wout_precise_QA_solution_psi_fci_cyl_N64_Nphi128.npz"
+    default_psi_npz = default_solution.replace(".npz", "_psi_fci_cyl_N64_Nphi128.npz")
 
-    nfp_default = 2
+    nfp_default = 2; tfinal_default = 2500.0; seeds_default = None; n_save_default = 12000
     if 'QH' in default_solution:
         nfp_default = 4
+        
+    if 'SLAM' in default_solution:
+        tfinal_default = 15000; n_save_default = 3000
+        seeds_default = "2.55:0:0,2.65:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
     
     parser = argparse.ArgumentParser(
         description="Probe FCI ψ along field lines and compare with Poincaré plots."
@@ -744,9 +1146,9 @@ if __name__ == "__main__":
                         help="ψ-solution NPZ created by solve_flux_psi_fci_cyl.py.")
     parser.add_argument("--nseed", type=int, default=6,
                         help="Number of field-line seeds (used if --seeds is not given).")
-    parser.add_argument("--tfinal", type=float, default=2500.0,
+    parser.add_argument("--tfinal", type=float, default=tfinal_default,
                         help="Final integration time for field lines.")
-    parser.add_argument("--n-save", type=int, default=12000,
+    parser.add_argument("--n-save", type=int, default=n_save_default,
                         help="Number of output samples per field line.")
     parser.add_argument("--normalize", action="store_true",
                         help="Normalize ∇φ when tracing (unit-speed field lines).")
@@ -756,7 +1158,7 @@ if __name__ == "__main__":
                         help="Number of Poincaré planes per field period.")
     parser.add_argument("--nfp", type=int, default=nfp_default,
                         help="Number of field periods.")
-    parser.add_argument("--seeds", type=str, default=None,
+    parser.add_argument("--seeds", type=str, default=seeds_default,
                         help="Comma-separated list of seed points as x:y:z,x:y:z,...")
     parser.add_argument("--no-save-figures", action="store_true",
                         help="Do not save figures, just show them.")

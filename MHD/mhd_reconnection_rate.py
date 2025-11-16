@@ -361,10 +361,6 @@ def parse_args():
                         help="Input .npz file produced by mhd_tearing_solve.py")
     p.add_argument("--prefix", type=str, default="",
                    help="Prefix for output plots/movies.")
-    # p.add_argument("--no-make-movie", dest="make_movie", action="store_false",
-    #                help="Do not build mp4 movies.")
-    # p.add_argument("--movie-fps", type=int, default=10,
-    #                help="Frames per second for the Ez movie.")
     
     return p.parse_args()
 
@@ -520,6 +516,42 @@ def main():
         fig.savefig(out_logE, bbox_inches="tight")
         plt.close(fig)
         print(f"[PLOT] Saved {out_logE}")
+        
+        # --- 3b) ln(RMS Bx) vs t with same γ_B and γ_FKR -------------------- #
+        logA = np.log(A_tearing_t + 1e-32)
+
+        fig2, axB = plt.subplots(figsize=(6.5, 4), dpi=200)
+        axB.plot(ts, logA, label=r"$\ln({\rm RMS}\,B_x)$")
+
+        # same fit window as used for γ_B
+        axB.axvspan(ts[i0], ts[i1], color="grey", alpha=0.2,
+                    label="fit window")
+
+        # line with slope γ_B anchored at (t[i0], logA[i0])
+        yA0 = logA[i0]
+        logA_fitB = yA0 + gamma_B * (ts - ts[i0])
+        axB.plot(ts, logA_fitB, "k--",
+                 label=rf"$\gamma_B \approx {gamma_B:.3e}$ (fit)")
+
+        # FKR prediction drawn with same anchor
+        if not np.isnan(gamma_FKR):
+            logA_FKR = yA0 + gamma_FKR * (ts - ts[i0])
+            axB.plot(ts, logA_FKR, "r:",
+                     label=rf"$\gamma_{{\rm FKR}} \approx {gamma_FKR:.3e}$")
+
+        axB.set_xlabel("t")
+        axB.set_ylabel(r"$\ln({\rm RMS}\,B_x)$")
+        axB.set_title(r"Tearing-mode growth from ${\rm RMS}\,B_x$")
+        axB.grid(True, alpha=0.3)
+        axB.legend(loc="best")
+
+        fig2.tight_layout()
+        out_logA = (prefix
+                    + f"tearing_logRMSBx_S{S:.2e}_B0{B0:.2f}.png")
+        fig2.savefig(out_logA, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"[PLOT] Saved {out_logA}")
+
 
         # --- 4) Movie of J_z with E_z contours ----------------------------- #
         movie_name = (prefix

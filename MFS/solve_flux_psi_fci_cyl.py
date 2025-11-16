@@ -9,13 +9,20 @@ We conceptually want an operator of the form
     ∇·[(P_par + ε P_perp) ∇ψ] = 0,
 where P_par = b b and P_perp = I - b b.
 
-In practice we implement this in two ways:
-    * use_fci=False: full tensor diffusion operator -∇·(D∇ψ) via a 27-point FV stencil.
+  * Uses JAX to evaluate φ and ∇φ.
+  * Uses Diffrax to find the magnetic axis.
+  * Offers two discretization modes:
 
-    * use_fci=True (default): FCI-style splitting
-        -κ_par ∂_s^2 ψ - κ_perp ∇^2 ψ = 0,
-    with ∂_s^2 built from field-line connectivity (no full-tensor D here).
-    
+    - use_fci=True (default):
+        Parallel diffusion via an FCI-style ∂_s^2 built from field-line
+        connectivity; perpendicular diffusion via a standard Laplacian:
+          • Cartesian: 7-point Laplacian in (x,y,z)
+          • Torus: cylindrical Laplacian in (R,φ,Z) with periodic φ.
+
+    - use_fci=False:
+        Full-tensor anisotropic operator -∇·(D ∇ψ) on a Cartesian grid,
+        with a 27-point finite-volume stencil that resolves cross-terms.
+
 The boundary Γ_bnd is a thin ribbon near the physical surface
 (the outer boundary of the domain) and Γ_axis is a thin tube around the
 magnetic axis.  This formulation follows the flux–coordinate independent
@@ -87,7 +94,7 @@ def build_psi_RZphi_volume(psi3, xs, ys, zs, P, inside3,
     Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
     Rs = np.linspace(Rb.min(), Rb.max(), nR)
     Zs = np.linspace(P[:, 2].min(), P[:, 2].max(), nZ)
-    phis = np.linspace(0.0, 2.0*np.pi, nphi, endpoint=False)
+    phis = np.linspace(0.0, 2.0*np.pi, nphi, endpoint=True)
 
     interp_psi = RegularGridInterpolator(
         (xs, ys, zs), psi3,
@@ -961,11 +968,13 @@ def make_fci_operator_jax(
 
     inside_flat = jnp.asarray(inside)
     core_flat_j = jnp.asarray(core_mask)
-    
-    # Only accept FCI parallel operator where:
-    # - connectivity was successfully built
-    # - node is inside AND in the core region
     valid_par = jnp.asarray(fci.valid) & inside_flat & core_flat_j
+
+    # Debug coverage (move to numpy to avoid jax inside print)
+    n_valid = int(np.array(jnp.sum(valid_par)))
+    n_inside = int(np.array(jnp.sum(inside_flat)))
+    print(f"[DEBUG] FCI coverage: valid={n_valid} / inside={n_inside} "
+          f"({100.0 * n_valid / max(1, n_inside):.1f} %)")
 
     inside3 = inside_flat.reshape(nx, ny, nz)
     
@@ -2118,7 +2127,7 @@ if __name__ == "__main__":
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
     parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
     parser.add_argument("--N_phi", type=int, default=128, help="Grid resolution in φ (only for cylindrical grids)")
-    parser.add_argument("--eps", type=float, default=5e-3, help="Perpendicular diffusion weight")
+    parser.add_argument("--eps", type=float, default=1e-5, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=0, help="Isotropic diffusion floor")
     parser.add_argument("--band-h", type=float, default=2.0, help="Boundary band thickness multiplier")
     parser.add_argument("--cg-tol", type=float, default=1e-12, help="CG tolerance (default: 1e-8)")
@@ -2127,8 +2136,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument("--no-save-figures", action="store_true", help="Do NOT save diagnostic figures to disk.")
     parser.add_argument("--no-fci", action="store_true", help="Disable FCI and use tensor Laplacian only.")
-    parser.add_argument("--fci-nsteps", type=int, default=32, help="Number of RK2 steps per FCI Δφ trace.")
-    parser.add_argument("--fci-planes-per-field-period", type=int, default=8, help="Number of FCI planes per field period")
+    parser.add_argument("--fci-nsteps", type=int, default=26, help="Number of RK2 steps per FCI Δφ trace.")
+    parser.add_argument("--fci-planes-per-field-period", type=int, default=4, help="Number of FCI planes per field period")
     parser.add_argument("--psi-power-for-plot", type=int, default=1, help="Power of psi when plotting RZ panels")
     args = parser.parse_args()
     
