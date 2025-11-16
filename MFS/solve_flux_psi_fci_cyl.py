@@ -10,15 +10,11 @@ We conceptually want an operator of the form
 where P_par = b b and P_perp = I - b b.
 
 In practice we implement this in two ways:
-  * use_fci=False: a full tensor operator -∇·(D∇ψ) with
-      D = P_par + ε P_perp (+ δI),
-    discretised by a 27-point FV stencil (see make_linear_operator_jax).
+    * use_fci=False: full tensor diffusion operator -∇·(D∇ψ) via a 27-point FV stencil.
 
-  * use_fci=True (default): FCI-like splitting
-      -κ_par ∂_s^2 ψ - κ_perp ∇^2 ψ = 0
-    with ∂_s^2 along field-lines computed by field-line tracing and
-    κ_par=1, κ_perp=ε. This is an FCI-style anisotropic diffusion
-    rather than an exact tensor D(x).
+    * use_fci=True (default): FCI-style splitting
+        -κ_par ∂_s^2 ψ - κ_perp ∇^2 ψ = 0,
+    with ∂_s^2 built from field-line connectivity (no full-tensor D here).
     
 The boundary Γ_bnd is a thin ribbon near the physical surface
 (the outer boundary of the domain) and Γ_axis is a thin tube around the
@@ -694,6 +690,191 @@ def build_fci_connectivity_chunked(
         valid=valid,
     )
 
+def build_fci_connectivity_cylindrical(
+    Rs,
+    phis,
+    Zs,
+    inside_mask: np.ndarray,
+    grad_phi_fn,
+    nfp: int,
+    dphi_per_step: float = None,
+    nsteps: int = 32,
+    verbose: bool = True,
+    chunk_size: int | None = None,
+    fci_planes_per_field_period: int = 16,
+) -> FCIConnectivity:
+    """
+    FCI connectivity builder on a cylindrical grid (R, φ, Z).
+
+    Rs    : 1D array, size nR
+    phis  : 1D array, size nphi (assumed 0..2π-periodic)
+    Zs    : 1D array, size nZ
+    inside_mask : length N=nR*nphi*nZ, True for interior nodes
+
+    Produces the same FCIConnectivity structure, but interpolation is done
+    in cylindrical coordinates (R,φ,Z). Field-line tracing is done in
+    physical space using grad_phi_fn, as before.
+    """
+    nR, nphi, nZ = len(Rs), len(phis), len(Zs)
+    N = nR * nphi * nZ
+    assert inside_mask.shape[0] == N
+
+    # choose Δφ for mapping between FCI planes if not provided
+    if dphi_per_step is None:
+        N_par = fci_planes_per_field_period  # planes per field period
+        dphi_per_step = 2.0 * np.pi / (nfp * N_par)
+
+    # allocate outputs
+    idx_plus  = np.zeros((N, 8), dtype=np.int64)
+    idx_minus = np.zeros((N, 8), dtype=np.int64)
+    w_plus    = np.zeros((N, 8), dtype=float)
+    w_minus   = np.zeros((N, 8), dtype=float)
+    L_plus    = np.zeros(N, dtype=float)
+    L_minus   = np.zeros(N, dtype=float)
+    valid     = np.zeros(N, dtype=bool)
+
+    # Build (R,φ,Z) arrays and flatten them
+    RR, PHI, ZZ = np.meshgrid(Rs, phis, Zs, indexing="ij")  # (nR,nphi,nZ)
+    R_flat   = RR.ravel(order="C")
+    phi_flat = PHI.ravel(order="C")
+    Z_flat   = ZZ.ravel(order="C")
+
+    inside_indices = np.where(inside_mask)[0]
+    n_inside_total = int(inside_indices.size)
+    if n_inside_total == 0:
+        raise RuntimeError("No interior nodes in build_fci_connectivity_cylindrical.")
+
+    start_time = time.time()
+    last_print = start_time
+    n_inside_processed = 0
+
+    # automatic chunk_size selection
+    if chunk_size is None:
+        n_devices = max(1, len(jax.devices()))
+        target_chunks_per_device = 8
+        est_chunk = n_inside_total // (n_devices * target_chunks_per_device + 1)
+        chunk_size = int(np.clip(est_chunk, 128, 4096))
+        if verbose:
+            pinfo(f"[FCI-cyl] Auto chunk_size={chunk_size} "
+                  f"(N_inside={n_inside_total}, n_devices={n_devices})")
+
+    @jax.jit
+    def _grad_phi_batched(X_batch):
+        return grad_phi_fn(X_batch)
+
+    # total φ-period for wrapping
+    phi_min, phi_max = phis[0], phis[-1]
+    phi_period = phi_max - phi_min + (phis[1] - phis[0])  # ~2π, robust to endpoint
+
+    for chunk_start in range(0, n_inside_total, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n_inside_total)
+        idx_chunk = inside_indices[chunk_start:chunk_end]
+        Nc = idx_chunk.size
+
+        R0  = R_flat[idx_chunk]
+        phi0 = phi_flat[idx_chunk]
+        Z0  = Z_flat[idx_chunk]
+
+        # Skip near-axis nodes (R very small) to avoid cylindrical singularity
+        mask_R_ok = R0 > 1e-5
+
+        # Physical coordinates for grad_phi sanity check
+        x0 = R0 * np.cos(phi0)
+        y0 = R0 * np.sin(phi0)
+        z0 = Z0
+        X_chunk = np.column_stack([x0, y0, z0])
+
+        X_chunk_j = jnp.asarray(X_chunk, dtype=jnp.float64)
+        B_chunk = np.asarray(_grad_phi_batched(X_chunk_j))   # (Nc, 3)
+        mask_finite = np.isfinite(B_chunk).all(axis=1)
+
+        mask_ok = mask_R_ok & mask_finite
+        if not np.any(mask_ok):
+            n_inside_processed += Nc
+            if verbose:
+                now = time.time()
+                dt  = now - last_print
+                total_dt = now - start_time
+                print(
+                    f"[FCI-cyl] inside nodes {n_inside_processed}/{n_inside_total} "
+                    f"({100.0*n_inside_processed/max(1,n_inside_total):.1f}%) "
+                    f"valid={int(valid.sum())} elapsed={total_dt:.1f}s (+{dt:.1f}s) [all skipped in chunk]"
+                )
+                last_print = now
+            continue
+
+        idx_chunk_ok = idx_chunk[mask_ok]
+        R0_ok  = R0[mask_ok]
+        Z0_ok  = Z0[mask_ok]
+        phi0_ok = phi0[mask_ok]
+
+        seeds_RZphi = np.stack([R0_ok, Z0_ok, phi0_ok], axis=1)
+
+        # forward & backward batched traces (returns numpy arrays)
+        fwd = trace_many_to_delta_phi(grad_phi_fn, seeds_RZphi,
+                                      +dphi_per_step, nsteps=nsteps)
+        bwd = trace_many_to_delta_phi(grad_phi_fn, seeds_RZphi,
+                                      -dphi_per_step, nsteps=nsteps)
+        Rf, Zf, phif, Lf = fwd.T
+        Rb, Zb, phib, Lb = bwd.T
+
+        # wrap φ into the grid interval (assume uniform 0..2π)
+        def wrap_phi(phi_arr):
+            phi_wrapped = (phi_arr - phi_min) % phi_period + phi_min
+            return phi_wrapped
+
+        phif = wrap_phi(phif)
+        phib = wrap_phi(phib)
+
+        # For each successful node in this chunk, compute trilinear weights
+        for local_idx, p in enumerate(idx_chunk_ok):
+            if (not np.isfinite(Lf[local_idx])) or (not np.isfinite(Lb[local_idx])):
+                continue
+
+            # interpolation in cylindrical coordinates (R,φ,Z)
+            idxp, wp = trilinear_weights(Rs, phis, Zs,
+                                         (Rf[local_idx], phif[local_idx], Zf[local_idx]))
+            idxm, wm = trilinear_weights(Rs, phis, Zs,
+                                         (Rb[local_idx], phib[local_idx], Zb[local_idx]))
+
+            if not (inside_mask[idxp].any() and inside_mask[idxm].any()):
+                continue
+
+            idx_plus[p, :]  = idxp
+            w_plus[p, :]    = wp
+            L_plus[p]       = max(float(Lf[local_idx]), 1e-8)
+
+            idx_minus[p, :] = idxm
+            w_minus[p, :]   = wm
+            L_minus[p]      = max(float(Lb[local_idx]), 1e-8)
+
+            valid[p] = True
+
+        n_inside_processed += Nc
+        if verbose:
+            now = time.time()
+            dt  = now - last_print
+            total_dt = now - start_time
+            print(
+                f"[FCI-cyl] inside nodes {n_inside_processed}/{n_inside_total} "
+                f"({100.0*n_inside_processed/max(1,n_inside_total):.1f}%) "
+                f"valid={int(valid.sum())} elapsed={total_dt:.1f}s (+{dt:.1f}s)"
+            )
+            last_print = now
+
+    if verbose:
+        print(
+            f"[FCI-cyl] Connectivity build finished: "
+            f"valid nodes={valid.sum()} / {inside_mask.sum()}, "
+            f"total time={time.time() - start_time:.1f}s"
+        )
+
+    return FCIConnectivity(
+        idx_plus=idx_plus, w_plus=w_plus, L_plus=L_plus,
+        idx_minus=idx_minus, w_minus=w_minus, L_minus=L_minus,
+        valid=valid,
+    )
+
 def _find_cell_indices(coord, grid):
     """
     Given a coordinate array coord (scalar) and a 1D grid array grid (monotone),
@@ -824,6 +1005,119 @@ def make_fci_operator_jax(
     deep_inside_mask = np.asarray(inside3.ravel(order="C"))
     return A_pde_jax, deep_inside_mask
 
+def make_fci_operator_cylindrical(
+    nR: int,
+    nphi: int,
+    nZ: int,
+    Rs: np.ndarray,
+    phis: np.ndarray,
+    Zs: np.ndarray,
+    inside: np.ndarray,
+    fci: FCIConnectivity,
+    core_mask: np.ndarray,
+    kappa_par: float,
+    kappa_perp: float,
+):
+    """
+    FCI operator on a cylindrical grid (R, φ, Z):
+
+        -kappa_par ∂_s^2 ψ  -  kappa_perp ∇^2ψ = 0
+
+    where ∂_s^2 is the field-aligned second derivative represented via FCI
+    connectivity, and ∇^2 is the *physical* isotropic Laplacian in
+    cylindrical coordinates:
+
+        ∇²ψ = (1/R)∂_R(R ∂_R ψ) + (1/R²)∂²_φ ψ + ∂²_Z ψ.
+
+    The FCI part only acts in the "core" region; the perpendicular Laplacian
+    acts in the whole inside region, masked by `inside`.
+    """
+    idx_plus  = jnp.asarray(fci.idx_plus)
+    idx_minus = jnp.asarray(fci.idx_minus)
+    w_plus    = jnp.asarray(fci.w_plus)
+    w_minus   = jnp.asarray(fci.w_minus)
+    L_plus    = jnp.asarray(fci.L_plus)
+    L_minus   = jnp.asarray(fci.L_minus)
+
+    inside_flat = jnp.asarray(inside)
+    core_flat_j = jnp.asarray(core_mask)
+
+    valid_par = jnp.asarray(fci.valid) & inside_flat & core_flat_j
+
+    inside3 = inside_flat.reshape(nR, nphi, nZ)
+
+    # 1D grids and spacings
+    Rs_j   = jnp.asarray(Rs)
+    phis_j = jnp.asarray(phis)
+    Zs_j   = jnp.asarray(Zs)
+
+    dR   = float(Rs[1]   - Rs[0])   if nR   > 1 else 1.0
+    dphi = float(phis[1] - phis[0]) if nphi > 1 else 1.0
+    dZ   = float(Zs[1]   - Zs[0])   if nZ   > 1 else 1.0
+
+    # R array to use inside interior region (broadcast)
+    R3 = jnp.broadcast_to(Rs_j[:, None, None], (nR, nphi, nZ))
+
+    @jax.jit
+    def A_pde_jax(u_flat: jnp.ndarray) -> jnp.ndarray:
+        u = u_flat
+
+        # ---------------- Field-aligned second derivative --------------
+        u_p = jnp.sum(w_plus * u[idx_plus], axis=1)
+        u_m = jnp.sum(w_minus * u[idx_minus], axis=1)
+        u0  = u
+
+        Lp_safe = jnp.where(L_plus  > 0.0, L_plus,  1e-8)
+        Lm_safe = jnp.where(L_minus > 0.0, L_minus, 1e-8)
+        Ltot    = Lp_safe + Lm_safe
+
+        dpar = 2.0 * ((u_p - u0) / Lp_safe + (u_m - u0) / Lm_safe) / Ltot
+        dpar = jnp.where(valid_par, dpar, 0.0)
+
+        out = -kappa_par * dpar
+
+        # ---------------- Cylindrical Laplacian ∇²ψ (PERIODIC in φ) -------------------
+        u3 = u_flat.reshape((nR, nphi, nZ))
+        lap3 = jnp.zeros_like(u3)
+
+        # R-term: interior in R,Z, all φ
+        uR_plus  = u3[2:,   :, 1:-1]
+        uR_0     = u3[1:-1, :, 1:-1]
+        uR_minus = u3[:-2,  :, 1:-1]
+        R_mid    = R3[1:-1, :, 1:-1]
+
+        d2u_dR2 = (uR_plus - 2.0 * uR_0 + uR_minus) / (dR * dR)
+        du_dR   = (uR_plus - uR_minus) / (2.0 * dR)
+        lap_R   = d2u_dR2 + du_dR / jnp.maximum(R_mid, 1e-8)
+
+        # φ-term: periodic on full φ range
+        u_phi = u3[1:-1, :, 1:-1]                      # (nR-2, nphi, nZ-2)
+        u_phi_plus  = jnp.roll(u_phi, -1, axis=1)
+        u_phi_minus = jnp.roll(u_phi, +1, axis=1)
+        d2u_dphi2   = (u_phi_plus - 2.0 * u_phi + u_phi_minus) / (dphi * dphi)
+
+        R_mid_phi = R3[1:-1, :, 1:-1]
+        lap_phi   = d2u_dphi2 / jnp.maximum(R_mid_phi * R_mid_phi, 1e-12)
+
+        # Z-term: interior in R,Z, all φ
+        uZ_plus  = u3[1:-1, :, 2:]
+        uZ_0     = u3[1:-1, :, 1:-1]
+        uZ_minus = u3[1:-1, :, :-2]
+        d2u_dZ2  = (uZ_plus - 2.0 * uZ_0 + uZ_minus) / (dZ * dZ)
+
+        total_lap = lap_R + lap_phi + d2u_dZ2
+
+        # write back on i=1..nR-2, all j, k=1..nZ-2
+        lap3 = lap3.at[1:-1, :, 1:-1].set(total_lap)
+
+        # zero outside inside-mask
+        lap3 = jnp.where(inside3, lap3, 0.0)
+
+        out -= kappa_perp * lap3.ravel(order="C")
+        return out
+
+    deep_inside_mask = np.asarray(inside3.ravel(order="C"))
+    return A_pde_jax, deep_inside_mask
 
 def make_linear_operator_jax(
     nx: int,
@@ -977,15 +1271,7 @@ def make_linear_operator_jax(
     deep_inside_mask = np.asarray(domain_mask.ravel(order="C"))
     return A_pde_jax, deep_inside_mask
 
-def cg_jax(
-    matvec, b, x0=None, tol=1e-8, maxiter=1000
-):
-    """
-    Simple JAX CG: solves A x = b given matvec(x) = A x.
-    matvec: callable taking (x) -> A x  (JAX)
-    b:      jnp.ndarray
-    x0:     optional initial guess (same shape as b)
-    """
+def cg_jax(matvec, b, x0=None, tol=1e-8, maxiter=1000):
     b = jnp.asarray(b)
     if x0 is None:
         x = jnp.zeros_like(b)
@@ -995,6 +1281,7 @@ def cg_jax(
     r = b - matvec(x)
     p = r
     rs_old = jnp.vdot(r, r)
+    rs0 = rs_old  # store initial residual norm^2
 
     def body_fun(k, state):
         x, r, p, rs_old = state
@@ -1010,9 +1297,11 @@ def cg_jax(
     def cond_fun(val):
         k, state = val
         _, r, _, rs_old = state
+        # relative residual sqrt(rs_old/rs0)
+        rel = jnp.sqrt(rs_old / rs0)
         return jnp.logical_and(
             k < maxiter,
-            jnp.sqrt(rs_old) > tol
+            rel > tol
         )
 
     def loop_fun(val):
@@ -1022,17 +1311,17 @@ def cg_jax(
 
     init_state = (x, r, p, rs_old)
     k0 = jnp.array(0, dtype=jnp.int32)
-    _, (x_final, r_final, _, rs_final) = jax.lax.while_loop(
+    k_final, (x_final, r_final, _, rs_final) = jax.lax.while_loop(
         cond_fun, loop_fun, (k0, init_state)
     )
-    return x_final, jnp.sqrt(rs_final)
+    return x_final, jnp.sqrt(rs_final / rs0), k_final
 
 
 ###############################################################################
 # Main solver routine
 ###############################################################################
 
-def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float = 1.5,
+def solve_fci(npz_file: str, grid_N: int = 64, N_phi: int = 128, eps: float = 1e-3, band_h: float = 1.5,
               cg_tol: float = 1e-8, cg_maxit: int = 2000,
               verbose: bool = True, plot: bool = False, nfp: int = 2,
               delta: float = 5e-3, save_figures: bool = True,
@@ -1056,24 +1345,94 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                        a=jnp.asarray(a), a_hat=jnp.asarray(a_hat))
     grad_phi = evals.build()
 
-    mins = P.min(axis=0); maxs = P.max(axis=0); span = maxs - mins
-    mins = mins - 0.01 * span; maxs = maxs + 0.01 * span
-    nx = ny = nz = int(grid_N)
-    xs = np.linspace(mins[0], maxs[0], nx)
-    ys = np.linspace(mins[1], maxs[1], ny)
-    zs = np.linspace(mins[2], maxs[2], nz)
-    dx, dy, dz = xs[1] - xs[0], ys[1] - ys[0], zs[1] - zs[0]
-    XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="xy")
-    XX = XX.transpose(1, 0, 2)
-    YY = YY.transpose(1, 0, 2)
-    ZZ = ZZ.transpose(1, 0, 2)
-    Xq = np.column_stack([XX.ravel(order="C"),
-                          YY.ravel(order="C"),
-                          ZZ.ravel(order="C")])
-    if verbose:
-        pinfo(f"Grid size: {nx}x{ny}x{nz} = {Xq.shape[0]} nodes.  Spacing dx≈{dx:.3g}, dy≈{dy:.3g}, dz≈{dz:.3g}")
-        pinfo(f"Grid bounds x=[{xs[0]:.3g}, {xs[-1]:.3g}], y=[{ys[0]:.3g}, {ys[-1]:.3g}], z=[{zs[0]:.3g}, {zs[-1]:.3g}]")
-    voxel = min(dx, dy, dz)
+    # ------------------------------------------------------------------
+    # Build grid: cylindrical (R, φ, Z) when kind=torus; Cartesian when mirror
+    # ------------------------------------------------------------------
+    kind_str = kind.strip().lower()
+
+    if kind_str == "torus":
+        # --- Cylindrical grid (R, φ, Z) ---
+        # Compute cylindrical coordinates of boundary points
+        Rb = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
+        Zb = P[:, 2]
+
+        # Slight padding around boundary
+        R_min, R_max = Rb.min(), Rb.max()
+        Z_min, Z_max = Zb.min(), Zb.max()
+        R_span = R_max - R_min
+        Z_span = Z_max - Z_min
+        R_min -= 0.02 * R_span
+        R_max += 0.02 * R_span
+        Z_min -= 0.02 * Z_span
+        Z_max += 0.02 * Z_span
+
+        # Use grid_N for radial and vertical; use grid_phi for toroidal
+        nR = int(grid_N)
+        nphi = int(N_phi)
+        nZ = int(grid_N)
+
+        Rs = np.linspace(R_min, R_max, nR)
+        phis = np.linspace(0.0, 2.0 * np.pi, nphi, endpoint=False)
+        Zs = np.linspace(Z_min, Z_max, nZ)
+
+        dR = Rs[1] - Rs[0] if nR > 1 else 1.0
+        dphi = phis[1] - phis[0] if nphi > 1 else 1.0
+        dZ = Zs[1] - Zs[0] if nZ > 1 else 1.0
+
+        # Build physical coordinates Xq from cylindrical grid
+        RR, PHI, ZZ_cyl = np.meshgrid(Rs, phis, Zs, indexing="ij")  # (nR,nphi,nZ)
+        XX = RR * np.cos(PHI)
+        YY = RR * np.sin(PHI)
+        Xq = np.column_stack([
+            XX.ravel(order="C"),
+            YY.ravel(order="C"),
+            ZZ_cyl.ravel(order="C"),
+        ])
+
+        # For later reshaping
+        nx, ny, nz = nR, nphi, nZ
+
+        if verbose:
+            pinfo(f"[GRID] kind=torus, cylindrical grid: nR={nR}, nphi={nphi}, nZ={nZ}, Ntot={Xq.shape[0]}")
+            pinfo(f"[GRID] R∈[{R_min:.3g},{R_max:.3g}], Z∈[{Z_min:.3g},{Z_max:.3g}], φ∈[0,2π)")
+            pinfo(f"[GRID] dR≈{dR:.3g}, dφ≈{dphi:.3g}, dZ≈{dZ:.3g}")
+
+        # Characteristic "voxel size" in physical space
+        # The toroidal direction has physical length ~ R*dphi; use mid-radius as estimate
+        R_mid = 0.5 * (R_min + R_max)
+        voxel = min(dR, R_mid * dphi, dZ)
+
+        grid_is_cyl = True
+        grid_axes = {"Rs": Rs, "phis": phis, "Zs": Zs, "dR": dR, "dphi": dphi, "dZ": dZ}
+
+    else:
+        # --- Cartesian grid (mirror or generic) ---
+        mins = P.min(axis=0); maxs = P.max(axis=0); span = maxs - mins
+        mins = mins - 0.01 * span; maxs = maxs + 0.01 * span
+        nx = ny = nz = int(grid_N)
+        xs = np.linspace(mins[0], maxs[0], nx)
+        ys = np.linspace(mins[1], maxs[1], ny)
+        zs = np.linspace(mins[2], maxs[2], nz)
+        dx, dy, dz = xs[1] - xs[0], ys[1] - ys[0], zs[1] - zs[0]
+        XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="xy")
+        XX = XX.transpose(1, 0, 2)
+        YY = YY.transpose(1, 0, 2)
+        ZZ = ZZ.transpose(1, 0, 2)
+        Xq = np.column_stack([XX.ravel(order="C"),
+                              YY.ravel(order="C"),
+                              ZZ.ravel(order="C")])
+        if verbose:
+            pinfo(f"[GRID] kind={kind_str}, Cartesian grid: {nx}x{ny}x{nz} = {Xq.shape[0]} nodes.")
+            pinfo(f"[GRID] Spacing dx≈{dx:.3g}, dy≈{dy:.3g}, dz≈{dz:.3g}")
+            pinfo(f"[GRID] Bounds x=[{xs[0]:.3g}, {xs[-1]:.3g}], y=[{ys[0]:.3g}, {ys[-1]:.3g}], z=[{zs[0]:.3g}, {zs[-1]:.3g}]")
+        voxel = min(dx, dy, dz)
+
+        grid_is_cyl = False
+        grid_axes = {"xs": xs, "ys": ys, "zs": zs, "dx": dx, "dy": dy, "dz": dz}
+
+    # bounding box valid in both cases
+    mins = Xq.min(axis=0)
+    maxs = Xq.max(axis=0)
 
     c = np.mean(P, axis=0)
     s = np.sum((P - c) * Nsurf, axis=1)
@@ -1257,29 +1616,55 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         if verbose:
             pinfo("Building FCI connectivity (field-line mapping) ...")
 
-        fci = build_fci_connectivity_chunked(
-            xs, ys, zs,
-            inside_mask,
-            grad_phi_fn=grad_phi,
-            nfp=nfp,
-            dphi_per_step=None,
-            nsteps=fci_nsteps,
-            verbose=verbose,
-            chunk_size=None,
-            fci_planes_per_field_period=fci_planes_per_field_period,
-        )
+        if grid_is_cyl and kind_str == "torus":
+            Rs = grid_axes["Rs"]
+            phis = grid_axes["phis"]
+            Zs = grid_axes["Zs"]
+
+            fci = build_fci_connectivity_cylindrical(
+                Rs, phis, Zs,
+                inside_mask,
+                grad_phi_fn=grad_phi,
+                nfp=nfp,
+                dphi_per_step=None,
+                nsteps=fci_nsteps,
+                verbose=verbose,
+                chunk_size=None,
+                fci_planes_per_field_period=fci_planes_per_field_period,
+            )
+        else:
+            xs = grid_axes["xs"]
+            ys = grid_axes["ys"]
+            zs = grid_axes["zs"]
+
+            fci = build_fci_connectivity_chunked(
+                xs, ys, zs,
+                inside_mask,
+                grad_phi_fn=grad_phi,
+                nfp=nfp,
+                dphi_per_step=None,
+                nsteps=fci_nsteps,
+                verbose=verbose,
+                chunk_size=None,
+                fci_planes_per_field_period=fci_planes_per_field_period,
+            )
+
         if verbose:
             pinfo(f"FCI connectivity: valid nodes = {fci.valid.sum()} / {inside_mask.sum()}")
 
         if verbose and fci.valid.sum() == 0:
             pinfo("[WARN] FCI connectivity has zero valid nodes; parallel operator is effectively disabled.")
         
+        kappa_par = 1.0
+        kappa_perp = eps
+
         inside3 = inside_mask.reshape(nx, ny, nz)
         band3 = band.reshape(nx, ny, nz)
         axis3 = axis_band.reshape(nx, ny, nz)
-        # core = at least 1 cell away from the domain boundary AND not in bands
+        # core = at least 1 cell away from domain boundary AND not in bands
         core3 = np.zeros_like(inside3, dtype=bool)
-        core3[1:-1, 1:-1, 1:-1] = True
+        # interior in R and Z, but *all* φ are core (since φ is periodic)
+        core3[1:-1, :, 1:-1] = True
         core3 &= inside3
         core3 &= ~band3
         core3 &= ~axis3
@@ -1287,19 +1672,44 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         if verbose and core_flat.sum() < 10:
             pinfo(f"[WARN] FCI core region has only {core_flat.sum()} nodes; parallel operator is almost inactive.")
 
-        A_pde_jax, deep_inside = make_fci_operator_jax(
-            nx, ny, nz,
-            xs, ys, zs,
-            inside_mask,
-            fci,
-            core_mask=core_flat,
-            kappa_par=1,
-            kappa_perp=eps,
-        )
+        if grid_is_cyl and kind_str == "torus":
+            Rs   = grid_axes["Rs"]
+            phis = grid_axes["phis"]
+            Zs   = grid_axes["Zs"]
+            A_pde_jax, deep_inside = make_fci_operator_cylindrical(
+                nx, ny, nz,
+                Rs, phis, Zs,
+                inside_mask,
+                fci,
+                core_mask=core_flat,
+                kappa_par=kappa_par,
+                kappa_perp=kappa_perp,
+            )
+        else:
+            xs = grid_axes["xs"]
+            ys = grid_axes["ys"]
+            zs = grid_axes["zs"]
+            A_pde_jax, deep_inside = make_fci_operator_jax(
+                nx, ny, nz,
+                xs, ys, zs,
+                inside_mask,
+                fci,
+                core_mask=core_flat,
+                kappa_par=kappa_par,
+                kappa_perp=kappa_perp,
+            )
 
     else:
+        if grid_is_cyl and kind_str == "torus":
+            raise NotImplementedError(
+                "use_fci=False not implemented for cylindrical torus grids; "
+                "run with FCI (default) for kind='torus'."
+            )
         if verbose:
             pinfo("Building Cartesian anisotropic tensor operator (no FCI, JAX) ...")
+        dx = grid_axes["dx"]
+        dy = grid_axes["dy"]
+        dz = grid_axes["dz"]
         D = diffusion_tensor_jax(G, eps=eps, delta=delta)  # now jax
         A_pde_jax, deep_inside = make_linear_operator_jax(
             nx, ny, nz, dx, dy, dz,
@@ -1358,10 +1768,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     if verbose:
         pinfo("Solving linear system (JAX CG) ...")
     b_free_j = jnp.asarray(b_free)
-    psi_free_j, res_norm = cg_jax(matvec_free_jax, b_free_j, tol=cg_tol, maxiter=cg_maxit)
+    psi_free_j, res_norm, k_final = cg_jax(matvec_free_jax, b_free_j, tol=cg_tol, maxiter=cg_maxit)
     psi_free = np.asarray(psi_free_j)
     if verbose:
-        pinfo(f"JAX CG solve completed with final residual norm {res_norm:.3e}.")
+        pinfo(f"JAX CG: k={int(k_final)} iters, final relative residual {res_norm:.3e}")
 
     psi = np.array(psi_fixed_full)
     psi[free] = psi_free
@@ -1387,18 +1797,122 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     psi3 = psi.reshape(nx, ny, nz)
 
-    dpsidx = (psi3[2:, 1:-1, 1:-1] - psi3[:-2, 1:-1, 1:-1]) / (2 * dx)
-    dpsidy = (psi3[1:-1, 2:, 1:-1] - psi3[1:-1, :-2, 1:-1]) / (2 * dy)
-    dpsidz = (psi3[1:-1, 1:-1, 2:] - psi3[1:-1, 1:-1, :-2]) / (2 * dz)
-
+    # ------------------------------------------------------------------
+    # Compute ∇ψ on the core for alignment metric q = |t·∇ψ| / |∇ψ|
+    # Use (x,y,z) finite differences on Cartesian grid, and cylindrical
+    # (R,φ,Z) derivatives with tensor transform on cylindrical grid.
+    # ------------------------------------------------------------------
     G3 = G.reshape(nx, ny, nz, 3)
-    B_core = G3[1:-1, 1:-1, 1:-1, :]
-    gnorm_core = np.linalg.norm(B_core, axis=-1)
-    core_mask = (gnorm_core > 1e-10)
 
+    if grid_is_cyl and kind_str == "torus":
+        # Cylindrical grid: psi3[iR, jphi, kZ] with axes Rs, phis, Zs
+        Rs   = grid_axes["Rs"]
+        phis = grid_axes["phis"]
+        Zs   = grid_axes["Zs"]
+        dR   = grid_axes["dR"]
+        dphi = grid_axes["dphi"]
+        dZ   = grid_axes["dZ"]
+
+        nR, nphi, nZ = psi3.shape
+
+        # Build R, φ 3D arrays for metric transform
+        RR, PHI, ZZ = np.meshgrid(Rs, phis, Zs, indexing="ij")  # (nR,nphi,nZ)
+
+        # Central differences in cylindrical coordinates on interior cells
+        # R: i = 1..nR-2, φ: j = 1..nphi-2, Z: k = 1..nZ-2
+        dpsi_dR = (psi3[2:, 1:-1, 1:-1] - psi3[:-2, 1:-1, 1:-1]) / (2.0 * dR)
+        # φ: periodic, central differences, then restrict to j=1..nphi-2
+        psi_phi = psi3[1:-1, :, 1:-1]  # (nR-2, nphi, nZ-2)
+        psi_phi_plus  = np.roll(psi_phi, -1, axis=1)
+        psi_phi_minus = np.roll(psi_phi, +1, axis=1)
+        dpsi_dphi_full = (psi_phi_plus - psi_phi_minus) / (2.0 * dphi)
+        dpsi_dphi = dpsi_dphi_full[:, 1:-1, :]  # (nR-2, nphi-2, nZ-2)
+
+        dpsi_dZ = (psi3[1:-1, 1:-1, 2:] - psi3[1:-1, 1:-1, :-2]) / (2.0 * dZ)
+
+        # Metric transform from (R,φ,Z) to (x,y,z)
+        R_mid   = RR[1:-1, 1:-1, 1:-1]
+        PHI_mid = PHI[1:-1, 1:-1, 1:-1]
+
+        cosphi = np.cos(PHI_mid)
+        sinphi = np.sin(PHI_mid)
+        R_safe = np.maximum(R_mid, 1e-8)
+
+        dpsidx = cosphi * dpsi_dR - (sinphi / R_safe) * dpsi_dphi
+        dpsidy = sinphi * dpsi_dR + (cosphi / R_safe) * dpsi_dphi
+        dpsidz = dpsi_dZ
+
+        # B on interior (1:-1,1:-1,1:-1)
+        # B_core = G3[1:-1, 1:-1, 1:-1, :]
+
+    else:
+        # Cartesian finite differences as before
+        dx = grid_axes["dx"]
+        dy = grid_axes["dy"]
+        dz = grid_axes["dz"]
+
+        dpsidx = (psi3[2:, 1:-1, 1:-1] - psi3[:-2, 1:-1, 1:-1]) / (2 * dx)
+        dpsidy = (psi3[1:-1, 2:, 1:-1] - psi3[1:-1, :-2, 1:-1]) / (2 * dy)
+        dpsidz = (psi3[1:-1, 1:-1, 2:] - psi3[1:-1, 1:-1, :-2]) / (2 * dz)
+
+        # B_core = G3[1:-1, 1:-1, 1:-1, :]
+
+    # gnorm_core = np.linalg.norm(B_core, axis=-1)
+    # core_mask = (gnorm_core > 1e-10)
+
+    # t_hat_core = np.zeros_like(B_core)
+    # t_hat_core[core_mask] = (
+    #     B_core[core_mask].T / gnorm_core[core_mask]
+    # ).T
+
+    # par_grad_full = (
+    #     t_hat_core[..., 0] * dpsidx +
+    #     t_hat_core[..., 1] * dpsidy +
+    #     t_hat_core[..., 2] * dpsidz
+    # )
+    # grad_mag_full = np.sqrt(dpsidx**2 + dpsidy**2 + dpsidz**2)
+
+    # par_grad = par_grad_full[core_mask]
+    # grad_mag = grad_mag_full[core_mask]
+
+    # q_metric = np.abs(par_grad) / np.maximum(grad_mag, 1e-14)
+    
+    # --- Build metric mask on the interior (1:-1,1:-1,1:-1) ---
+    inside3 = inside_mask.reshape(nx, ny, nz)
+    band3   = band.reshape(nx, ny, nz)
+    axis3   = axis_band.reshape(nx, ny, nz)
+    
+    # FCI-valid mask in 3D
+    fci_valid3 = np.zeros_like(inside3, dtype=bool)
+    if use_fci:
+        fci_valid3 = fci.valid.reshape(nx, ny, nz)
+    
+    # This matches the "core3" you used for the operator,
+    # but restricted to the central stencil region and FCI-valid points:
+    core_metric = (
+        inside3[1:-1, 1:-1, 1:-1]
+        & (~band3[1:-1, 1:-1, 1:-1])
+        & (~axis3[1:-1, 1:-1, 1:-1])
+        & (fci_valid3[1:-1, 1:-1, 1:-1])
+    )
+
+    # Now compute |B| and |∇ψ| on that interior region
+    B_core = G3[1:-1, 1:-1, 1:-1, :]  # already used above
+    gnorm_core = np.linalg.norm(B_core, axis=-1)
+    grad_mag_full = np.sqrt(dpsidx**2 + dpsidy**2 + dpsidz**2)
+
+    # Only keep points where |B| and |∇ψ| are "well defined"
+    grad_floor = 1e-3 * np.nanmax(grad_mag_full)  # e.g. 0.1% of max
+    metric_mask = (
+        core_metric
+        & (gnorm_core > 1e-10)
+        & (grad_mag_full > grad_floor)
+    )
+
+    # Build t_hat only on metric_mask
     t_hat_core = np.zeros_like(B_core)
-    t_hat_core[core_mask] = (
-        B_core[core_mask].T / gnorm_core[core_mask]
+    t_hat_core[metric_mask] = (
+        B_core[metric_mask].T / gnorm_core[metric_mask]
     ).T
 
     par_grad_full = (
@@ -1406,10 +1920,9 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         t_hat_core[..., 1] * dpsidy +
         t_hat_core[..., 2] * dpsidz
     )
-    grad_mag_full = np.sqrt(dpsidx**2 + dpsidy**2 + dpsidz**2)
 
-    par_grad = par_grad_full[core_mask]
-    grad_mag = grad_mag_full[core_mask]
+    par_grad = par_grad_full[metric_mask]
+    grad_mag = grad_mag_full[metric_mask]
 
     q_metric = np.abs(par_grad) / np.maximum(grad_mag, 1e-14)
 
@@ -1424,6 +1937,17 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
     inside3 = inside_mask.reshape(nx, ny, nz)
 
     print(f"Solved FCI ψ in {(time.time() - time_start_solve_fci):.2f} s.")
+
+    bad_core = (inside_mask & (~band) & (~axis_band) & (np.abs(psi) < 1e-10))
+    print(f"[DEBUG] interior nodes with ψ≈0 (excluding bands): {bad_core.sum()}")
+    
+    if q_metric.size > 0:
+        n = q_metric.size
+        for thresh in [0.05, 0.1, 0.2, 0.5, 0.8, 0.9]:
+            frac = np.count_nonzero(q_metric < thresh) / n
+            print(f"[ALIGN] frac(q < {thresh}) = {frac:.3f}")
+        frac_bad = np.count_nonzero(q_metric > 0.8) / n
+        print(f"[ALIGN] frac(q > 0.8) = {frac_bad:.3f}")
 
     if plot:
         if q_metric.size > 0:
@@ -1447,29 +1971,59 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                 fig1.savefig("fci_psi_diagnostics.png")
 
         try:
-            time0 = time.time()
-            psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, mask_RZphi = build_psi_RZphi_volume(
-                psi3, xs, ys, zs, P, inside3, nR=128, nphi=256, nZ=128)
-            pinfo(f"Built ψ(R,Z,φ) volume in {(time.time() - time0):.2f} s.")
+            if grid_is_cyl and kind_str == "torus":
+                # ψ is already on (R,φ,Z) grid
+                Rs_cyl   = grid_axes["Rs"]
+                phis_cyl = grid_axes["phis"]
+                Zs_cyl   = grid_axes["Zs"]
+                psi_RZphi = psi3  # shape (nR, nphi, nZ)
 
-            Rb    = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
-            phi_b = np.mod(np.arctan2(P[:, 1], P[:, 0]), 2*np.pi)
-            Zb    = P[:, 2]
+                Rb    = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
+                phi_b = np.mod(np.arctan2(P[:, 1], P[:, 0]), 2*np.pi)
+                Zb    = P[:, 2]
 
-            # magnetic axis in cylindrical coords
-            R_axis   = np.sqrt(axis_pts[:, 0]**2 + axis_pts[:, 1]**2)
-            phi_axis = np.mod(np.arctan2(axis_pts[:, 1], axis_pts[:, 0]), 2*np.pi)
-            Z_axis   = axis_pts[:, 2]
+                R_axis   = np.sqrt(axis_pts[:, 0]**2 + axis_pts[:, 1]**2)
+                phi_axis = np.mod(np.arctan2(axis_pts[:, 1], axis_pts[:, 0]), 2*np.pi)
+                Z_axis   = axis_pts[:, 2]
 
-            jj_list = np.linspace(0, int((len(phis_cyl) - 1)/nfp), 4, dtype=int, endpoint=False)
-            power = psi_power_for_plot
-            figRZ = plot_psi_maps_RZ_panels(
-                jnp.pow(psi_RZphi, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
-                Rb=Rb, Zb=Zb, phi_b=phi_b,
-                R_axis=R_axis, Z_axis=Z_axis, phi_axis=phi_axis,
-                title=rf"$\psi(R,Z)^{power}$"
-            )
-            # figRZ.suptitle(rf"$\psi(R,Z)^{power}$ at selected toroidal angles")
+                jj_list = np.linspace(0, int((len(phis_cyl) - 1)/nfp), 4, dtype=int, endpoint=False)
+                power = psi_power_for_plot
+                # Mask out points outside the torus by setting them to NaN
+                psi_RZphi_plot = np.where(inside3, psi3, np.nan)
+
+                figRZ = plot_psi_maps_RZ_panels(
+                    np.power(psi_RZphi_plot, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                    Rb=Rb, Zb=Zb, phi_b=phi_b,
+                    R_axis=R_axis, Z_axis=Z_axis, phi_axis=phi_axis,
+                    title=rf"$\psi(R,Z)^{power}$"
+                )
+            else:
+                # old Cartesian path
+                xs = grid_axes["xs"]
+                ys = grid_axes["ys"]
+                zs = grid_axes["zs"]
+                time0 = time.time()
+                psi_RZphi, Rs_cyl, phis_cyl, Zs_cyl, mask_RZphi = build_psi_RZphi_volume(
+                    psi3, xs, ys, zs, P, inside3, nR=128, nphi=256, nZ=128)
+                pinfo(f"Built ψ(R,Z,φ) volume in {(time.time() - time0):.2f} s.")
+
+                Rb    = np.sqrt(P[:, 0]**2 + P[:, 1]**2)
+                phi_b = np.mod(np.arctan2(P[:, 1], P[:, 0]), 2*np.pi)
+                Zb    = P[:, 2]
+
+                R_axis   = np.sqrt(axis_pts[:, 0]**2 + axis_pts[:, 1]**2)
+                phi_axis = np.mod(np.arctan2(axis_pts[:, 1], axis_pts[:, 0]), 2*np.pi)
+                Z_axis   = axis_pts[:, 2]
+
+                jj_list = np.linspace(0, int((len(phis_cyl) - 1)/nfp), 4, dtype=int, endpoint=False)
+                power = psi_power_for_plot
+                figRZ = plot_psi_maps_RZ_panels(
+                    jnp.pow(psi_RZphi, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
+                    Rb=Rb, Zb=Zb, phi_b=phi_b,
+                    R_axis=R_axis, Z_axis=Z_axis, phi_axis=phi_axis,
+                    title=rf"$\psi(R,Z)^{power}$"
+                )
+
             if save_figures:
                 figRZ.savefig("fci_psi_RZ_panels.png")
 
@@ -1477,16 +2031,21 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             pinfo(f"[WARN] Failed to build RZφ panels: {e}")
 
         try:
-            # X_bnd = P
-            # logical mask of boundary band in 3D indices
             band3 = band.reshape(nx, ny, nz)
             P_bnd_grid = np.column_stack(np.nonzero(band3))  # (i,j,k) indices
-            X_bnd = np.column_stack([xs[P_bnd_grid[:,0]],
-                                     ys[P_bnd_grid[:,1]],
-                                     zs[P_bnd_grid[:,2]]])
-            fig3d = plot_3d_axis_boundary_interp(X_bnd, axis_pts, psi3, xs, ys, zs)
-            if save_figures:
-                fig3d.savefig("fci_psi_3d_axis_boundary.png")
+
+            if grid_is_cyl and kind_str == "torus":
+                pinfo("[WARN] 3D ψ-coloured boundary plot not implemented in cylindrical mode; skipping.")
+            else:
+                xs = grid_axes["xs"]
+                ys = grid_axes["ys"]
+                zs = grid_axes["zs"]
+                X_bnd = np.column_stack([xs[P_bnd_grid[:,0]],
+                                         ys[P_bnd_grid[:,1]],
+                                         zs[P_bnd_grid[:,2]]])
+                fig3d = plot_3d_axis_boundary_interp(X_bnd, axis_pts, psi3, xs, ys, zs)
+                if save_figures:
+                    fig3d.savefig("fci_psi_3d_axis_boundary.png")
         except Exception as e:
             pinfo(f"[WARN] Failed to plot 3D axis/boundary: {e}")
 
@@ -1509,9 +2068,28 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
         plt.show()
 
+    if grid_is_cyl and kind_str == "torus":
+        grid_info = {
+            'grid_type': 'cylindrical',
+            'Rs': grid_axes['Rs'],
+            'phis': grid_axes['phis'],
+            'Zs': grid_axes['Zs'],
+            'mins': mins,
+            'maxs': maxs,
+        }
+    else:
+        grid_info = {
+            'grid_type': 'cartesian',
+            'xs': grid_axes['xs'],
+            'ys': grid_axes['ys'],
+            'zs': grid_axes['zs'],
+            'mins': mins,
+            'maxs': maxs,
+        }
+
     result = {
         'psi': psi,
-        'grid': {'xs': xs, 'ys': ys, 'zs': zs,'mins': mins, 'maxs': maxs,},
+        'grid': grid_info,
         'inside': inside_mask,
         'bands': {'boundary': band,'axis': axis_band,},
         'quality': {'q_metric': q_metric,'parallel_dot_grad': par_grad,'residual': r_full,},
@@ -1525,10 +2103,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
 if __name__ == "__main__":
 
-    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    # default_solution = "wout_SLAM_6_coils_solution.npz"
+    default_solution = "wout_SLAM_6_coils_solution.npz"
     # default_solution = "knot_tube_solution.npz"
 
     nfp_default = 2
@@ -1538,23 +2116,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
-    parser.add_argument("--eps", type=float, default=1e-2, help="Perpendicular diffusion weight")
+    parser.add_argument("--N", type=int, default=32, help="Grid resolution per axis")
+    parser.add_argument("--N_phi", type=int, default=64, help="Grid resolution in φ (only for cylindrical grids)")
+    parser.add_argument("--eps", type=float, default=5e-3, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=0, help="Isotropic diffusion floor")
-    parser.add_argument("--band-h", type=float, default=2.5, help="Boundary band thickness multiplier")
+    parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
     parser.add_argument("--cg-tol", type=float, default=1e-11, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=4000, help="CG maximum iterations (default: 2000)")
     parser.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods (default: 2)")
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument("--no-save-figures", action="store_true", help="Do NOT save diagnostic figures to disk.")
     parser.add_argument("--no-fci", action="store_true", help="Disable FCI and use tensor Laplacian only.")
-    parser.add_argument("--fci-nsteps", type=int, default=18, help="Number of RK2 steps per FCI Δφ trace.")
-    parser.add_argument("--fci-planes-per-field-period", type=int, default=2, help="Number of FCI planes per field period")
+    parser.add_argument("--fci-nsteps", type=int, default=32, help="Number of RK2 steps per FCI Δφ trace.")
+    parser.add_argument("--fci-planes-per-field-period", type=int, default=8, help="Number of FCI planes per field period")
     parser.add_argument("--psi-power-for-plot", type=int, default=1, help="Power of psi when plotting RZ panels")
     args = parser.parse_args()
     
     res = solve_fci(
-        args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
+        args.npz, grid_N=args.N, N_phi=args.N_phi, eps=args.eps, band_h=args.band_h,
         cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
         nfp=args.nfp, delta=args.delta, save_figures=not args.no_save_figures,
         use_fci=not args.no_fci, fci_nsteps=args.fci_nsteps,
