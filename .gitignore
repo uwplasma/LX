@@ -220,3 +220,5 @@ hpo_viz/*
 *.mp4
 *.DS_store
 *.png
+*psi_fci*.npz
+*tearing*.npz

@@ -2148,3 +2148,59 @@ if __name__ == "__main__":
     psi_in = psi_all[free_inside]
     if psi_in.size > 0:
         pstat("Solution ψ (inside free region)", psi_in)
+
+    # ------------------------------------------------------------------
+    # Save ψ solution + metadata for post-processing / analysis
+    # ------------------------------------------------------------------
+    grid = res["grid"]
+    bands = res["bands"]
+    axis_info = res["axis"]
+    quality = res["quality"]
+
+    base = Path(args.npz).with_suffix("").name
+    if grid["grid_type"] == "cylindrical":
+        out_name = f"{base}_psi_fci_cyl_N{args.N}_Nphi{args.N_phi}.npz"
+        np.savez(
+            out_name,
+            psi=res["psi"],
+            inside=res["inside"],
+            boundary_band=bands["boundary"],
+            axis_band=bands["axis"],
+            grid_type="cylindrical",
+            Rs=grid["Rs"],
+            phis=grid["phis"],
+            Zs=grid["Zs"],
+            mins=grid["mins"],
+            maxs=grid["maxs"],
+            mfs_npz=os.path.basename(args.npz),
+            R_axis=axis_info["R"],
+            Z_axis=axis_info["Z"],
+            axis_points=axis_info["points"],
+            q_metric=quality["q_metric"],
+            parallel_dot_grad=quality["parallel_dot_grad"],
+            residual=quality["residual"],
+        )
+    else:
+        out_name = f"{base}_psi_fci_cart_N{args.N}.npz"
+        np.savez(
+            out_name,
+            psi=res["psi"],
+            inside=res["inside"],
+            boundary_band=bands["boundary"],
+            axis_band=bands["axis"],
+            grid_type="cartesian",
+            xs=grid["xs"],
+            ys=grid["ys"],
+            zs=grid["zs"],
+            mins=grid["mins"],
+            maxs=grid["maxs"],
+            mfs_npz=os.path.basename(args.npz),
+            R_axis=axis_info["R"],
+            Z_axis=axis_info["Z"],
+            axis_points=axis_info["points"],
+            q_metric=quality["q_metric"],
+            parallel_dot_grad=quality["parallel_dot_grad"],
+            residual=quality["residual"],
+        )
+
+    pinfo(f"[SAVE] Saved ψ-solution snapshot to: {out_name}")
