@@ -170,7 +170,7 @@ def fix_matplotlib_3d(ax):
     R = 0.5 * max([x_range, y_range, z_range])
     ax.set_xlim3d([x_mid-R, x_mid+R]); ax.set_ylim3d([y_mid-R, y_mid+R]); ax.set_zlim3d([z_mid-R, z_mid+R])
 
-def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf):
+def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs):
     interp_psi = RegularGridInterpolator((xs, ys, zs), psi3,
                                          bounds_error=False, fill_value=np.nan)
 
@@ -207,11 +207,6 @@ def plot_3d_axis_boundary_interp(P, axis_pts, psi3, xs, ys, zs, voxel, Nsurf):
 ###############################################################################
 # JAX helpers for Green's function and gradient
 ###############################################################################
-
-@jit
-def green_G(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    r = jnp.linalg.norm(x - y, axis=-1)
-    return 1.0 / (4.0 * jnp.pi * jnp.maximum(1e-30, r))
 
 @jit
 def grad_green_x(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
@@ -270,7 +265,6 @@ class Evaluators:
         a_c = jnp.asarray(self.a)
         a_hatc = jnp.asarray(self.a_hat)
 
-        S_single = jit(lambda xn: jnp.dot(vmap(lambda y: green_G(xn, y))(Yn_c), alpha_c))
         dS_single = jit(lambda xn: jnp.sum(
             vmap(lambda y: grad_green_x(xn, y))(Yn_c) * alpha_c[:, None],
             axis=0
@@ -304,8 +298,8 @@ def inside_mask_from_surface(P_surf: np.ndarray, N_surf: np.ndarray,
 ###############################################################################
 
 def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, Z0: float,
-                     nfp: int, nsteps: int = 1000, max_newton: int = 12,
-                     tol: float = 1e-8) -> Tuple[float, float]:
+                     nfp: int, nsteps: int = 500, max_newton: int = 12,
+                     tol: float = 1e-6) -> Tuple[float, float]:
     @jit
     def B_cyl(R: float, phi: float, Z: float) -> Tuple[jnp.ndarray, float, float]:
         x = R * jnp.cos(phi)
@@ -334,7 +328,7 @@ def collapse_to_axis(grad_phi: Callable[[jnp.ndarray], jnp.ndarray], R0: float, 
     t1 = 2.0 * jnp.pi / nfp
     dt0 = float(t1) / float(nsteps)
     saveat_t1 = dfx.SaveAt(t1=True)
-    stepsize_controller = dfx.PIDController(rtol=1e-4, atol=1e-5)
+    stepsize_controller = dfx.PIDController(rtol=1e-4, atol=1e-4)
 
     @jit
     def integrate_one_turn(RZ0: jnp.ndarray) -> jnp.ndarray:
@@ -396,65 +390,6 @@ def make_fieldline_phi_rhs_jax(grad_phi_fn):
         return jnp.stack([dR_dphi, dZ_dphi], axis=-1)
 
     return rhs
-
-
-@partial(jax.jit, static_argnames=("grad_phi_fn", "nsteps"))
-def trace_to_delta_phi(
-    grad_phi_fn,
-    R0: float,
-    Z0: float,
-    phi0: float,
-    dphi_target: float,
-    nsteps: int = 16,
-    verbose: bool = False,   # kept for signature compatibility; ignored in JIT
-):
-    """
-    JAX version using fixed-step RK2 (Heun) in toroidal angle φ.
-
-    Returns JAX scalars (0D arrays): (R1, Z1, phi1, L)
-    """
-
-    rhs = make_fieldline_phi_rhs_jax(grad_phi_fn)
-
-    R  = jnp.asarray(R0,  dtype=jnp.float64)
-    Z  = jnp.asarray(Z0,  dtype=jnp.float64)
-    ph = jnp.asarray(phi0, dtype=jnp.float64)
-    L0 = jnp.asarray(0.0, dtype=jnp.float64)
-
-    dphi = jnp.asarray(dphi_target, dtype=jnp.float64) / nsteps
-
-    def body_fun(i, carry):
-        R, Z, phi, L = carry
-
-        RZ = jnp.stack([R, Z])
-        k1 = rhs(phi, RZ, None)           # shape (2,)
-        k1R, k1Z = k1[0], k1[1]
-
-        R_pred  = R   + dphi * k1R
-        Z_pred  = Z   + dphi * k1Z
-        phi_pred = phi + dphi
-
-        RZ_pred = jnp.stack([R_pred, Z_pred])
-        k2 = rhs(phi_pred, RZ_pred, None)
-        k2R, k2Z = k2[0], k2[1]
-
-        R_new  = R   + 0.5 * dphi * (k1R + k2R)
-        Z_new  = Z   + 0.5 * dphi * (k1Z + k2Z)
-        phi_new = phi + dphi
-
-        # arclength increment
-        x  = R  * jnp.cos(phi)
-        y  = R  * jnp.sin(phi)
-        z  = Z
-        x2 = R_new  * jnp.cos(phi_new)
-        y2 = R_new  * jnp.sin(phi_new)
-        z2 = Z_new
-        dL = jnp.sqrt((x2 - x)**2 + (y2 - y)**2 + (z2 - z)**2)
-
-        return (R_new, Z_new, phi_new, L + dL)
-
-    R1, Z1, phi1, L1 = lax.fori_loop(0, nsteps, body_fun, (R, Z, ph, L0))
-    return R1, Z1, phi1, L1
 
 @partial(jax.jit, static_argnames=("grad_phi_fn", "nsteps"))
 def trace_to_delta_phi_batched(
@@ -532,47 +467,6 @@ def trace_many_to_delta_phi(grad_phi_fn, seeds_RZphi, dphi_target, nsteps=16):
 # Diffusion tensor
 ###############################################################################
 
-def diffusion_tensor(gradphi: np.ndarray,
-                     eps: float,
-                     delta: float = 0.0,
-                     b_floor: float = 1e-12) -> np.ndarray:
-    """
-    Build D = P_par + eps * P_perp + delta * I, with
-
-        P_par  = b ⊗ b,   b = gradφ / |gradφ|
-        P_perp = I - P_par
-
-    If |gradφ| is too small (below b_floor), we fall back to an isotropic tensor.
-
-    eps   : κ_perp / κ_par (anisotropy ratio)
-    delta : small extra isotropic diffusion (optional)
-    """
-    I = np.eye(3)[None, :, :]
-    g = gradphi
-    n = np.linalg.norm(g, axis=-1, keepdims=True)
-
-    # where |gradφ| is large enough, define b = gradφ/|gradφ|
-    good = n[..., 0] > b_floor
-    b = np.zeros_like(g)
-    b[good] = g[good] / n[good]
-
-    # projectors
-    P_par = np.einsum("ni,nj->nij", b, b)     # b ⊗ b
-    P_perp = I - P_par
-
-    # anisotropic tensor
-    D = P_par + eps * P_perp
-
-    # optional isotropic floor
-    if delta != 0.0:
-        D = D + delta * I
-
-    # where |gradφ| is tiny, just use I (isotropic) to avoid singular projector
-    # D[~good] = I[0]
-    D[~good] = (1.0 + delta) * I[0]
-
-    return D
-
 def diffusion_tensor_jax(gradphi_j: jnp.ndarray, eps: float, delta: float=0.0, b_floor: float=1e-12) -> jnp.ndarray:
     I = jnp.eye(3)[None, :, :]
     g = gradphi_j
@@ -602,150 +496,6 @@ class FCIConnectivity:
     w_minus:   np.ndarray
     L_minus:   np.ndarray
     valid:     np.ndarray  # shape (N,) bool: true where both ends are inside
-
-def build_fci_connectivity(xs, ys, zs,
-                           inside_mask: np.ndarray,
-                           grad_phi_fn,
-                           nfp: int,
-                           dphi_per_step: float = None,
-                           nsteps: int = 16,
-                           verbose: bool = True) -> FCIConnectivity:
-    """
-    Build FCI connectivity for each grid node.
-
-    For each node p inside the domain:
-      - Compute (R,phi,Z) from (x,y,z).
-      - Integrate field line forward/backward by ±Δφ.
-      - If both endpoints remain inside the torus, compute trilinear interpolation
-        weights/indices for the two endpoints.
-    """
-    nx, ny, nz = len(xs), len(ys), len(zs)
-    N = nx * ny * nz
-    assert inside_mask.shape[0] == N
-
-    # choose Δφ
-    if dphi_per_step is None:
-        N_par = 32  # planes per field period
-        dphi_per_step = 2.0 * np.pi / (nfp * N_par)
-
-    idx_plus  = np.zeros((N, 8), dtype=np.int64)
-    idx_minus = np.zeros((N, 8), dtype=np.int64)
-    w_plus    = np.zeros((N, 8), dtype=float)
-    w_minus   = np.zeros((N, 8), dtype=float)
-    L_plus    = np.zeros(N, dtype=float)
-    L_minus   = np.zeros(N, dtype=float)
-    valid     = np.zeros(N, dtype=bool)
-
-    XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="xy")
-    XX = XX.transpose(1, 0, 2)
-    YY = YY.transpose(1, 0, 2)
-    ZZ = ZZ.transpose(1, 0, 2)
-    Xflat = np.column_stack([XX.ravel(order="C"),
-                             YY.ravel(order="C"),
-                             ZZ.ravel(order="C")])
-
-    inside_indices     = np.where(inside_mask)[0]
-    n_inside_total     = int(inside_indices.size)
-    n_inside_processed = 0
-
-    start_time = time.time()
-    last_print = start_time
-
-    for p in range(N):
-        if not inside_mask[p]:
-            continue
-
-        n_inside_processed += 1
-
-        if verbose and (n_inside_processed % 50 == 1 or
-                        n_inside_processed == n_inside_total):
-            now = time.time()
-            dt  = now - last_print
-            total_dt = now - start_time
-            print(
-                f"[FCI] inside node {n_inside_processed}/{n_inside_total} "
-                f"({100.0*n_inside_processed/max(1,n_inside_total):.1f}%) "
-                f"valid={int(valid.sum())} elapsed={total_dt:.1f}s (+{dt:.1f}s)"
-            )
-            last_print = now
-
-        x, y, z = Xflat[p]
-        R = np.sqrt(x*x + y*y)
-        phi0 = np.arctan2(y, x)
-        Z = z
-
-        if R < 1e-5:
-            if verbose:
-                print(f"[FCI] skipping node {p}: R≈0 (near axis).")
-            continue
-
-        # Check grad_phi at start point
-        B0 = np.asarray(grad_phi_fn(jnp.asarray([[x, y, z]], dtype=jnp.float64)))[0]
-        if not np.isfinite(B0).all():
-            if verbose:
-                print(f"[FCI] skipping node {p}: non-finite grad_phi at start B0={B0}")
-            continue
-
-        # forward step
-        try:
-            Rf, Zf, phif, Lf = trace_to_delta_phi(
-                grad_phi_fn, R, Z, phi0, +dphi_per_step,
-                nsteps=nsteps, verbose=True
-            )
-            Rf, Zf, phif, Lf = map(float, (Rf, Zf, phif, Lf))
-            xf = Rf * np.cos(phif)
-            yf = Rf * np.sin(phif)
-            zf = Zf
-        except Exception as e:
-            if verbose:
-                print(f"[FCI] WARN: forward trace failed at node {p}: {e}")
-            continue
-
-        # backward step
-        try:
-            Rb, Zb, phib, Lb = trace_to_delta_phi(
-                grad_phi_fn, R, Z, phi0, -dphi_per_step,
-                nsteps=nsteps, verbose=False
-            )
-            Rb, Zb, phib, Lb = map(float, (Rb, Zb, phib, Lb))
-            xb = Rb * np.cos(phib)
-            yb = Rb * np.sin(phib)
-            zb = Zb
-        except Exception as e:
-            if verbose:
-                print(f"[FCI] WARN: backward trace failed at node {p}: {e}")
-            continue
-
-        # interpolate endpoints back to grid
-        idxp, wp = trilinear_weights(xs, ys, zs, (xf, yf, zf))
-        idxm, wm = trilinear_weights(xs, ys, zs, (xb, yb, zb))
-
-        # require that at least some of the contributing nodes are inside
-        if not (inside_mask[idxp].any() and inside_mask[idxm].any()):
-            if verbose:
-                print(f"[FCI] node {p}: endpoints map outside domain; skipping.")
-            continue
-
-        idx_plus[p, :]  = idxp
-        w_plus[p, :]    = wp
-        L_plus[p]       = max(Lf, 1e-8)
-        idx_minus[p, :] = idxm
-        w_minus[p, :]   = wm
-        L_minus[p]      = max(Lb, 1e-8)
-        valid[p]        = True
-
-    if verbose:
-        print(
-            f"[FCI] Connectivity build finished: "
-            f"valid nodes={valid.sum()} / {inside_mask.sum()}, "
-            f"total time={time.time() - start_time:.1f}s"
-        )
-
-    return FCIConnectivity(
-        idx_plus=idx_plus, w_plus=w_plus, L_plus=L_plus,
-        idx_minus=idx_minus, w_minus=w_minus, L_minus=L_minus,
-        valid=valid,
-    )
     
 def build_fci_connectivity_chunked(
     xs,
@@ -755,9 +505,10 @@ def build_fci_connectivity_chunked(
     grad_phi_fn,
     nfp: int,
     dphi_per_step: float = None,
-    nsteps: int = 16,
+    nsteps: int = 32,
     verbose: bool = True,
-    chunk_size: int = 256,
+    chunk_size: int | None = None,
+    fci_planes_per_field_period: int = 16
 ) -> FCIConnectivity:
     """
     Chunked / batched version of build_fci_connectivity.
@@ -772,7 +523,7 @@ def build_fci_connectivity_chunked(
 
     # choose Δφ if not provided
     if dphi_per_step is None:
-        N_par = 32  # planes per field period
+        N_par = fci_planes_per_field_period  # planes per field period
         dphi_per_step = 2.0 * np.pi / (nfp * N_par)
 
     # allocate outputs
@@ -801,6 +552,17 @@ def build_fci_connectivity_chunked(
     start_time = time.time()
     last_print = start_time
     n_inside_processed = 0
+    
+    # --- automatic chunk_size selection ---
+    if chunk_size is None:
+        n_devices = max(1, len(jax.devices()))
+        # aim for ~ 8 chunks per device, clamp to [128, 4096]
+        target_chunks_per_device = 8
+        est_chunk = n_inside_total // (n_devices * target_chunks_per_device + 1)
+        chunk_size = int(np.clip(est_chunk, 128, 4096))
+        if verbose:
+            pinfo(f"[FCI] Auto chunk_size={chunk_size} "
+                  f"(N_inside={n_inside_total}, n_devices={n_devices})")
 
     # helper: batched grad_phi to check finiteness
     @jax.jit
@@ -923,8 +685,6 @@ def build_fci_connectivity_chunked(
         valid=valid,
     )
 
-
-
 def _find_cell_indices(coord, grid):
     """
     Given a coordinate array coord (scalar) and a 1D grid array grid (monotone),
@@ -989,7 +749,7 @@ def trilinear_weights(xs, ys, zs, point):
         w /= s
     return np.array(idx, dtype=np.int64), w
 
-def make_fci_operator(
+def make_fci_operator_jax(
     nx: int,
     ny: int,
     nz: int,
@@ -998,253 +758,63 @@ def make_fci_operator(
     zs: np.ndarray,
     inside: np.ndarray,
     fci: FCIConnectivity,
+    core_mask: np.ndarray,
     kappa_par: float,
     kappa_perp: float,
 ):
-    """
-    Build a matrix–free FCI operator A_pde[u] ≈
-        - kappa_par * Δ_parallel u  - kappa_perp * Δ_perp u
+    idx_plus  = jnp.asarray(fci.idx_plus)
+    idx_minus = jnp.asarray(fci.idx_minus)
+    w_plus    = jnp.asarray(fci.w_plus)
+    w_minus   = jnp.asarray(fci.w_minus)
+    L_plus    = jnp.asarray(fci.L_plus)
+    L_minus   = jnp.asarray(fci.L_minus)
 
-    where
-      - Δ_parallel is constructed from FCI connectivity,
-      - Δ_perp is a standard Cartesian Laplacian acting only inside the torus.
+    inside_flat = jnp.asarray(inside)
+    core_flat_j = jnp.asarray(core_mask)
+    
+    # Only accept FCI parallel operator where:
+    # - connectivity was successfully built
+    # - node is inside AND in the core region
+    valid_par = jnp.asarray(fci.valid) & inside_flat & core_flat_j
 
-    Dirichlet bands are still handled via lifting outside this function.
-    """
-
-    N = nx * ny * nz
-    assert inside.shape[0] == N
-
+    inside3 = inside_flat.reshape(nx, ny, nz)
+    
     dx = xs[1] - xs[0]
     dy = ys[1] - ys[0]
     dz = zs[1] - zs[0]
 
-    inside3 = inside.reshape(nx, ny, nz)
-    valid_par = fci.valid & inside  # only do parallel operator where mapping is valid
-
-    def matvec(u: np.ndarray) -> np.ndarray:
-        u = u.astype(float, copy=False)
-        out = np.zeros_like(u)
-
-        # --- parallel FCI contribution ---
-        # Δ_parallel u ≈ 2 [ (u+ - u)/L+ + (u- - u)/L- ] / (L+ + L-)
-        u_p = (fci.w_plus * u[fci.idx_plus]).sum(axis=1)
-        u_m = (fci.w_minus * u[fci.idx_minus]).sum(axis=1)
+    @jax.jit
+    def A_pde_jax(u_flat: jnp.ndarray) -> jnp.ndarray:
+        u = u_flat
+        u_p = jnp.sum(w_plus * u[idx_plus], axis=1)
+        u_m = jnp.sum(w_minus * u[idx_minus], axis=1)
         u0  = u
 
-        Lp = fci.L_plus
-        Lm = fci.L_minus
-
-        Lp_safe = np.where(Lp > 0.0, Lp, 1e-8)
-        Lm_safe = np.where(Lm > 0.0, Lm, 1e-8)
+        Lp_safe = jnp.where(L_plus > 0.0, L_plus, 1e-8)
+        Lm_safe = jnp.where(L_minus > 0.0, L_minus, 1e-8)
         Ltot    = Lp_safe + Lm_safe
 
         dpar = 2.0 * ((u_p - u0) / Lp_safe + (u_m - u0) / Lm_safe) / Ltot
-        dpar[~valid_par] = 0.0
+        dpar = jnp.where(valid_par, dpar, 0.0)
 
-        out -= kappa_par * dpar
+        out = -kappa_par * dpar
 
-        # --- perpendicular Cartesian Laplacian ---
-        u3 = u.reshape(nx, ny, nz)
-        lap3 = np.zeros_like(u3)
-
-        # standard 7-point Laplacian, but only on interior indices
-        lap3[1:-1, 1:-1, 1:-1] = (
+        # 7-point Laplacian (Cartesian, perpendicular)
+        u3 = u_flat.reshape((nx, ny, nz))
+        lap3 = jnp.zeros_like(u3)
+        lap3 = lap3.at[1:-1, 1:-1, 1:-1].set(
             (u3[2:, 1:-1, 1:-1] - 2*u3[1:-1, 1:-1, 1:-1] + u3[:-2, 1:-1, 1:-1]) / dx**2 +
             (u3[1:-1, 2:, 1:-1] - 2*u3[1:-1, 1:-1, 1:-1] + u3[1:-1, :-2, 1:-1]) / dy**2 +
             (u3[1:-1, 1:-1, 2:] - 2*u3[1:-1, 1:-1, 1:-1] + u3[1:-1, 1:-1, :-2]) / dz**2
         )
-
-        # Only enforce PDE inside the torus; outside gets 0 equation.
-        lap3[~inside3] = 0.0
-
+        lap3 = jnp.where(inside3, lap3, 0.0)
         out -= kappa_perp * lap3.ravel(order="C")
-
+        
         return out
 
-    A = LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+    deep_inside_mask = np.asarray(inside3.ravel(order="C"))
+    return A_pde_jax, deep_inside_mask
 
-    # “deep inside” = physically inside, same as before.
-    deep_inside_mask = inside.copy()
-
-    return A, deep_inside_mask
-
-
-def make_linear_operator(
-    nx: int,
-    ny: int,
-    nz: int,
-    dx: float,
-    dy: float,
-    dz: float,
-    inside: np.ndarray,
-    Dfield: np.ndarray,
-):
-    """
-    Build a matrix–free LinearOperator A_pde for the anisotropic diffusion equation
-
-        A_pde[u] = -div( D ∇u )
-
-    on a uniform Cartesian grid.
-
-    Changes vs the previous version:
-      * The PDE is enforced on **all nodes inside the torus** (inside==True),
-        not just a shrunken 'interior_core'.
-      * Fluxes across faces are computed wherever both cells are inside.
-      * Cross-terms are dropped only when the *specific* neighbours needed
-        for that derivative are outside, not all-or-nothing.
-    """
-    inside3 = inside.reshape(nx, ny, nz)
-    D3 = Dfield.reshape(nx, ny, nz, 3, 3)
-
-    # Masks for cells in the physical domain (inside the torus)
-    domain_mask = inside3
-
-    # --- Face diffusion tensors and masks (same structure as before) ---
-
-    # x-faces: between i and i+1, with i=0..nx-2, j=1..ny-2, k=1..nz-2
-    D_x = 0.5 * (D3[1:, 1:-1, 1:-1, :, :] + D3[:-1, 1:-1, 1:-1, :, :])
-    mask_x = domain_mask[1:, 1:-1, 1:-1] & domain_mask[:-1, 1:-1, 1:-1]
-
-    # y-faces: between j and j+1, i=1..nx-2, j=0..ny-2, k=1..nz-2
-    D_y = 0.5 * (D3[1:-1, 1:, 1:-1, :, :] + D3[1:-1, :-1, 1:-1, :, :])
-    mask_y = domain_mask[1:-1, 1:, 1:-1] & domain_mask[1:-1, :-1, 1:-1]
-
-    # z-faces: between k and k+1, i=1..nx-2, j=1..ny-2, k=0..nz-2
-    D_z = 0.5 * (D3[1:-1, 1:-1, 1:, :, :] + D3[1:-1, 1:-1, :-1, :, :])
-    mask_z = domain_mask[1:-1, 1:-1, 1:] & domain_mask[1:-1, 1:-1, :-1]
-
-    def matvec(u: np.ndarray) -> np.ndarray:
-        u3 = u.reshape(nx, ny, nz)
-        out3 = np.zeros_like(u3)
-
-        # ---------------- x-faces ----------------
-        # central differences at x-faces
-        dpsi_dx_xp = (u3[1:, 1:-1, 1:-1] - u3[:-1, 1:-1, 1:-1]) / dx
-
-        # cross derivatives: d/dy, d/dz at x-faces
-        dpsi_dy_xp = (
-            (u3[1:, 2:, 1:-1] - u3[1:, :-2, 1:-1]) +
-            (u3[:-1, 2:, 1:-1] - u3[:-1, :-2, 1:-1])
-        ) * (0.25 / dy)
-
-        dpsi_dz_xp = (
-            (u3[1:, 1:-1, 2:] - u3[1:, 1:-1, :-2]) +
-            (u3[:-1, 1:-1, 2:] - u3[:-1, 1:-1, :-2])
-        ) * (0.25 / dz)
-
-        # Only drop cross-terms that genuinely lack neighbours.
-        # For d/dy at x-face we need 4 neighbours:
-        valid_dy_x = (
-            domain_mask[1:, 2:, 1:-1] & domain_mask[1:, :-2, 1:-1] &
-            domain_mask[:-1, 2:, 1:-1] & domain_mask[:-1, :-2, 1:-1]
-        )
-        # For d/dz at x-face we need 4 neighbours:
-        valid_dz_x = (
-            domain_mask[1:, 1:-1, 2:] & domain_mask[1:, 1:-1, :-2] &
-            domain_mask[:-1, 1:-1, 2:] & domain_mask[:-1, 1:-1, :-2]
-        )
-
-        dpsi_dy_xp = np.where(valid_dy_x & mask_x, dpsi_dy_xp, 0.0)
-        dpsi_dz_xp = np.where(valid_dz_x & mask_x, dpsi_dz_xp, 0.0)
-
-        qx_xp = (
-            D_x[..., 0, 0] * dpsi_dx_xp +
-            D_x[..., 0, 1] * dpsi_dy_xp +
-            D_x[..., 0, 2] * dpsi_dz_xp
-        )
-        qx_xp *= mask_x
-
-        out3[:-1, 1:-1, 1:-1] -= qx_xp / dx
-        out3[1:, 1:-1, 1:-1]  += qx_xp / dx
-
-        # ---------------- y-faces ----------------
-        dpsi_dy_yp = (u3[1:-1, 1:, 1:-1] - u3[1:-1, :-1, 1:-1]) / dy
-
-        dpsi_dx_yp = (
-            (u3[2:, 1:, 1:-1] - u3[:-2, 1:, 1:-1]) +
-            (u3[2:, :-1, 1:-1] - u3[:-2, :-1, 1:-1])
-        ) * (0.25 / dx)
-
-        dpsi_dz_yp = (
-            (u3[1:-1, 1:, 2:] - u3[1:-1, 1:, :-2]) +
-            (u3[1:-1, :-1, 2:] - u3[1:-1, :-1, :-2])
-        ) * (0.25 / dz)
-
-        # For d/dx at y-face: need i±1 neighbours
-        valid_dx_y = (
-            domain_mask[2:, 1:, 1:-1] & domain_mask[:-2, 1:, 1:-1] &
-            domain_mask[2:, :-1, 1:-1] & domain_mask[:-2, :-1, 1:-1]
-        )
-        # For d/dz at y-face: need k±1 neighbours
-        valid_dz_y = (
-            domain_mask[1:-1, 1:, 2:] & domain_mask[1:-1, 1:, :-2] &
-            domain_mask[1:-1, :-1, 2:] & domain_mask[1:-1, :-1, :-2]
-        )
-
-        dpsi_dx_yp = np.where(valid_dx_y & mask_y, dpsi_dx_yp, 0.0)
-        dpsi_dz_yp = np.where(valid_dz_y & mask_y, dpsi_dz_yp, 0.0)
-
-        qy_yp = (
-            D_y[..., 1, 0] * dpsi_dx_yp +
-            D_y[..., 1, 1] * dpsi_dy_yp +
-            D_y[..., 1, 2] * dpsi_dz_yp
-        )
-        qy_yp *= mask_y
-
-        out3[1:-1, :-1, 1:-1] -= qy_yp / dy
-        out3[1:-1, 1:, 1:-1]  += qy_yp / dy
-
-        # ---------------- z-faces ----------------
-        dpsi_dz_zp = (u3[1:-1, 1:-1, 1:] - u3[1:-1, 1:-1, :-1]) / dz
-
-        dpsi_dx_zp = (
-            (u3[2:, 1:-1, 1:] - u3[:-2, 1:-1, 1:]) +
-            (u3[2:, 1:-1, :-1] - u3[:-2, 1:-1, :-1])
-        ) * (0.25 / dx)
-
-        dpsi_dy_zp = (
-            (u3[1:-1, 2:, 1:] - u3[1:-1, :-2, 1:]) +
-            (u3[1:-1, 2:, :-1] - u3[1:-1, :-2, :-1])
-        ) * (0.25 / dy)
-
-        # For d/dx at z-face: need i±1 neighbours
-        valid_dx_z = (
-            domain_mask[2:, 1:-1, 1:] & domain_mask[:-2, 1:-1, 1:] &
-            domain_mask[2:, 1:-1, :-1] & domain_mask[:-2, 1:-1, :-1]
-        )
-        # For d/dy at z-face: need j±1 neighbours
-        valid_dy_z = (
-            domain_mask[1:-1, 2:, 1:] & domain_mask[1:-1, :-2, 1:] &
-            domain_mask[1:-1, 2:, :-1] & domain_mask[1:-1, :-2, :-1]
-        )
-
-        dpsi_dx_zp = np.where(valid_dx_z & mask_z, dpsi_dx_zp, 0.0)
-        dpsi_dy_zp = np.where(valid_dy_z & mask_z, dpsi_dy_zp, 0.0)
-
-        qz_zp = (
-            D_z[..., 2, 0] * dpsi_dx_zp +
-            D_z[..., 2, 1] * dpsi_dy_zp +
-            D_z[..., 2, 2] * dpsi_dz_zp
-        )
-        qz_zp *= mask_z
-
-        out3[1:-1, 1:-1, :-1] -= qz_zp / dz
-        out3[1:-1, 1:-1, 1:]  += qz_zp / dz
-
-        # Enforce PDE only in the physical domain (inside the torus).
-        # Outside nodes get zero operator (no equation).
-        out3[~domain_mask] = 0.0
-
-        return out3.ravel(order="C")
-
-    N = nx * ny * nz
-    A = LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
-
-    # Deep-inside mask for the solver: all nodes in the physical domain
-    deep_inside_mask = domain_mask.ravel(order="C")
-
-    return A, deep_inside_mask
 
 def make_linear_operator_jax(
     nx: int,
@@ -1398,6 +968,90 @@ def make_linear_operator_jax(
     deep_inside_mask = np.asarray(domain_mask.ravel(order="C"))
     return A_pde_jax, deep_inside_mask
 
+def evaluate_grad_phi_on_grid(grad_phi, Xq: np.ndarray, chunk_size: int | None = None) -> np.ndarray:
+    """
+    Evaluate grad_phi(X) on a large grid Xq with *fixed-shape* chunks
+    to avoid JAX recompiling for each tail chunk.
+
+    grad_phi: JAX-jitted function mapping (N,3) -> (N,3)
+    Xq:       (N,3) numpy array
+    """
+    N = Xq.shape[0]
+    if chunk_size is None:
+        # crude auto choice: aim for ~8 chunks, clamp between 8k and 32k
+        target_chunks = 8
+        est_chunk = max(1, N // target_chunks)
+        chunk_size = int(np.clip(est_chunk, 8000, 32000))
+
+    n_chunks = int(np.ceil(N / chunk_size))
+    Npad = n_chunks * chunk_size
+
+    # pad with last point to get a multiple of chunk_size
+    Xq_pad = np.zeros((Npad, 3), dtype=Xq.dtype)
+    Xq_pad[:N] = Xq
+    Xq_pad[N:] = Xq[-1]
+
+    Xq_pad_j = jnp.asarray(Xq_pad).reshape(n_chunks, chunk_size, 3)
+
+    @jax.jit
+    def eval_chunks(X_chunks):
+        def eval_one_chunk(Xc):
+            return grad_phi(Xc)      # (chunk_size, 3)
+        return jax.vmap(eval_one_chunk, in_axes=0)(X_chunks)  # (n_chunks, chunk_size, 3)
+
+    G_pad = np.asarray(eval_chunks(Xq_pad_j)).reshape(Npad, 3)
+    return G_pad[:N]
+
+def cg_jax(
+    matvec, b, x0=None, tol=1e-8, maxiter=1000
+):
+    """
+    Simple JAX CG: solves A x = b given matvec(x) = A x.
+    matvec: callable taking (x) -> A x  (JAX)
+    b:      jnp.ndarray
+    x0:     optional initial guess (same shape as b)
+    """
+    b = jnp.asarray(b)
+    if x0 is None:
+        x = jnp.zeros_like(b)
+    else:
+        x = jnp.asarray(x0)
+
+    r = b - matvec(x)
+    p = r
+    rs_old = jnp.vdot(r, r)
+
+    def body_fun(k, state):
+        x, r, p, rs_old = state
+        Ap = matvec(p)
+        alpha = rs_old / jnp.vdot(p, Ap)
+        x_new = x + alpha * p
+        r_new = r - alpha * Ap
+        rs_new = jnp.vdot(r_new, r_new)
+        beta = rs_new / rs_old
+        p_new = r_new + beta * p
+        return (x_new, r_new, p_new, rs_new)
+
+    def cond_fun(val):
+        k, state = val
+        _, r, _, rs_old = state
+        return jnp.logical_and(
+            k < maxiter,
+            jnp.sqrt(rs_old) > tol
+        )
+
+    def loop_fun(val):
+        k, state = val
+        new_state = body_fun(k, state)
+        return (k + 1, new_state)
+
+    init_state = (x, r, p, rs_old)
+    k0 = jnp.array(0, dtype=jnp.int32)
+    _, (x_final, r_final, _, rs_final) = jax.lax.while_loop(
+        cond_fun, loop_fun, (k0, init_state)
+    )
+    return x_final, jnp.sqrt(rs_final)
+
 
 ###############################################################################
 # Main solver routine
@@ -1407,7 +1061,8 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
               cg_tol: float = 1e-8, cg_maxit: int = 2000,
               verbose: bool = True, plot: bool = False, nfp: int = 2,
               delta: float = 5e-3, save_figures: bool = True,
-              use_fci: bool = True, fci_nsteps: int = 16) -> Dict[str, Any]:
+              use_fci: bool = True, fci_nsteps: int = 16,
+              fci_planes_per_field_period = 16, psi_power_for_plot=2) -> Dict[str, Any]:
     
     time_start_solve_fci = time.time()
     
@@ -1442,6 +1097,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
                           ZZ.ravel(order="C")])
     if verbose:
         pinfo(f"Grid size: {nx}x{ny}x{nz} = {Xq.shape[0]} nodes.  Spacing dx≈{dx:.3g}, dy≈{dy:.3g}, dz≈{dz:.3g}")
+        pinfo(f"Grid bounds x=[{xs[0]:.3g}, {xs[-1]:.3g}], y=[{ys[0]:.3g}, {ys[-1]:.3g}], z=[{zs[0]:.3g}, {zs[-1]:.3g}]")
     voxel = min(dx, dy, dz)
 
     c = np.mean(P, axis=0)
@@ -1461,42 +1117,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     if not np.any(inside_mask):
         raise RuntimeError("Inside mask is empty; check surface normals or grid bounds.")
-
-    x0 = Xq[inside_mask][0]
-
-    # Direction sign heuristic (still degenerate but harmless; keeps +1)
-    def decide_sign(x_init: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray ]:
-        x = jnp.asarray(x_init, dtype=jnp.float64)
-        def advance(xstart: jnp.ndarray, sgn: float, K: int = 8, step: float = 1e-2) -> jnp.ndarray:
-            xs = xstart
-            g = grad_phi(xs[None, :])[0]
-            nrm = jnp.linalg.norm(g) + 1e-30
-            g_unit = g / nrm
-            for _ in range(K):
-                xs = xs + sgn * step * g_unit
-                g = grad_phi(xs[None, :])[0]
-                nrm = jnp.linalg.norm(g) + 1e-30
-                g_unit = g / nrm
-            return xs
-        xp = advance(x, +1.0)
-        xm = advance(x, -1.0)
-        return xp, xm
-
-    xp, xm = decide_sign(x0)
-    d_plus = float(np.linalg.norm(xp - x0))
-    d_minus = float(np.linalg.norm(xm - x0))
-    if abs(d_plus - d_minus) <= 5e-5 * max(d_plus, d_minus):
-        dir_sign = +1.0
-    else:
-        dir_sign = +1.0 if d_plus > d_minus else -1.0
-    if verbose:
-        pinfo(f"Toroidal direction sign chosen as {dir_sign:+.0f} (d+= {d_plus:.3e}, d-= {d_minus:.3e})")
-
-    a_flipped = np.array([float(dir_sign) * float(a[0]), float(a[1])], dtype=float)
-    evals = Evaluators(center=jnp.asarray(center), scale=scale,
-                       Yn=jnp.asarray(Yn), alpha=jnp.asarray(alpha),
-                       a=jnp.asarray(a_flipped), a_hat=jnp.asarray(a_hat))
-    grad_phi = evals.build()
 
     phi_tol = 0.2
     phiq = np.arctan2(Xq[:, 1], Xq[:, 0])
@@ -1635,38 +1255,33 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         print(f"[INFO] axis band radius     ≈ {axis_band_radius_eff:.3e}")
 
     if verbose:
-        pinfo("Evaluating ∇φ on grid ...")
+        pinfo("Evaluating ∇φ on grid (inside nodes only) ...")
+
+    time0_grad = time.time()
+    # Only evaluate at interior nodes
+    X_inside = Xq[inside_mask]
+    X_inside_j = jnp.asarray(X_inside, dtype=jnp.float64)
+    G_inside = np.asarray(grad_phi(X_inside_j))     # (N_inside, 3)
+    # Scatter back into a full-sized array (zero outside)
     G = np.zeros_like(Xq)
-    chunk = 20000
-    for start in range(0, Xq.shape[0], chunk):
-        Xc = jnp.asarray(Xq[start:start + chunk])
-        Gi = np.asarray(grad_phi(Xc))
-        bad = ~np.isfinite(Gi).all(axis=1)
-        if np.any(bad):
-            Gi[bad] = 0.0
-        G[start:start + chunk] = Gi
-        
+    G[inside_mask] = G_inside
+    # Clean up any non-finite values inside
+    bad_inside = ~np.isfinite(G_inside).all(axis=1)
+    if np.any(bad_inside):
+        G_inside[bad_inside] = 0.0
+        G[inside_mask] = G_inside
     if verbose:
-        gnorm = np.linalg.norm(G, axis=1)
-        pstat("|∇φ| (all nodes)", gnorm)
-        pstat("|∇φ| (inside)", gnorm[inside_mask])
-        n_bad = np.count_nonzero(~np.isfinite(G).all(axis=1))
-        print(f"[INFO] grad_phi non-finite points: {n_bad} / {G.shape[0]}")
+        pinfo(f"Direct JAX evaluation for ∇φ on inside nodes took {(time.time() - time0_grad):.2f} s.")
+        gnorm_inside = np.linalg.norm(G_inside, axis=1)
+        pstat("|∇φ| (inside)", gnorm_inside)
+        n_bad = np.count_nonzero(~np.isfinite(G_inside).all(axis=1))
+        print(f"[INFO] grad_phi non-finite points (inside only): {n_bad} / {G_inside.shape[0]}")
+
 
     if use_fci:
-        # --- FCI geometry precompute ---
         if verbose:
             pinfo("Building FCI connectivity (field-line mapping) ...")
-        time_start_fci = time.time()
-        # fci = build_fci_connectivity(
-        #     xs, ys, zs,
-        #     inside_mask,
-        #     grad_phi_fn=grad_phi,
-        #     nfp=nfp,
-        #     dphi_per_step=None,
-        #     nsteps=fci_nsteps,
-        #     verbose=verbose,
-        # )
+
         fci = build_fci_connectivity_chunked(
             xs, ys, zs,
             inside_mask,
@@ -1675,49 +1290,58 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             dphi_per_step=None,
             nsteps=fci_nsteps,
             verbose=verbose,
-            chunk_size=1024,  # tweak as you like
+            chunk_size=None,
+            fci_planes_per_field_period=fci_planes_per_field_period,
         )
         if verbose:
-            print(f"  ... done in {(time.time() - time_start_fci):.2f} s.")
             pinfo(f"FCI connectivity: valid nodes = {fci.valid.sum()} / {inside_mask.sum()}")
 
-        # Choose anisotropy via κ⊥/κ∥ ratio (eps).
-        kappa_par = 1.0
-        kappa_perp = eps  # same eps meaning as before
+        if verbose and fci.valid.sum() == 0:
+            pinfo("[WARN] FCI connectivity has zero valid nodes; parallel operator is effectively disabled.")
 
-        A_pde, deep_inside = make_fci_operator(
+        kappa_par = 1.0
+        kappa_perp = eps**2
+        
+        inside3 = inside_mask.reshape(nx, ny, nz)
+        band3 = band.reshape(nx, ny, nz)
+        axis3 = axis_band.reshape(nx, ny, nz)
+        # core = at least 1 cell away from the domain boundary AND not in bands
+        core3 = np.zeros_like(inside3, dtype=bool)
+        core3[1:-1, 1:-1, 1:-1] = True
+        core3 &= inside3
+        core3 &= ~band3
+        core3 &= ~axis3
+        core_flat = core3.ravel(order="C")
+        if verbose and core_flat.sum() < 10:
+            pinfo(f"[WARN] FCI core region has only {core_flat.sum()} nodes; parallel operator is almost inactive.")
+
+        A_pde_jax, deep_inside = make_fci_operator_jax(
             nx, ny, nz,
             xs, ys, zs,
             inside_mask,
             fci,
+            core_mask=core_flat,
             kappa_par=kappa_par,
             kappa_perp=kappa_perp,
         )
-    # else:
-    #     if verbose:
-    #         pinfo("Building Cartesian anisotropic tensor operator (no FCI) ...")
-    #     D = diffusion_tensor(G, eps=eps, delta=delta)
-    #     A_pde, deep_inside = make_linear_operator(
-    #         nx, ny, nz, dx, dy, dz,
-    #         inside_mask, D
-    #     )
+
     else:
         if verbose:
             pinfo("Building Cartesian anisotropic tensor operator (no FCI, JAX) ...")
-        # D = diffusion_tensor(G, eps=eps, delta=delta)      # still numpy
         D = diffusion_tensor_jax(G, eps=eps, delta=delta)  # now jax
         A_pde_jax, deep_inside = make_linear_operator_jax(
             nx, ny, nz, dx, dy, dz,
             inside_mask, D
         )
-        # Wrap JAX operator in a scipy LinearOperator for current CG usage:
-        def matvec_np(u_np: np.ndarray) -> np.ndarray:
-            u_j = jnp.asarray(u_np)
-            out_j = A_pde_jax(u_j)
-            return np.asarray(out_j)
-        N = nx*ny*nz
-        A_pde = LinearOperator((N, N), matvec=matvec_np, rmatvec=matvec_np, dtype=float)
 
+    # Wrap common JAX matvec in a SciPy LinearOperator for CG
+    def matvec_np(u_np: np.ndarray) -> np.ndarray:
+        u_j = jnp.asarray(u_np)
+        out_j = A_pde_jax(u_j)
+        return np.asarray(out_j)
+
+    N = nx * ny * nz
+    A_pde = LinearOperator((N, N), matvec=matvec_np, rmatvec=matvec_np, dtype=float)
 
     free = deep_inside & (~fixed)
     if not np.any(free):
@@ -1732,25 +1356,40 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
 
     Nfree = int(free.sum())
 
-    def matvec_free(u_free: np.ndarray) -> np.ndarray:
-        u_full = np.zeros(Ntot, dtype=float)
-        u_full[free] = u_free
-        Au_full = A_pde @ u_full
+    # ## Using scipy CG with LinearOperator wrapper around JAX matvec
+    # def matvec_free(u_free: np.ndarray) -> np.ndarray:
+    #     u_full = np.zeros(Ntot, dtype=float)
+    #     u_full[free] = u_free
+    #     Au_full = A_pde @ u_full
+    #     return Au_full[free]
+    # A_eff = LinearOperator(
+    #     (Nfree, Nfree),
+    #     matvec=matvec_free,
+    #     rmatvec=matvec_free,
+    #     dtype=float
+    # )
+    # if verbose:
+    #     pinfo("Solving linear system (CG) ...")
+    # # start with zeros
+    # psi_free, info = cg(A_eff, b_free, rtol=cg_tol, maxiter=cg_maxit)
+    # if verbose:
+    #     pinfo(f"CG solve completed with {info} info.")
+    # if info != 0 and verbose:
+    #     pinfo(f"[WARN] CG returned info={info} (0 means full convergence).")
+    ## Using JAX CG directly
+    def matvec_free_jax(u_free_j):
+        # u_free_j: jnp array
+        u_full = jnp.zeros(Ntot)
+        u_full = u_full.at[free].set(u_free_j)
+        Au_full = A_pde_jax(u_full)
         return Au_full[free]
-
-    A_eff = LinearOperator(
-        (Nfree, Nfree),
-        matvec=matvec_free,
-        rmatvec=matvec_free,
-        dtype=float
-    )
-
     if verbose:
-        pinfo("Solving linear system (CG) ...")
-    # start with zeros
-    psi_free, info = cg(A_eff, b_free, rtol=cg_tol, maxiter=cg_maxit)
-    if info != 0 and verbose:
-        pinfo(f"[WARN] CG returned info={info} (0 means full convergence).")
+        pinfo("Solving linear system (JAX CG) ...")
+    b_free_j = jnp.asarray(b_free)
+    psi_free_j, res_norm = cg_jax(matvec_free_jax, b_free_j, tol=cg_tol, maxiter=cg_maxit)
+    psi_free = np.asarray(psi_free_j)
+    if verbose:
+        pinfo(f"JAX CG solve completed with final residual norm {res_norm:.3e}.")
 
     psi = np.array(psi_fixed_full)
     psi[free] = psi_free
@@ -1769,9 +1408,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
         free_inside = inside_mask & (~fixed)
         if np.any(free_inside):
             pstat("ψ on free interior", psi[free_inside])
-        pstat("Full residual", r_full)
+        r_free = r_full[free]
+        pstat("Residual on free nodes", r_free)
         # We don't have a nonzero RHS on free nodes anymore; measure absolute residual
-        print(f"||r||_2 over free nodes = {np.linalg.norm(r_full[free]):.3e}")
+        pstat(f"||r||_2 over free nodes", np.linalg.norm(r_full[free]))
 
     psi3 = psi.reshape(nx, ny, nz)
 
@@ -1809,7 +1449,6 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             f"p50={p[4]:.3e} p95={p[6]:.3e} p99={p[7]:.3e} max={p[8]:.3e}"
         )
     
-    psi3 = psi.reshape(nx, ny, nz)
     inside3 = inside_mask.reshape(nx, ny, nz)
 
     print(f"Solved FCI ψ in {(time.time() - time_start_solve_fci):.2f} s.")
@@ -1851,7 +1490,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             Z_axis   = axis_pts[:, 2]
 
             jj_list = np.linspace(0, int((len(phis_cyl) - 1)/nfp), 4, dtype=int, endpoint=False)
-            power = 2
+            power = psi_power_for_plot
             figRZ = plot_psi_maps_RZ_panels(
                 jnp.pow(psi_RZphi, power), Rs_cyl, phis_cyl, Zs_cyl, jj_list,
                 Rb=Rb, Zb=Zb, phi_b=phi_b,
@@ -1873,7 +1512,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, eps: float = 1e-3, band_h: float 
             X_bnd = np.column_stack([xs[P_bnd_grid[:,0]],
                                      ys[P_bnd_grid[:,1]],
                                      zs[P_bnd_grid[:,2]]])
-            fig3d = plot_3d_axis_boundary_interp(X_bnd, axis_pts, psi3, xs, ys, zs, voxel, Nsurf)
+            fig3d = plot_3d_axis_boundary_interp(X_bnd, axis_pts, psi3, xs, ys, zs)
             if save_figures:
                 fig3d.savefig("fci_psi_3d_axis_boundary.png")
         except Exception as e:
@@ -1927,24 +1566,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
-    parser.add_argument("--eps", type=float, default=1e-3, help="Perpendicular diffusion weight")
-    parser.add_argument("--delta", type=float, default=1e-4, help="Isotropic diffusion floor")
-    parser.add_argument("--band-h", type=float, default=2.0, help="Boundary band thickness multiplier")
-    parser.add_argument("--cg-tol", type=float, default=1e-8, help="CG tolerance (default: 1e-8)")
-    parser.add_argument("--cg-maxit", type=int, default=2000, help="CG maximum iterations (default: 2000)")
+    parser.add_argument("--N", type=int, default=152, help="Grid resolution per axis")
+    parser.add_argument("--eps", type=float, default=1e-2, help="Perpendicular diffusion weight")
+    parser.add_argument("--delta", type=float, default=0, help="Isotropic diffusion floor")
+    parser.add_argument("--band-h", type=float, default=2.5, help="Boundary band thickness multiplier")
+    parser.add_argument("--cg-tol", type=float, default=1e-11, help="CG tolerance (default: 1e-8)")
+    parser.add_argument("--cg-maxit", type=int, default=4000, help="CG maximum iterations (default: 2000)")
     parser.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods (default: 2)")
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
-    parser.add_argument("--save-figures", action="store_true", default=True, help="Save diagnostic figures to disk.")
+    parser.add_argument("--no-save-figures", action="store_true", help="Do NOT save diagnostic figures to disk.")
     parser.add_argument("--no-fci", action="store_true", help="Disable FCI and use tensor Laplacian only.")
-    parser.add_argument("--fci-nsteps", type=int, default=16, help="Number of RK2 steps per FCI Δφ trace (default: 16).")
+    parser.add_argument("--fci-nsteps", type=int, default=18, help="Number of RK2 steps per FCI Δφ trace.")
+    parser.add_argument("--fci-planes-per-field-period", type=int, default=2, help="Number of FCI planes per field period")
+    parser.add_argument("--psi-power-for-plot", type=int, default=1, help="Power of psi when plotting RZ panels")
     args = parser.parse_args()
-
+    
     res = solve_fci(
         args.npz, grid_N=args.N, eps=args.eps, band_h=args.band_h,
         cg_tol=args.cg_tol, cg_maxit=args.cg_maxit, verbose=True, plot=(not args.no_plot),
-        nfp=args.nfp, delta=args.delta, save_figures=args.save_figures,
+        nfp=args.nfp, delta=args.delta, save_figures=not args.no_save_figures,
         use_fci=not args.no_fci, fci_nsteps=args.fci_nsteps,
+        fci_planes_per_field_period=args.fci_planes_per_field_period,
+        psi_power_for_plot=args.psi_power_for_plot
     )
 
     psi_all = res['psi']
