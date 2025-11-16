@@ -1566,7 +1566,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=152, help="Grid resolution per axis")
+    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
     parser.add_argument("--eps", type=float, default=1e-2, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=0, help="Isotropic diffusion floor")
     parser.add_argument("--band-h", type=float, default=2.5, help="Boundary band thickness multiplier")

@@ -1,402 +1,371 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Toy pseudo-spectral MHD in cylindrical coordinates (R, theta, z)
-================================================================
+Incompressible pseudo-spectral MHD in a periodic box
+====================================================
 
-- Incompressible-ish resistive MHD with constant density rho=1.
-- Geometry: cylindrical shell R ∈ [R_in, R_out],
-             theta ∈ [0, 2π) (periodic),
-             z ∈ [0, Lz) (periodic).
+- 3D periodic box (x,y,z) ∈ [0,Lx]×[0,Ly]×[0,Lz].
+- Incompressible MHD:
+    ∂v/∂t = -(v·∇)v + (B·∇)B - ∇p + ν ∇²v
+    ∂B/∂t = (B·∇)v - (v·∇)B + η ∇²B
+  with ∇·v = 0, ∇·B ≈ 0 (spectral projection).
 
-- Fields in cylindrical components:
-    v = (v_R, v_theta, v_z)
-    B = (B_R, B_theta, B_z)
-
-- Derivatives:
-    * Spectral (FFT) in theta, z.
-    * 2nd-order finite differences in R.
-    * Divergence, curl, and vector Laplacian use cylindrical formulas.
-
-- Equations (dimensionless, mu0 = rho = 1):
-    dv/dt = -(v·∇)v + (∇×B)×B + nu ∇²v
-    dB/dt = ∇×(v×B) + eta ∇²B
-
-  (No explicit pressure term; flow is "weakly compressible".)
+- Numerical method:
+    * Fourier pseudo-spectral in all directions
+    * 2/3 de-aliasing rule
+    * Projection in k-space to enforce incompressibility
+    * JAX + Diffrax time stepping
 
 - Diagnostics:
-    * E_kin(t) = 0.5 ∫ |v|^2 dV
-    * E_mag(t) = 0.5 ∫ |B|^2 dV
-    * E_tot(t) = E_kin + E_mag
-      with cylindrical volume element dV = R dR dtheta dz.
+    * E_kin(t), E_mag(t), E_tot(t)
+    * Dissipation rates eps_visc(t), eps_ohm(t)
+    * "Conserved" total:
+          E_cons(t) = E_tot(t) + ∫ (eps_visc+eps_ohm) dt
+      which should be ~constant if everything is consistent.
 
-    * Divergence of B measured with cylindrical formula:
-        divB = (1/R) ∂(R B_R)/∂R + (1/R) ∂B_theta/∂theta + ∂B_z/∂z
-
-The script produces mhd_diagnostics_cylindrical.png with:
-  - Left: E_kin, E_mag, E_tot vs time
-  - Right: ||divB||_2 and ||divB||_∞ vs time
-
-This is a **toy code**, not a production-quality tokamak/stellarator solver,
-but it puts the previous box MHD into (R, theta, z) geometry with proper
-cylindrical operators and pseudo-spectral treatment in the periodic directions.
+This is a good baseline to:
+    - test MHD stability of given equilibria,
+    - see growth/decay of perturbations,
+    - later plug in local Miller geometry / flux-tube approximations.
 """
 
 from __future__ import annotations
 
 import math
-import functools
-from dataclasses import dataclass
-
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from jax import jit, vmap
 
 import diffrax as dfx
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# ---------------------------- Grid & spectral tools ---------------------------- #
 
-# ---------------------------- Utility functions ---------------------------- #
+def make_grid(Nx, Ny, Nz, Lx, Ly, Lz):
+    x = jnp.linspace(0.0, Lx, Nx, endpoint=False)
+    y = jnp.linspace(0.0, Ly, Ny, endpoint=False)
+    z = jnp.linspace(0.0, Lz, Nz, endpoint=False)
+    X, Y, Z = jnp.meshgrid(x, y, z, indexing="ij")
+    return X, Y, Z
 
-def make_kvec(N: int, L: float) -> jnp.ndarray:
-    """
-    Spectral wavenumbers for periodic domain of length L with N points.
-    """
-    return 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=L / N)
+def make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz):
+    # Integer mode indices
+    nx = jnp.fft.fftfreq(Nx) * Nx
+    ny = jnp.fft.fftfreq(Ny) * Ny
+    nz = jnp.fft.fftfreq(Nz) * Nz
+    NX, NY, NZ = jnp.meshgrid(nx, ny, nz, indexing="ij")
 
+    # Physical wavenumbers (2π/L factor)
+    kx = 2.0 * jnp.pi * NX / Lx
+    ky = 2.0 * jnp.pi * NY / Ly
+    kz = 2.0 * jnp.pi * NZ / Lz
 
-def spectral_deriv_theta(f, k_theta):
-    """∂f/∂theta using FFT along axis=1."""
-    f_hat = jnp.fft.fft(f, axis=1)
-    d_hat = f_hat * (1j * k_theta)[None, :, None]
-    df = jnp.fft.ifft(d_hat, axis=1).real
-    return df
+    k2 = kx**2 + ky**2 + kz**2
+    k2 = jnp.where(k2 == 0.0, 1.0, k2)  # avoid divide-by-zero at k=0 mode
+    return kx, ky, kz, k2, NX, NY, NZ
 
-
-def spectral_deriv_z(f, k_z):
-    """∂f/∂z using FFT along axis=2."""
-    f_hat = jnp.fft.fft(f, axis=2)
-    d_hat = f_hat * (1j * k_z)[None, None, :]
-    df = jnp.fft.ifft(d_hat, axis=2).real
-    return df
-
-
-def spectral_d2_theta(f, k_theta):
-    """∂²f/∂theta² via FFT."""
-    f_hat = jnp.fft.fft(f, axis=1)
-    d2_hat = f_hat * (-(k_theta**2))[None, :, None]
-    d2f = jnp.fft.ifft(d2_hat, axis=1).real
-    return d2f
-
-
-def spectral_d2_z(f, k_z):
-    """∂²f/∂z² via FFT."""
-    f_hat = jnp.fft.fft(f, axis=2)
-    d2_hat = f_hat * (-(k_z**2))[None, None, :]
-    d2f = jnp.fft.ifft(d2_hat, axis=2).real
-    return d2f
-
-
-def deriv_R(f, dR):
-    """
-    ∂f/∂R with 2nd-order finite differences in R (axis=0).
-    One-sided 2nd-order at boundaries.
-    """
-    # central differences for interior
-    df = (jnp.roll(f, -1, axis=0) - jnp.roll(f, 1, axis=0)) / (2.0 * dR)
-    # one-sided at boundaries
-    df = df.at[0].set((-3.0 * f[0] + 4.0 * f[1] - f[2]) / (2.0 * dR))
-    df = df.at[-1].set((3.0 * f[-1] - 4.0 * f[-2] + f[-3]) / (2.0 * dR))
-    return df
-
-
-def scalar_laplacian_cyl(f, R, dR, k_theta, k_z):
-    """
-    Scalar Laplacian in cylindrical coordinates for a scalar f(R, theta, z):
-
-      ∇² f = (1/R) ∂/∂R (R ∂f/∂R)
-             + (1/R²) ∂²f/∂theta²
-             + ∂²f/∂z²
-    """
-    R3 = R[:, None, None]
-
-    df_dR = deriv_R(f, dR)
-    term_R = deriv_R(R3 * df_dR, dR) / R3
-    term_theta = spectral_d2_theta(f, k_theta)[...] / (R3**2)
-    term_z = spectral_d2_z(f, k_z)
-    return term_R + term_theta + term_z
-
-
-def vector_laplacian_cyl(v, R, dR, k_theta, k_z):
-    """
-    Vector Laplacian in cylindrical coordinates using the decomposition
-    from e.g. Wikipedia:
-
-      (∇²A)_R     = ∇²A_R     - A_R/R² - (2/R²) ∂A_θ/∂θ
-      (∇²A)_θ     = ∇²A_θ     - A_θ/R² + (2/R²) ∂A_R/∂θ
-      (∇²A)_z     = ∇²A_z
-
-    where ∇² is the scalar Laplacian above.
-    """
-    R3 = R[:, None, None]
-
-    A_R, A_th, A_z = v[..., 0], v[..., 1], v[..., 2]
-
-    lap_AR = scalar_laplacian_cyl(A_R, R, dR, k_theta, k_z)
-    lap_Ath = scalar_laplacian_cyl(A_th, R, dR, k_theta, k_z)
-    lap_Az = scalar_laplacian_cyl(A_z, R, dR, k_theta, k_z)
-
-    dAth_dtheta = spectral_deriv_theta(A_th, k_theta)
-    dAR_dtheta = spectral_deriv_theta(A_R, k_theta)
-
-    lap_R = lap_AR - A_R / (R3**2) - 2.0 * dAth_dtheta / (R3**2)
-    lap_th = lap_Ath - A_th / (R3**2) + 2.0 * dAR_dtheta / (R3**2)
-    lap_z = lap_Az
-
-    return jnp.stack([lap_R, lap_th, lap_z], axis=-1)
-
-
-def divergence_cyl(B, R, dR, k_theta, k_z):
-    """
-    Divergence in cylindrical coordinates:
-
-      ∇·B = 1/R ∂(R B_R)/∂R + 1/R ∂B_θ/∂θ + ∂B_z/∂z
-    """
-    R3 = R[:, None, None]
-    BR, Bth, Bz = B[..., 0], B[..., 1], B[..., 2]
-
-    term_R = deriv_R(R3 * BR, dR) / R3
-    term_th = spectral_deriv_theta(Bth, k_theta) / R3
-    term_z = spectral_deriv_z(Bz, k_z)
-    return term_R + term_th + term_z
-
-
-def curl_cyl(A, R, dR, k_theta, k_z):
-    """
-    Curl in cylindrical coordinates:
-
-      (∇×A)_R     = (1/R) ∂A_z/∂θ - ∂A_θ/∂z
-      (∇×A)_θ     = ∂A_R/∂z - ∂A_z/∂R
-      (∇×A)_z     = (1/R) ∂(R A_θ)/∂R - (1/R) ∂A_R/∂θ
-    """
-    R3 = R[:, None, None]
-    A_R, A_th, A_z = A[..., 0], A[..., 1], A[..., 2]
-
-    dAz_dtheta = spectral_deriv_theta(A_z, k_theta)
-    dAth_dz = spectral_deriv_z(A_th, k_z)
-
-    dAR_dz = spectral_deriv_z(A_R, k_z)
-    dAz_dR = deriv_R(A_z, dR)
-
-    dR_Ath_dR = deriv_R(R3 * A_th, dR)
-    dAR_dtheta = spectral_deriv_theta(A_R, k_theta)
-
-    curl_R = dAz_dtheta / R3 - dAth_dz
-    curl_th = dAR_dz - dAz_dR
-    curl_z = dR_Ath_dR / R3 - dAR_dtheta / R3
-
-    return jnp.stack([curl_R, curl_th, curl_z], axis=-1)
-
-
-def directional_derivative_cyl(A, B, R, dR, k_theta, k_z):
-    """
-    Cylindrical directional derivative (A·∇)B using the formula for
-    the "Directional derivative" in cylindrical coordinates:
-
-      (A·∇B)_R   = A_R ∂B_R/∂R + (A_θ/R) ∂B_R/∂θ + A_z ∂B_R/∂z - (A_θ B_θ)/R
-      (A·∇B)_θ   = A_R ∂B_θ/∂R + (A_θ/R) ∂B_θ/∂θ + A_z ∂B_θ/∂z + (A_θ B_R)/R
-      (A·∇B)_z   = A_R ∂B_z/∂R + (A_θ/R) ∂B_z/∂θ + A_z ∂B_z/∂z
-
-    (See "Del in cylindrical and spherical coordinates", Wikipedia.)
-    """
-    R3 = R[:, None, None]
-
-    A_R, A_th, A_z = A[..., 0], A[..., 1], A[..., 2]
-    B_R, B_th, B_z = B[..., 0], B[..., 1], B[..., 2]
-
-    dBR_dR = deriv_R(B_R, dR)
-    dBR_dtheta = spectral_deriv_theta(B_R, k_theta)
-    dBR_dz = spectral_deriv_z(B_R, k_z)
-
-    dBth_dR = deriv_R(B_th, dR)
-    dBth_dtheta = spectral_deriv_theta(B_th, k_theta)
-    dBth_dz = spectral_deriv_z(B_th, k_z)
-
-    dBz_dR = deriv_R(B_z, dR)
-    dBz_dtheta = spectral_deriv_theta(B_z, k_theta)
-    dBz_dz = spectral_deriv_z(B_z, k_z)
-
-    adv_R = (
-        A_R * dBR_dR
-        + (A_th / R3) * dBR_dtheta
-        + A_z * dBR_dz
-        - (A_th * B_th) / R3
+def make_dealias_mask(Nx, Ny, Nz, NX, NY, NZ):
+    # 2/3 rule: keep modes with |n| <= N/3 in each direction
+    kx_cut = Nx // 3
+    ky_cut = Ny // 3
+    kz_cut = Nz // 3
+    mask = (
+        (jnp.abs(NX) <= kx_cut) &
+        (jnp.abs(NY) <= ky_cut) &
+        (jnp.abs(NZ) <= kz_cut)
     )
+    return mask.astype(jnp.float64)  # multiplies Fourier fields
 
-    adv_th = (
-        A_R * dBth_dR
-        + (A_th / R3) * dBth_dtheta
-        + A_z * dBth_dz
-        + (A_th * B_R) / R3
-    )
+# ----------------------------- Projection operator ----------------------------- #
 
-    adv_z = (
-        A_R * dBz_dR
-        + (A_th / R3) * dBz_dtheta
-        + A_z * dBz_dz
-    )
+def project_div_free(v_hat, kx, ky, kz, k2):
+    """
+    Project a vector field in Fourier space onto divergence-free subspace:
+      v_hat -> (I - k k^T / k^2) v_hat
+    v_hat shape: (3, Nx, Ny, Nz)
+    """
+    vx_hat, vy_hat, vz_hat = v_hat[0], v_hat[1], v_hat[2]
+    k_dot_v = kx * vx_hat + ky * vy_hat + kz * vz_hat
+    factor = k_dot_v / k2
 
-    return jnp.stack([adv_R, adv_th, adv_z], axis=-1)
+    vx_hat_proj = vx_hat - factor * kx
+    vy_hat_proj = vy_hat - factor * ky
+    vz_hat_proj = vz_hat - factor * kz
+    return jnp.stack([vx_hat_proj, vy_hat_proj, vz_hat_proj], axis=0)
+
+# -------------------------- Gradient & directional derivatives ----------------- #
+
+def grad_from_hat(f_hat, kx, ky, kz):
+    """
+    Gradient of scalar field whose Fourier transform is f_hat.
+    Returns real-space arrays (df/dx, df/dy, df/dz).
+    """
+    df_dx_hat = 1j * kx * f_hat
+    df_dy_hat = 1j * ky * f_hat
+    df_dz_hat = 1j * kz * f_hat
+    df_dx = jnp.fft.ifftn(df_dx_hat, axes=(0,1,2)).real
+    df_dy = jnp.fft.ifftn(df_dy_hat, axes=(0,1,2)).real
+    df_dz = jnp.fft.ifftn(df_dz_hat, axes=(0,1,2)).real
+    return df_dx, df_dy, df_dz
+
+def directional_derivative(v, grad_fx, grad_fy, grad_fz):
+    """
+    v · ∇f for scalar f.
+    v shape: (3, Nx, Ny, Nz)
+    grad_f* shapes: (Nx, Ny, Nz)
+    """
+    vx, vy, vz = v[0], v[1], v[2]
+    return vx * grad_fx + vy * grad_fy + vz * grad_fz
+
+def directional_derivative_vec(A, grad_Bx, grad_By, grad_Bz):
+    """
+    (A·∇)B where A = (Ax,Ay,Az), B has components Bx,By,Bz.
+    grad_Bx etc: tuples (dBx/dx, dBx/dy, dBx/dz), etc.
+    Returns vector field with shape (3, Nx, Ny, Nz).
+    """
+    Ax, Ay, Az = A[0], A[1], A[2]
+
+    dBx_dx, dBx_dy, dBx_dz = grad_Bx
+    dBy_dx, dBy_dy, dBy_dz = grad_By
+    dBz_dx, dBz_dy, dBz_dz = grad_Bz
+
+    adv_x = Ax * dBx_dx + Ay * dBx_dy + Az * dBx_dz
+    adv_y = Ax * dBy_dx + Ay * dBy_dy + Az * dBy_dz
+    adv_z = Ax * dBz_dx + Ay * dBz_dy + Az * dBz_dz
+
+    return jnp.stack([adv_x, adv_y, adv_z], axis=0)
+
+# --------------------------- Initial equilibrium & perturbation ---------------- #
+
+def init_equilibrium(Nx, Ny, Nz, Lx, Ly, Lz):
+    """
+    Define initial v(x,y,z) and B(x,y,z) in real space.
+
+    Here:
+      - Background field B0 = (0, 0, B0)
+      - Small helical perturbation in B and v to seed dynamics
+
+    You can replace this with:
+      - slab tearing equilibrium,
+      - local Miller geometry, etc.
+    """
+    X, Y, Z = make_grid(Nx, Ny, Nz, Lx, Ly, Lz)
+
+    B0 = 1.0
+
+    # Background uniform field along z
+    Bx0 = jnp.zeros_like(X)
+    By0 = jnp.zeros_like(X)
+    Bz0 = B0 * jnp.ones_like(X)
+
+    # Add small helical perturbation
+    m, n = 1, 1
+    eps_B = 0.05
+    phase = m * Y / Ly * 2*jnp.pi + n * Z / Lz * 2*jnp.pi
+    Bx0 = Bx0 + eps_B * jnp.sin(phase)
+    By0 = By0 + eps_B * jnp.cos(phase)
+
+    B0_real = jnp.stack([Bx0, By0, Bz0], axis=0)
+
+    # Small incompressible-like velocity perturbation
+    eps_v = 0.05
+    vx0 = eps_v * jnp.cos(phase)
+    vy0 = eps_v * jnp.sin(phase)
+    vz0 = eps_v * jnp.cos(2*phase)
+
+    v0_real = jnp.stack([vx0, vy0, vz0], axis=0)
+    return v0_real, B0_real
+
+# --------------------------------- RHS builder -------------------------------- #
+
+def make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias):
+
+    def rhs(t, y_hat, args_unused):
+        """
+        y_hat: (v_hat, B_hat)
+          v_hat, B_hat have shape (3, Nx, Ny, Nz), complex
+        """
+        v_hat, B_hat = y_hat
+
+        # Dealias: always keep fields within 2/3 rule
+        v_hat = v_hat * mask_dealias
+        B_hat = B_hat * mask_dealias
+
+        # Enforce incompressibility on v (and also clean B a bit)
+        v_hat = project_div_free(v_hat, kx, ky, kz, k2)
+        B_hat = project_div_free(B_hat, kx, ky, kz, k2)
+
+        # Real-space fields
+        v = jnp.fft.ifftn(v_hat, axes=(1,2,3)).real
+        B = jnp.fft.ifftn(B_hat, axes=(1,2,3)).real
+
+        # Gradients of v and B components (via spectral derivatives)
+        vx_hat, vy_hat, vz_hat = v_hat[0], v_hat[1], v_hat[2]
+        Bx_hat, By_hat, Bz_hat = B_hat[0], B_hat[1], B_hat[2]
+
+        dvx_dx, dvx_dy, dvx_dz = grad_from_hat(vx_hat, kx, ky, kz)
+        dvy_dx, dvy_dy, dvy_dz = grad_from_hat(vy_hat, kx, ky, kz)
+        dvz_dx, dvz_dy, dvz_dz = grad_from_hat(vz_hat, kx, ky, kz)
+
+        dBx_dx, dBx_dy, dBx_dz = grad_from_hat(Bx_hat, kx, ky, kz)
+        dBy_dx, dBy_dy, dBy_dz = grad_from_hat(By_hat, kx, ky, kz)
+        dBz_dx, dBz_dy, dBz_dz = grad_from_hat(Bz_hat, kx, ky, kz)
+
+        grad_vx = (dvx_dx, dvx_dy, dvx_dz)
+        grad_vy = (dvy_dx, dvy_dy, dvy_dz)
+        grad_vz = (dvz_dx, dvz_dy, dvz_dz)
+
+        grad_Bx = (dBx_dx, dBx_dy, dBx_dz)
+        grad_By = (dBy_dx, dBy_dy, dBy_dz)
+        grad_Bz = (dBz_dx, dBz_dy, dBz_dz)
+
+        # (v·∇)v and (B·∇)B
+        adv_v = directional_derivative_vec(
+            v, grad_vx, grad_vy, grad_vz
+        )
+        strB_v = directional_derivative_vec(
+            B, grad_Bx, grad_By, grad_Bz
+        )
+
+        # (v·∇)B and (B·∇)v for induction equation
+        adv_B = directional_derivative_vec(
+            v, grad_Bx, grad_By, grad_Bz
+        )
+        strv_B = directional_derivative_vec(
+            B, grad_vx, grad_vy, grad_vz
+        )
+
+        # Nonlinear terms (real space)
+        Nv = -adv_v + strB_v          # RHS for v (before pressure projection)
+        NB = -adv_B + strv_B          # RHS for B
+
+        # Transform nonlinear terms to Fourier
+        Nv_hat = jnp.fft.fftn(Nv, axes=(1,2,3))
+        NB_hat = jnp.fft.fftn(NB, axes=(1,2,3))
+
+        # Dealias nonlinear terms
+        Nv_hat = Nv_hat * mask_dealias
+        NB_hat = NB_hat * mask_dealias
+
+        # Project velocity RHS to remove pressure (∇·v = 0)
+        Nv_hat = project_div_free(Nv_hat, kx, ky, kz, k2)
+
+        # Diffusion in Fourier space
+        lap_factor = -k2
+        dv_hat_dt = Nv_hat + nu * lap_factor * v_hat
+        dB_hat_dt = NB_hat + eta * lap_factor * B_hat
+
+        # Optional: clean B RHS a bit too
+        # dB_hat_dt = project_div_free(dB_hat_dt, kx, ky, kz, k2)
+
+        return (dv_hat_dt, dB_hat_dt)
+
+    return jax.jit(rhs)
+
+# -------------------------------- Energy diagnostics -------------------------- #
+
+def energy_from_hat(v_hat, B_hat, Lx, Ly, Lz):
+    """
+    Compute kinetic and magnetic energy from Fourier fields using Parseval.
+    Depending on FFT conventions, overall constant might differ by (NxNyNz),
+    but relative conservation is what we care about.
+
+    Here we just use real-space form for clarity.
+    """
+    v = jnp.fft.ifftn(v_hat, axes=(1,2,3)).real
+    B = jnp.fft.ifftn(B_hat, axes=(1,2,3)).real
+    dv = (Lx * Ly * Lz) / (v[0].size)  # volume / number of grid points
+
+    v2 = jnp.sum(v * v, axis=0)
+    B2 = jnp.sum(B * B, axis=0)
+    E_kin = 0.5 * jnp.sum(v2) * dv
+    E_mag = 0.5 * jnp.sum(B2) * dv
+    return E_kin, E_mag
+
+def dissipation_rates(v_hat, B_hat, k2, nu, eta, Lx, Ly, Lz):
+    """
+    Compute viscous and ohmic dissipation rates using Fourier representation:
+      eps_visc = 2 ν ∫ |∇v|^2 dV
+      eps_ohm  = 2 η ∫ |∇B|^2 dV
+
+    With numpy/jax FFT conventions (ifft includes 1/N):
+      ∑_x |f(x)|^2 = (1/Npoints) ∑_k |F(k)|^2
+
+    Energy in energy_from_hat is:
+      E = 0.5 * (Volume / Npoints) * ∑_x |f(x)|^2
+        = 0.5 * (Volume / Npoints^2) * ∑_k |F(k)|^2
+
+    So ∫ |∇v|^2 dV = (Volume / Npoints^2) * ∑_k k^2 |v_hat(k)|^2, etc.
+    """
+    Nx = v_hat.shape[1]
+    Ny = v_hat.shape[2]
+    Nz = v_hat.shape[3]
+    Npoints = Nx * Ny * Nz
+
+    volume = Lx * Ly * Lz
+    factor = volume / (Npoints**2)
+
+    v_power = jnp.sum(jnp.abs(v_hat)**2, axis=0)  # sum over components
+    B_power = jnp.sum(jnp.abs(B_hat)**2, axis=0)
+
+    eps_visc = 2.0 * nu * factor * jnp.sum(k2 * v_power)
+    eps_ohm  = 2.0 * eta * factor * jnp.sum(k2 * B_power)
+    return eps_visc, eps_ohm
 
 
-def cross(a, b):
-    """Vector cross product for last-dimension-3 arrays."""
-    ax, ay, az = a[..., 0], a[..., 1], a[..., 2]
-    bx, by, bz = b[..., 0], b[..., 1], b[..., 2]
-    cx = ay * bz - az * by
-    cy = az * bx - ax * bz
-    cz = ax * by - ay * bx
-    return jnp.stack([cx, cy, cz], axis=-1)
-
-
-# --------------------------- Problem definition --------------------------- #
-
-@dataclass
-class CylindricalMHDParams:
-    nu: float
-    eta: float
-    R: jnp.ndarray
-    dR: float
-    k_theta: jnp.ndarray
-    k_z: jnp.ndarray
-
-
-def mhd_rhs(t, state, args: CylindricalMHDParams):
-    """RHS for cylindrical MHD ODE system."""
-    v, B = state
-    nu, eta = args.nu, args.eta
-    R, dR, k_theta, k_z = args.R, args.dR, args.k_theta, args.k_z
-
-    # Nonlinear advection term (v·∇)v in cylindrical
-    adv_v = directional_derivative_cyl(v, v, R, dR, k_theta, k_z)
-
-    # Magnetic terms
-    J = curl_cyl(B, R, dR, k_theta, k_z)      # current J = ∇×B
-    lorentz = cross(J, B)                     # (∇×B)×B
-
-    # Diffusion
-    lap_v = vector_laplacian_cyl(v, R, dR, k_theta, k_z)
-    lap_B = vector_laplacian_cyl(B, R, dR, k_theta, k_z)
-
-    dvdt = -adv_v + lorentz + nu * lap_v
-
-    # Induction equation: dB/dt = ∇×(v×B) + eta ∇² B
-    v_cross_B = cross(v, B)
-    curl_v_cross_B = curl_cyl(v_cross_B, R, dR, k_theta, k_z)
-    dBdt = curl_v_cross_B + eta * lap_B
-
-    return (dvdt, dBdt)
-
-
-mhd_rhs_jit = jit(mhd_rhs)
-
-
-# ------------------------------ Main driver ------------------------------ #
+# --------------------------------------- Main --------------------------------- #
 
 def main():
-    # Parameters (adjust to taste)
-    Nr, Nth, Nz = 32, 32, 32
-    R_in, R_out = 0.5, 1.5
-    Lz = 2.0
+    # Grid & physical parameters
+    Nx = Ny = Nz = 32
+    Lx = Ly = Lz = 2.0 * math.pi
 
     nu = 1e-3
     eta = 1e-3
-    rho = 1.0
 
-    t0, t1 = 0.0, 1.2
+    t0, t1 = 0.0, 5.0       # evolve long enough to see instability / decay
+    n_frames = 80
     dt0 = 1e-3
-    n_frames = 40
 
-    # Diagnostics printout
-    print("========== Cylindrical pseudo-spectral MHD Parameters ==========")
-    print(f"Nr,Ntheta,Nz = {Nr},{Nth},{Nz}")
-    print(f"R_in,R_out,Lz = {R_in},{R_out},{Lz}")
-    print(f"nu={nu}, eta={eta}, rho={rho}")
+    print("=== Incompressible pseudo-spectral MHD Parameters ===")
+    print(f"Nx,Ny,Nz = {Nx},{Ny},{Nz}")
+    print(f"Lx,Ly,Lz = {Lx},{Ly},{Lz}")
+    print(f"nu={nu}, eta={eta}")
     print(f"t0={t0}, t1={t1}, dt0={dt0}")
-    print("solver=tsit5, stepsize_controller=pid, rtol=1e-7, atol=1e-7, max_steps=20000")
-    print("n_frames=", n_frames)
-    print("================================================================")
+    print(f"n_frames = {n_frames}")
+    print("=====================================================")
 
-    # Grid
-    R = jnp.linspace(R_in, R_out, Nr)
-    theta = jnp.linspace(0.0, 2.0 * jnp.pi, Nth, endpoint=False)
-    z = jnp.linspace(0.0, Lz, Nz, endpoint=False)
+    # Spectral arrays
+    kx, ky, kz, k2, NX, NY, NZ = make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz)
+    mask_dealias = make_dealias_mask(Nx, Ny, Nz, NX, NY, NZ)
 
-    dR = float(R[1] - R[0])
-    dtheta = float(theta[1] - theta[0])
-    dz = float(z[1] - z[0])
+    # Initial equilibrium & perturbation in real space
+    v0_real, B0_real = init_equilibrium(Nx, Ny, Nz, Lx, Ly, Lz)
 
-    # Wavenumbers for spectral derivatives
-    k_theta = make_kvec(Nth, 2.0 * math.pi)
-    k_z = make_kvec(Nz, Lz)
+    # Transform to Fourier
+    v0_hat = jnp.fft.fftn(v0_real, axes=(1,2,3))
+    B0_hat = jnp.fft.fftn(B0_real, axes=(1,2,3))
 
-    # 3D grids
-    R3, TH3, Z3 = jnp.meshgrid(R, theta, z, indexing="ij")
+    # Dealias & project divergence-free
+    v0_hat = v0_hat * mask_dealias
+    B0_hat = B0_hat * mask_dealias
+    v0_hat = project_div_free(v0_hat, kx, ky, kz, k2)
+    B0_hat = project_div_free(B0_hat, kx, ky, kz, k2)
 
-    # Initial B: toroidal-ish field + small helical perturbation
-    B0 = 0.5
-    R0 = 1.0
-    m = 1
-    kz_mode = 2.0 * math.pi / Lz
+    # Initial energy
+    E_kin0, E_mag0 = energy_from_hat(v0_hat, B0_hat, Lx, Ly, Lz)
+    print(f"[INIT] E_kin0={float(E_kin0):.6e}, E_mag0={float(E_mag0):.6e}, "
+          f"E_tot0={float(E_kin0+E_mag0):.6e}")
 
-    B_R0 = 0.02 * jnp.sin(m * TH3) * jnp.sin(kz_mode * Z3)
-    B_th0 = B0 * R0 / R3
-    B_z0 = 0.02 * jnp.cos(m * TH3) * jnp.cos(kz_mode * Z3)
+    # Build RHS and ODE term
+    rhs = make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias)
+    term = dfx.ODETerm(rhs)
 
-    B0_field = jnp.stack([B_R0, B_th0, B_z0], axis=-1)
-
-    # Initial v: small shear flow
-    v0_amp = 0.2
-    v_R0 = jnp.zeros_like(R3)
-    v_th0 = v0_amp * jnp.sin(jnp.pi * (R3 - R_in) / (R_out - R_in))**2 * jnp.sin(2.0 * jnp.pi * Z3 / Lz)
-    v_z0 = v0_amp * jnp.cos(m * TH3) * jnp.sin(2.0 * jnp.pi * Z3 / Lz)
-
-    v0_field = jnp.stack([v_R0, v_th0, v_z0], axis=-1)
-
-    # Diagnostic: initial energies and divB
-    def energy(v, B):
-        # Volume element: dV = R dR dtheta dz
-        R3_local = R[:, None, None]
-        dv = R3_local * dR * dtheta * dz
-        e_kin = 0.5 * rho * jnp.sum(jnp.sum(v**2, axis=-1) * dv)
-        e_mag = 0.5 * jnp.sum(jnp.sum(B**2, axis=-1) * dv)
-        return e_kin, e_mag
-
-    E_kin0, E_mag0 = energy(v0_field, B0_field)
-
-    divB0 = divergence_cyl(B0_field, R, dR, k_theta, k_z)
-    divB_L2_0 = jnp.sqrt(jnp.mean(divB0**2))
-    divB_Linf_0 = jnp.max(jnp.abs(divB0))
-
-    print(f"[INIT] E_kin0={E_kin0:.6e}, E_mag0={E_mag0:.6e}")
-    print(f"[INIT] ||divB||_2={divB_L2_0:.3e}, ||divB||_∞={divB_Linf_0:.3e}")
-
-    # Build args
-    params = CylindricalMHDParams(
-        nu=nu,
-        eta=eta,
-        R=R,
-        dR=dR,
-        k_theta=k_theta,
-        k_z=k_z,
-    )
-
-    # ODE setup
-    term = dfx.ODETerm(mhd_rhs_jit)
     solver = dfx.Tsit5()
-    stepsize_controller = dfx.PIDController(rtol=1e-7, atol=1e-7)
-
+    stepsize_controller = dfx.ConstantStepSize()
     ts_save = jnp.linspace(t0, t1, n_frames)
     saveat = dfx.SaveAt(ts=ts_save)
 
@@ -407,86 +376,100 @@ def main():
         t0=t0,
         t1=t1,
         dt0=dt0,
-        y0=(v0_field, B0_field),
-        args=params,
+        y0=(v0_hat, B0_hat),
+        args=None,
         saveat=saveat,
-        max_steps=20000,
+        max_steps=int((t1 - t0) / dt0) + 10_000,
         stepsize_controller=stepsize_controller,
+        progress_meter=dfx.TqdmProgressMeter(),
     )
+    print("[RUN] Solve finished. stats:", sol.stats)
 
-    print("[RUN] Solve finished. stats:", sol.stats())
+    ts = np.array(sol.ts)
+    v_hat_frames, B_hat_frames = sol.ys  # shapes (n_frames, 3, Nx,Ny,Nz)
 
-    # -------------------------- Diagnostics in time ------------------------- #
-
-    ts = sol.ts
-    v_frames, B_frames = zip(*sol.ys)
+    # ---------------------- Energy & dissipation diagnostics ------------------ #
 
     E_kin_list = []
     E_mag_list = []
     E_tot_list = []
-    divB_L2_list = []
-    divB_Linf_list = []
+    eps_visc_list = []
+    eps_ohm_list = []
+    E_cons_list = []
 
-    print("[POST] Computing diagnostic curves...")
-    for i, (t, v_f, B_f) in enumerate(zip(ts, v_frames, B_frames)):
-        E_kin, E_mag = energy(v_f, B_f)
-        E_tot = E_kin + E_mag
+    E_cons_running = 0.0
 
-        divB = divergence_cyl(B_f, R, dR, k_theta, k_z)
-        divB_L2 = jnp.sqrt(jnp.mean(divB**2))
-        divB_Linf = jnp.max(jnp.abs(divB))
+    for i in range(len(ts)):
+        v_hat_i = v_hat_frames[i]
+        B_hat_i = B_hat_frames[i]
 
-        E_kin_list.append(float(E_kin))
-        E_mag_list.append(float(E_mag))
-        E_tot_list.append(float(E_tot))
-        divB_L2_list.append(float(divB_L2))
-        divB_Linf_list.append(float(divB_Linf))
+        E_kin_i, E_mag_i = energy_from_hat(v_hat_i, B_hat_i, Lx, Ly, Lz)
+        eps_visc_i, eps_ohm_i = dissipation_rates(
+            v_hat_i, B_hat_i, k2, nu, eta, Lx, Ly, Lz
+        )
+        E_tot_i = E_kin_i + E_mag_i
+
+        E_kin_list.append(float(E_kin_i))
+        E_mag_list.append(float(E_mag_i))
+        E_tot_list.append(float(E_tot_i))
+        eps_visc_list.append(float(eps_visc_i))
+        eps_ohm_list.append(float(eps_ohm_i))
+
+        if i > 0:
+            dt = ts[i] - ts[i-1]
+            eps_prev = eps_visc_list[i-1] + eps_ohm_list[i-1]
+            eps_curr = eps_visc_list[i]   + eps_ohm_list[i]
+            E_cons_running += 0.5 * (eps_prev + eps_curr) * dt
+
+        E_cons_list.append(float(E_tot_i + E_cons_running))
 
         print(
-            f"[POST] frame {i}/{len(ts)-1}, t={float(t):.4f}, "
-            f"E_kin={E_kin:.3e}, E_mag={E_mag:.3e}, "
-            f"||divB||_2={divB_L2:.3e}, ||divB||_∞={divB_Linf:.3e}"
+            f"[POST] frame {i}/{len(ts)-1}, t={ts[i]:.4f}, "
+            f"E_kin={E_kin_i:.3e}, E_mag={E_mag_i:.3e}, E_tot={E_tot_i:.3e}, "
+            f"eps_visc={eps_visc_i:.3e}, eps_ohm={eps_ohm_i:.3e}, "
+            f"E_cons={E_tot_i + E_cons_running:.3e}"
         )
 
-    E_kin_arr = jnp.array(E_kin_list)
-    E_mag_arr = jnp.array(E_mag_list)
-    E_tot_arr = jnp.array(E_tot_list)
-    divB_L2_arr = jnp.array(divB_L2_list)
-    divB_Linf_arr = jnp.array(divB_Linf_list)
+    # ------------------------------ Plot diagnostics -------------------------- #
 
-    # ----------------------------- Plot results ----------------------------- #
+    ts_np = ts
+    E_kin_arr = np.array(E_kin_list)
+    E_mag_arr = np.array(E_mag_list)
+    E_tot_arr = np.array(E_tot_list)
+    eps_visc_arr = np.array(eps_visc_list)
+    eps_ohm_arr = np.array(eps_ohm_list)
+    E_cons_arr = np.array(E_cons_list)
 
-    print("[PLOT] Saving diagnostics figure to mhd_diagnostics_cylindrical.png")
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4), dpi=150)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), dpi=120)
+    ax1, ax2 = axs
 
     # Energies
-    ax = axes[0]
-    ax.plot(ts, E_kin_arr, label=r"$E_{\rm kin}$")
-    ax.plot(ts, E_mag_arr, label=r"$E_{\rm mag}$")
-    ax.plot(ts, E_tot_arr, label=r"$E_{\rm tot}$", linestyle="--")
-    ax.set_xlabel("t")
-    ax.set_ylabel("Energy")
-    ax.set_title("Cylindrical MHD Energies vs time")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax1.plot(ts_np, E_kin_arr, label=r"$E_{\rm kin}$")
+    ax1.plot(ts_np, E_mag_arr, label=r"$E_{\rm mag}$")
+    ax1.plot(ts_np, E_tot_arr, "--", label=r"$E_{\rm tot}$")
+    ax1.plot(ts_np, E_cons_arr, "-.", label=r"$E_{\rm cons}$")
+    ax1.set_xlabel("t")
+    ax1.set_ylabel("Energy")
+    ax1.set_title("MHD energies and invariant")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
 
-    # Divergence
-    ax2 = axes[1]
-    ax2.semilogy(ts, divB_L2_arr, label=r"$\|\nabla\cdot B\|_2$")
-    ax2.semilogy(ts, divB_Linf_arr, label=r"$\|\nabla\cdot B\|_\infty$")
+    # Dissipation rates
+    ax2.plot(ts_np, eps_visc_arr, label=r"$\epsilon_{\rm visc}$")
+    ax2.plot(ts_np, eps_ohm_arr, label=r"$\epsilon_{\rm ohm}$")
+    ax2.plot(ts_np, eps_visc_arr + eps_ohm_arr, "--", label=r"$\epsilon_{\rm tot}$")
     ax2.set_xlabel("t")
-    ax2.set_ylabel("Divergence norm")
-    ax2.set_title("Divergence of B (cylindrical)")
-    ax2.grid(True, which="both", alpha=0.3)
+    ax2.set_ylabel("Dissipation rate")
+    ax2.set_title("Dissipation rates vs time")
+    ax2.grid(True, alpha=0.3)
     ax2.legend()
 
     fig.tight_layout()
-    fig.savefig("mhd_diagnostics_cylindrical.png", bbox_inches="tight")
+    fig.savefig("mhd_energy_invariants.png", bbox_inches="tight")
     plt.close(fig)
 
-    print("[DONE] Diagnostics figure written.")
-
+    print("[DONE] Diagnostics saved to mhd_energy_invariants.png")
 
 if __name__ == "__main__":
     main()
