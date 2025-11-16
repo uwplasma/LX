@@ -919,7 +919,7 @@ def analyze(
             dpsi_rel,
             lw=0.5,
             label=f"seed {i+1}" if i < 8 else None,
-            linestyle=".-",
+            linestyle="-.",
         )
 
     ax1.set_xlabel(r"Field-line arclength $s$ [arb. units]")

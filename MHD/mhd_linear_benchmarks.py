@@ -225,8 +225,8 @@ def fit_gamma_from_mode(
     iy1,
     iz0,
     label="Bx",
-    t_min_frac: float = 0.05,   # start at 05% of run time
-    t_max_frac: float = 0.18,   # end at 18% of run time
+    t_min_frac: float = 0.1,   # start at 05% of run time
+    t_max_frac: float = 0.3,   # end at 18% of run time
 ):
     """
     Extract Bx(kx=0,ky=1,kz=0), then fit γ from ln|Bx| over a *time-based*
@@ -728,19 +728,21 @@ def main():
     # Base physical parameters for benchmarks (edit as desired).
     # Defaults are quasi-2D (Nz_ref=1) and moderate resolution.
     base_params = dict(
-        N_ref=32,          # reference Nx=Ny for scans
-        Nz_ref=6,          # Nz_ref=1: quasi-2D to keep runs very cheap
+        N_ref=128,          # reference Nx=Ny for scans
+        Nz_ref=1,          # Nz_ref=1: quasi-2D to keep runs very cheap
         Lx=2.0 * math.pi,
         Ly=2.0 * math.pi,
         Lz=2.0 * math.pi,
         nu=1e-3,
-        eta=1e-3,
+        eta=5e-3,
         B0=1.0,
         a=(2.0 * math.pi) / 16.0,  # consistent with default in solver
         B_g=0.2,
         eps_B=0.01,
         t0=0.0,
     )
+    
+    args.t1 = 20
 
     print("========================================================")
     print(" Linear tearing-mode benchmark suite")

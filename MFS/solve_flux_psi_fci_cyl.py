@@ -5,23 +5,14 @@ Flux surface solver inspired by flux–coordinate independent (FCI) approaches (
 using a strongly anisotropic diffusion tensor aligned with ∇φ to construct a flux-like scalar ψ.
 The goal is to construct a scalar potential ψ that is approximately constant
 along magnetic field lines while diffusing across those lines. 
-We conceptually want an operator of the form
-    ∇·[(P_par + ε P_perp) ∇ψ] = 0,
-where P_par = b b and P_perp = I - b b.
+Conceptually, we want ∇·[(P_par + ε P_perp) ∇ψ], where P_par = b b and
+P_perp = I - b b. In practice we implement this in two ways:
 
-  * Uses JAX to evaluate φ and ∇φ.
-  * Uses Diffrax to find the magnetic axis.
-  * Offers two discretization modes:
+  • use_fci=True: parallel part from a field-line mapped ∂_s^2 (FCI),
+    perpendicular part from a small isotropic Laplacian (approx. ε ∇²).
 
-    - use_fci=True (default):
-        Parallel diffusion via an FCI-style ∂_s^2 built from field-line
-        connectivity; perpendicular diffusion via a standard Laplacian:
-          • Cartesian: 7-point Laplacian in (x,y,z)
-          • Torus: cylindrical Laplacian in (R,φ,Z) with periodic φ.
-
-    - use_fci=False:
-        Full-tensor anisotropic operator -∇·(D ∇ψ) on a Cartesian grid,
-        with a 27-point finite-volume stencil that resolves cross-terms.
+  • use_fci=False: full tensor anisotropic operator -∇·(D ∇ψ) with
+    D ≈ P_par + ε P_perp + δ I.
 
 The boundary Γ_bnd is a thin ribbon near the physical surface
 (the outer boundary of the domain) and Γ_axis is a thin tube around the
@@ -33,9 +24,6 @@ This version:
 
   * Uses JAX to evaluate φ and ∇φ.
   * Uses Diffrax to find the magnetic axis.
-  * Discretises ∇·(D∇ψ) with a **full-tensor 27-point stencil** on a Cartesian grid:
-      - face fluxes F_x, F_y, F_z include all tensor components D_ij,
-        not just n·D·n, so cross-derivative terms are represented.
   * Imposes ψ=1 on a boundary band and ψ=0 on an axis band via a standard
     linear "lifting" so the matrix-free operator remains a pure PDE operator.
   * Includes diagnostics on residuals and a field-alignment error metric q = |t·∇ψ|/|∇ψ|.
@@ -887,20 +875,26 @@ def _find_cell_indices(coord, grid):
     Given a coordinate array coord (scalar) and a 1D grid array grid (monotone),
     return (i, w) such that coord is between grid[i] and grid[i+1], and
       value(coord) ≈ (1-w)*val[i] + w*val[i+1].
-    Clamp to interior cells.
+    Clamp coord into [grid[0], grid[-1]] and index into interior cells.
     """
+    # --- clamp coord into [grid[0], grid[-1]] ---
+    coord_clamped = np.clip(coord, grid[0], grid[-1])
+
     # fractional index
-    t = (coord - grid[0]) / (grid[-1] - grid[0])
+    t = (coord_clamped - grid[0]) / (grid[-1] - grid[0])
     idx_float = t * (len(grid) - 1)
     i = int(np.floor(idx_float))
+    # clamp i to [0, len(grid)-2]
     i = max(0, min(i, len(grid) - 2))
+
     x0 = grid[i]
-    x1 = grid[i+1]
+    x1 = grid[i + 1]
     if x1 == x0:
         w = 0.0
     else:
-        w = (coord - x0) / (x1 - x0)
+        w = (coord_clamped - x0) / (x1 - x0)
     return i, w
+
 
 def trilinear_weights(xs, ys, zs, point):
     """
@@ -946,6 +940,9 @@ def trilinear_weights(xs, ys, zs, point):
         w /= s
     return np.array(idx, dtype=np.int64), w
 
+###############################################################################
+# Field-aligned FCI operator (parallel via FCI, perpendicular via 7-point Laplacian)
+################################################################################
 def make_fci_operator_jax(
     nx: int,
     ny: int,
@@ -1742,12 +1739,12 @@ def solve_fci(npz_file: str, grid_N: int = 64, N_phi: int = 128, eps: float = 1e
     psi_fixed_full = np.zeros(Ntot, dtype=float)
     psi_fixed_full[fixed] = val[fixed]
 
-    F0_full = A_pde @ psi_fixed_full  # A_pde applied to known fixed field
+    # F0_full = A_pde @ psi_fixed_full  # A_pde applied to known fixed field
+    F0_full = np.asarray(A_pde_jax(jnp.asarray(psi_fixed_full)))
     b_free = -F0_full[free]
 
-    Nfree = int(free.sum())
-
     # ## Using scipy CG with LinearOperator wrapper around JAX matvec
+    # Nfree = int(free.sum())
     # def matvec_free(u_free: np.ndarray) -> np.ndarray:
     #     u_full = np.zeros(Ntot, dtype=float)
     #     u_full[free] = u_free
