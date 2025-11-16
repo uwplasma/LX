@@ -760,6 +760,9 @@ def main():
     logA_line = coeffs[1] + coeffs[0] * ts_np
 
     print(f"[FIT] Measured tearing gamma ≈ {gamma_fit:.3e}")
+    if not np.isnan(gamma_theory):
+        ratio = gamma_fit / gamma_theory
+        print(f"[COMP] gamma_fit/gamma_theory ≈ {ratio:.3f}")
 
     # Panel 2: log mode amplitude, shaded fit region, and fitted line
     axs[1].plot(ts_np, log_mode, label=r"$\ln|B_x(k_x=0,k_y=1)|$")
@@ -773,6 +776,21 @@ def main():
     axs[1].set_title("Mode growth (linear phase shaded)")
     axs[1].grid(True, alpha=0.3)
     axs[1].legend(loc="best")
+
+    # --- Add text box comparing fit vs theory ---
+    if not np.isnan(gamma_theory):
+        ratio = gamma_fit / gamma_theory
+        txt = (
+            rf"$\gamma_\mathrm{{fit}} \approx {gamma_fit:.3e}$" + "\n" +
+            rf"$\gamma_\mathrm{{FKR}} \approx {gamma_theory:.3e}$" + "\n" +
+            rf"$\gamma_\mathrm{{fit}}/\gamma_\mathrm{{FKR}} \approx {ratio:.2f}$"
+        )
+        axs[1].text(
+            0.05, 0.05, txt,
+            transform=axs[1].transAxes,
+            fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
 
     # Panel 3: invariant error
     axs[2].plot(ts_np, rel_E_cons_err)

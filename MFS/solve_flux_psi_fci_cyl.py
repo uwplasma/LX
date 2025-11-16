@@ -1943,7 +1943,7 @@ def solve_fci(npz_file: str, grid_N: int = 64, N_phi: int = 128, eps: float = 1e
     
     if q_metric.size > 0:
         n = q_metric.size
-        for thresh in [0.05, 0.1, 0.2, 0.5, 0.8, 0.9]:
+        for thresh in [0.05, 0.1, 0.5, 0.9]:
             frac = np.count_nonzero(q_metric < thresh) / n
             print(f"[ALIGN] frac(q < {thresh}) = {frac:.3f}")
         frac_bad = np.count_nonzero(q_metric > 0.8) / n
@@ -2103,10 +2103,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, N_phi: int = 128, eps: float = 1e
 
 if __name__ == "__main__":
 
-    # default_solution = "wout_precise_QA_solution.npz"
+    default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    default_solution = "wout_SLAM_6_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
     # default_solution = "knot_tube_solution.npz"
 
     nfp_default = 2
@@ -2116,12 +2116,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solve field–aligned flux function ψ via FCI diffusion.")
     parser.add_argument("npz", nargs="?", default=resolve_npz_file_location(default_solution),
                         help="MFS solution checkpoint (*.npz) containing center, scale, Yn, alpha, a, a_hat, P, N")
-    parser.add_argument("--N", type=int, default=32, help="Grid resolution per axis")
-    parser.add_argument("--N_phi", type=int, default=64, help="Grid resolution in φ (only for cylindrical grids)")
+    parser.add_argument("--N", type=int, default=64, help="Grid resolution per axis")
+    parser.add_argument("--N_phi", type=int, default=128, help="Grid resolution in φ (only for cylindrical grids)")
     parser.add_argument("--eps", type=float, default=5e-3, help="Perpendicular diffusion weight")
     parser.add_argument("--delta", type=float, default=0, help="Isotropic diffusion floor")
-    parser.add_argument("--band-h", type=float, default=1.0, help="Boundary band thickness multiplier")
-    parser.add_argument("--cg-tol", type=float, default=1e-11, help="CG tolerance (default: 1e-8)")
+    parser.add_argument("--band-h", type=float, default=2.0, help="Boundary band thickness multiplier")
+    parser.add_argument("--cg-tol", type=float, default=1e-12, help="CG tolerance (default: 1e-8)")
     parser.add_argument("--cg-maxit", type=int, default=4000, help="CG maximum iterations (default: 2000)")
     parser.add_argument("--nfp", type=int, default=nfp_default, help="Number of field periods (default: 2)")
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
