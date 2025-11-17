@@ -1223,8 +1223,8 @@ def main(xyz_csv,
 
 if __name__ == "__main__":
     # Default example (adjust file_name to your case)
-    file_name = "wout_precise_QH"
-    # file_name = "wout_precise_QA"
+    # file_name = "wout_precise_QH"
+    file_name = "wout_precise_QA"
     candidate_xyz, candidate_normals = get_candidates(file_name, subdir="inputs")
 
     parser = argparse.ArgumentParser(

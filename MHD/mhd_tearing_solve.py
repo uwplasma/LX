@@ -614,7 +614,7 @@ def solve_tearing_case(
         "t0": t0, "t1": t1,
         "n_frames": n_frames,
         "dt0": dt0,
-        "gamma_FKR": gamma_theory,
+        "gamma_FKR": gamma_theory, # this doesn't mean that we are in the FKR regime! Just a growth rate.
         "S": S,
         "Delta_prime_a": Delta_prime_a,
         "ix0": ix0, "iy1": iy1, "iz0": iz0,

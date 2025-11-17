@@ -979,9 +979,9 @@ if __name__ == "__main__":
     # default_solution = "knot_tube_mfs_energymin_vmec_like_solution.npz"
 
     nfp_default = 2
-    tfinal_default = 100.0
+    tfinal_default = 0.2
     seeds_default = None
-    n_save_default = 100  # so n_save_total ≈ n_save * tfinal
+    n_save_default = 10  # so n_save_total ≈ n_save * tfinal
 
     if "QH" in default_solution:
         nfp_default = 4

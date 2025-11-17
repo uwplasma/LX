@@ -315,8 +315,8 @@ def main():
     ap.add_argument("--filename", type=str, default="wout.nc", help="VMEC output wout file path")
 
     # Surface resolution
-    ap.add_argument("--ntheta", type=int, default=32, help="Grid points in poloidal angle")
-    ap.add_argument("--nphi", type=int, default=64, help="Grid points in toroidal angle")
+    ap.add_argument("--ntheta", type=int, default=26, help="Grid points in poloidal angle")
+    ap.add_argument("--nphi", type=int, default=128, help="Grid points in toroidal angle")
 
     # Output
     ap.add_argument("--out", type=str, default=".csv", help="Output file: .npz | .npy | .csv")
