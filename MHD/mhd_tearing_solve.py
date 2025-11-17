@@ -12,6 +12,10 @@ This script:
   - runs the MHD equations with diffrax,
   - saves the full solution (Fourier coefficients) and metadata to a .npz file.
 
+There are two mores for the equilibria:
+  - original: classic tearing harris sheet style
+  - forcefree: plasmoid-like regime
+
 You can later post-process with:
   - mhd_tearing_postprocess.py
   - mhd_reconnection_rate.py
@@ -19,6 +23,7 @@ You can later post-process with:
 
 from __future__ import annotations
 
+import os
 import math
 import argparse
 import jax
@@ -299,17 +304,23 @@ def tearing_amplitude(B_hat, Lx, Ly, Lz, band_width_frac=0.25):
 # RHS builder
 # -----------------------------------------------------------------------------#
 
-def make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias):
+# -----------------------------------------------------------------------------#
+# RHS builders
+# -----------------------------------------------------------------------------#
 
+def make_mhd_rhs_original(nu, eta, kx, ky, kz, k2, mask_dealias):
+    """Original incompressible MHD RHS (no equilibrium subtraction)."""
     def rhs(t, y_hat, args_unused):
         v_hat, B_hat = y_hat
 
         v_hat = v_hat * mask_dealias
         B_hat = B_hat * mask_dealias
 
+        # Project to div-free
         v_hat = project_div_free(v_hat, kx, ky, kz, k2)
         B_hat = project_div_free(B_hat, kx, ky, kz, k2)
 
+        # Real-space fields
         v = jnp.fft.ifftn(v_hat, axes=(1, 2, 3)).real
         B = jnp.fft.ifftn(B_hat, axes=(1, 2, 3)).real
 
@@ -333,6 +344,54 @@ def make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias):
         lap_factor = -k2
         dv_hat_dt = Nv_hat + nu * lap_factor * v_hat
         dB_hat_dt = NB_hat + eta * lap_factor * B_hat
+
+        return (dv_hat_dt, dB_hat_dt)
+
+    return jax.jit(rhs)
+
+
+def make_mhd_rhs_forcefree(nu, eta, kx, ky, kz, k2, mask_dealias,
+                           B0_hat_eq, Nv0_hat_eq):
+    """Equilibrium-subtracted RHS so (v=0, B=B0) is a solution."""
+    lap_factor = -k2
+
+    def rhs(t, y_hat, args_unused):
+        v_hat, B_hat = y_hat
+
+        v_hat = v_hat * mask_dealias
+        B_hat = B_hat * mask_dealias
+
+        # Project to div-free
+        v_hat = project_div_free(v_hat, kx, ky, kz, k2)
+        B_hat = project_div_free(B_hat, kx, ky, kz, k2)
+
+        # Real-space fields
+        v = jnp.fft.ifftn(v_hat, axes=(1, 2, 3)).real
+        B = jnp.fft.ifftn(B_hat, axes=(1, 2, 3)).real
+
+        grad_v = grad_vec_from_hat(v_hat, kx, ky, kz)
+        grad_B = grad_vec_from_hat(B_hat, kx, ky, kz)
+
+        adv_v  = directional_derivative_vec(v, grad_v)
+        strB_v = directional_derivative_vec(B, grad_B)
+
+        adv_B  = directional_derivative_vec(v, grad_B)
+        strv_B = directional_derivative_vec(B, grad_v)
+
+        Nv = -adv_v + strB_v
+        NB = -adv_B + strv_B
+
+        Nv_hat = jnp.fft.fftn(Nv, axes=(1, 2, 3)) * mask_dealias
+        NB_hat = jnp.fft.fftn(NB, axes=(1, 2, 3)) * mask_dealias
+
+        Nv_hat = project_div_free(Nv_hat, kx, ky, kz, k2)
+
+        # subtract equilibrium force
+        Nv_hat = Nv_hat - Nv0_hat_eq
+
+        # evolve δB = B - B0
+        dB_hat_dt = NB_hat + eta * lap_factor * (B_hat - B0_hat_eq)
+        dv_hat_dt = Nv_hat + nu * lap_factor * v_hat
 
         return (dv_hat_dt, dB_hat_dt)
 
@@ -363,9 +422,9 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Harris-sheet tearing mode MHD solver (pseudo-spectral)."
     )
-    p.add_argument("--Nx", type=int, default=48)
-    p.add_argument("--Ny", type=int, default=48)
-    p.add_argument("--Nz", type=int, default=48)
+    p.add_argument("--Nx", type=int, default=52)
+    p.add_argument("--Ny", type=int, default=52)
+    p.add_argument("--Nz", type=int, default=52)
     p.add_argument("--Lx", type=float, default=2.0 * math.pi)
     p.add_argument("--Ly", type=float, default=2.0 * math.pi)
     p.add_argument("--Lz", type=float, default=2.0 * math.pi)
@@ -375,27 +434,52 @@ def parse_args():
     p.add_argument("--a", type=float, default=None,
                    help="current sheet half-width (default Lx/16)")
     p.add_argument("--Bg", type=float, default=0.2, help="guide field B_g")
-    p.add_argument("--epsB", type=float, default=0.01,
+    p.add_argument("--epsB", type=float, default=1e-2,
                    help="perturbation amplitude in A_z")
     p.add_argument("--t0", type=float, default=0.0)
     p.add_argument("--t1", type=float, default=50.0)
-    p.add_argument("--n_frames", type=int, default=150)
+    p.add_argument("--n_frames", type=int, default=140)
     p.add_argument("--dt0", type=float, default=None,
                    help="initial dt; if None, estimated via CFL")
     p.add_argument("--outfile", type=str,
                    default="mhd_tearing_solution.npz",
                    help="output .npz file with solution and metadata")
+    p.add_argument(
+        "--equilibrium-mode",
+        type=str,
+        choices=["original", "forcefree"],
+        default="original",
+        help="Choose equilibrium model: 'original' or 'forcefree' (subtract equilibrium force)."
+    )
     return p.parse_args()
 
-def main():
-    args = parse_args()
+def solve_tearing_case(
+    Nx: int,
+    Ny: int,
+    Nz: int,
+    Lx: float,
+    Ly: float,
+    Lz: float,
+    nu: float,
+    eta: float,
+    B0: float,
+    a: float | None,
+    B_g: float,
+    eps_B: float,
+    t0: float,
+    t1: float,
+    n_frames: int,
+    dt0: float | None,
+    outfile: str,
+    equilibrium_mode: str = "original",
+) -> str:
+    """
+    Single Harris-sheet tearing run, used both by CLI (this file) and by
+    the scan script.
 
-    Nx, Ny, Nz = args.Nx, args.Ny, args.Nz
-    Lx, Ly, Lz = args.Lx, args.Ly, args.Lz
-    nu, eta = args.nu, args.eta
-    B0, a, B_g, eps_B = args.B0, args.a, args.Bg, args.epsB
-    t0, t1, n_frames = args.t0, args.t1, args.n_frames
-
+    Saves an .npz to `outfile` with all the metadata needed for post-processing,
+    and returns the outfile path.
+    """
     if a is None:
         a = Lx / 16.0
 
@@ -405,8 +489,17 @@ def main():
     print(f"nu={nu}, eta={eta}")
     print(f"B0={B0}, a={a}, B_g={B_g}, eps_B={eps_B}")
     print(f"t0={t0}, t1={t1}, n_frames={n_frames}")
+    print(f"equilibrium_mode = {equilibrium_mode}")
     print("=====================================================")
+    
+    # If user did not override the default name, append equilibrium_mode
+    default_out = "mhd_tearing_solution.npz"
+    if outfile == default_out:
+        stem, ext = os.path.splitext(default_out)
+        outfile = f"{stem}_{equilibrium_mode}{ext}"
+        print(f"[OUT] Using automatic outfile name: {outfile}")
 
+    # Spectral stuff
     kx, ky, kz, k2, NX, NY, NZ = make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz)
     mask_dealias = make_dealias_mask(Nx, Ny, Nz, NX, NY, NZ)
 
@@ -418,10 +511,12 @@ def main():
     iy1 = int(np.where(NY_np[0, :, 0] == 1)[0][0])
     iz0 = int(np.where(NZ_np[0, 0, :] == 0)[0][0])
 
+    # Theory
     gamma_theory, S, Delta_prime_a = fkr_gamma(B0, a, Ly, eta)
     print(f"[THEORY] FKR-like tearing estimate: gamma ≈ {gamma_theory:.3e}")
     print(f"[THEORY] S = {S:.3e}, Delta' a = {Delta_prime_a:.3e}")
 
+    # Equilibrium + perturbation
     v0_real, B0_real = init_equilibrium(
         Nx, Ny, Nz, Lx, Ly, Lz,
         B0=B0, a=a, B_g=B_g, eps_B=eps_B
@@ -435,22 +530,41 @@ def main():
     v0_hat = project_div_free(v0_hat, kx, ky, kz, k2)
     B0_hat = project_div_free(B0_hat, kx, ky, kz, k2)
 
+    if equilibrium_mode == "forcefree":
+        # precompute equilibrium "force" P[(B0·∇)B0]
+        grad_B0 = grad_vec_from_hat(B0_hat, kx, ky, kz)
+        strB_v0 = directional_derivative_vec(B0_real, grad_B0)
+        Nv0_hat = jnp.fft.fftn(strB_v0, axes=(1, 2, 3)) * mask_dealias
+        Nv0_hat = project_div_free(Nv0_hat, kx, ky, kz, k2)
+
+        B0_hat_const = B0_hat
+        Nv0_hat_const = Nv0_hat
+    else:
+        B0_hat_const = None
+        Nv0_hat_const = None
+
     E_kin0, E_mag0 = energy_from_hat(v0_hat, B0_hat, Lx, Ly, Lz)
     print(f"[INIT] E_kin0={float(E_kin0):.6e}, "
           f"E_mag0={float(E_mag0):.6e}, "
           f"E_tot0={float(E_kin0+E_mag0):.6e}")
 
     # Time step
-    if args.dt0 is None:
+    if dt0 is None:
         dt_max = estimate_max_dt(v0_hat, B0_hat, Lx, Ly, Lz, nu, eta)
         print(f"[DT] Estimated dt_max from CFL/diffusion = {dt_max:.3e}")
         dt0 = min(5e-4, 0.5 * dt_max)
-    else:
-        dt0 = args.dt0
-
     print(f"[DT] Using dt0 = {dt0:.3e}")
 
-    rhs = make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias)
+    # rhs = make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias)
+    if equilibrium_mode == "forcefree":
+        rhs = make_mhd_rhs_forcefree(
+            nu, eta, kx, ky, kz, k2, mask_dealias,
+            B0_hat_const, Nv0_hat_const
+        )
+    else:
+        rhs = make_mhd_rhs_original(
+            nu, eta, kx, ky, kz, k2, mask_dealias
+        )
     term = dfx.ODETerm(rhs)
 
     solver = dfx.Dopri8()
@@ -480,7 +594,7 @@ def main():
     v_hat_frames = np.array(v_hat_frames)
     B_hat_frames = np.array(B_hat_frames)
 
-    # Minimal check: print final energies
+    # Final energies
     v_hat_end = jnp.array(v_hat_frames[-1])
     B_hat_end = jnp.array(B_hat_frames[-1])
     E_kin_end, E_mag_end = energy_from_hat(v_hat_end, B_hat_end, Lx, Ly, Lz)
@@ -504,9 +618,35 @@ def main():
         "S": S,
         "Delta_prime_a": Delta_prime_a,
         "ix0": ix0, "iy1": iy1, "iz0": iz0,
+        "equilibrium_mode": equilibrium_mode,
     }
-    np.savez(args.outfile, **out)
-    print(f"[SAVE] Solution saved to {args.outfile}")
+    np.savez(outfile, **out)
+    print(f"[SAVE] Solution saved to {outfile}")
+    return outfile
+
+def main():
+    args = parse_args()
+
+    solve_tearing_case(
+        Nx=args.Nx,
+        Ny=args.Ny,
+        Nz=args.Nz,
+        Lx=args.Lx,
+        Ly=args.Ly,
+        Lz=args.Lz,
+        nu=args.nu,
+        eta=args.eta,
+        B0=args.B0,
+        a=args.a,
+        B_g=args.Bg,
+        eps_B=args.epsB,
+        t0=args.t0,
+        t1=args.t1,
+        n_frames=args.n_frames,
+        dt0=args.dt0,
+        outfile=args.outfile,
+        equilibrium_mode=args.equilibrium_mode,
+    )
 
 if __name__ == "__main__":
     main()

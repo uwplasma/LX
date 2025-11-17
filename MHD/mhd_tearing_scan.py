@@ -5,9 +5,12 @@ mhd_tearing_scan.py
 
 "Loureiro-style" scan driver for Harris-sheet tearing.
 
-This script does *both*:
+This script does, for each chosen equilibrium model
+    equilibrium_mode ∈ {"original", "forcefree"}:
+
   1) runs the incompressible pseudo-spectral MHD tearing simulation
-     (JAX + diffrax) for a scan over (a, eta), and
+     for a scan over (a, eta) by calling
+         mhd_tearing_solve.solve_tearing_case(..., equilibrium_mode=...)
   2) postprocesses each run to extract:
        - island width w(t),
        - linear growth rate γ_fit,
@@ -26,19 +29,25 @@ Per-run diagnostics include:
   - E_kin(t), E_mag(t) with regime markers,
   - reconnected flux proxy ψ_rec(t) ∝ |A_1|(t).
 
-All runs are saved as mhd_tearing_solution_*.npz in --outdir, and a
-summary file tearing_scan_summary.npz plus PNGs are written there.
+For each equilibrium_mode, runs are saved as
+    outdir/<equilibrium_mode>/mhd_tearing_solution_*.npz
+
+and a summary file
+    outdir/<equilibrium_mode>/tearing_scan_summary_<equilibrium_mode>.npz
+
+plus PNGs with names ending in _<equilibrium_mode>.png are written there.
 
 Example usage
 -------------
 
 python mhd_tearing_scan.py \
-    --scan-a 0.25 0.35 0.45 \
-    --scan-eta 5e-4 1e-3 2e-3 \
-    --Nx 48 --Ny 48 --Nz 48 \
+    --scan-a 0.5 0.6 0.785 \
+    --scan-eta 1.25e-3 6.25e-4 3.125e-4 \
+    --Nx 152 --Ny 152 --Nz 1 \
     --Lx 6.283185307179586 --Ly 6.283185307179586 --Lz 6.283185307179586 \
-    --t0 0.0 --t1 100.0 --n-frames 80 \
-    --outdir tearing_scan_plots
+    --t0 0.0 --t1 100.0 --n-frames 200 \
+    --outdir tearing_scan_plots \
+    --equilibrium-modes original forcefree
 
 """
 
@@ -53,11 +62,8 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-import diffrax as dfx
-
+# Import the physics + numerics + solver from the base file
+from mhd_tearing_solve import solve_tearing_case, make_k_arrays
 
 # -----------------------------------------------------------------------------#
 # Matplotlib style
@@ -80,388 +86,17 @@ mpl.rcParams.update({
 
 
 # -----------------------------------------------------------------------------#
-# Solver utilities (copied/adapted from mhd_tearing_solve.py)
-# -----------------------------------------------------------------------------#
-
-def estimate_max_dt(v_hat, B_hat, Lx, Ly, Lz, nu, eta,
-                    CFL_adv=0.4, CFL_diff=0.2):
-    """
-    Estimate a safe maximum timestep from CFL + diffusion constraints.
-    v_hat, B_hat: (3, Nx, Ny, Nz), complex
-    """
-    v = jnp.fft.ifftn(v_hat, axes=(1, 2, 3)).real
-    B = jnp.fft.ifftn(B_hat, axes=(1, 2, 3)).real
-
-    v_mag = jnp.sqrt(jnp.sum(v * v, axis=0))
-    B_mag = jnp.sqrt(jnp.sum(B * B, axis=0))
-
-    v_char = jnp.max(v_mag + B_mag)
-
-    Nx = v.shape[1]
-    Ny = v.shape[2]
-    Nz = v.shape[3]
-    dx = Lx / Nx
-    dy = Ly / Ny
-    dz = Lz / Nz
-    hmin = jnp.min(jnp.array([dx, dy, dz]))
-
-    dt_adv = jnp.where(v_char > 0.0, CFL_adv * hmin / v_char, 1e9)
-
-    nu_eff = jnp.maximum(nu, eta)
-    dt_diff = CFL_diff * hmin * hmin / jnp.maximum(nu_eff, 1e-16)
-
-    dt_max = jnp.minimum(dt_adv, dt_diff)
-    return float(dt_max)
-
-
-def make_grid(Nx, Ny, Nz, Lx, Ly, Lz):
-    x = jnp.linspace(0.0, Lx, Nx, endpoint=False)
-    y = jnp.linspace(0.0, Ly, Ny, endpoint=False)
-    z = jnp.linspace(0.0, Lz, Nz, endpoint=False)
-    X, Y, Z = jnp.meshgrid(x, y, z, indexing="ij")
-    return X, Y, Z
-
-
-def make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz):
-    nx = jnp.fft.fftfreq(Nx) * Nx
-    ny = jnp.fft.fftfreq(Ny) * Ny
-    nz = jnp.fft.fftfreq(Nz) * Nz
-    NX, NY, NZ = jnp.meshgrid(nx, ny, nz, indexing="ij")
-
-    kx = 2.0 * jnp.pi * NX / Lx
-    ky = 2.0 * jnp.pi * NY / Ly
-    kz = 2.0 * jnp.pi * NZ / Lz
-
-    k2 = kx**2 + ky**2 + kz**2
-    k2 = jnp.where(k2 == 0.0, 1.0, k2)  # avoid divide-by-zero at k=0
-    return kx, ky, kz, k2, NX, NY, NZ
-
-
-def make_dealias_mask(Nx, Ny, Nz, NX, NY, NZ):
-    kx_cut = Nx // 3
-    ky_cut = Ny // 3
-    kz_cut = Nz // 3
-    mask = (
-        (jnp.abs(NX) <= kx_cut) &
-        (jnp.abs(NY) <= ky_cut) &
-        (jnp.abs(NZ) <= kz_cut)
-    )
-    return mask.astype(jnp.complex128)
-
-
-def project_div_free(v_hat, kx, ky, kz, k2):
-    """
-    Project a vector field in Fourier space onto divergence-free subspace:
-      v_hat -> (I - k k^T / k^2) v_hat
-    v_hat shape: (3, Nx, Ny, Nz)
-    """
-    vx_hat, vy_hat, vz_hat = v_hat[0], v_hat[1], v_hat[2]
-    k_dot_v = kx * vx_hat + ky * vy_hat + kz * vz_hat
-    factor = k_dot_v / k2
-
-    vx_hat_proj = vx_hat - factor * kx
-    vy_hat_proj = vy_hat - factor * ky
-    vz_hat_proj = vz_hat - factor * kz
-    return jnp.stack([vx_hat_proj, vy_hat_proj, vz_hat_proj], axis=0)
-
-
-def grad_vec_from_hat(F_hat, kx, ky, kz):
-    """
-    Gradient of a vector field from Fourier coefficients.
-
-    F_hat: (3, Nx, Ny, Nz) complex, components (F_x, F_y, F_z)
-    Returns grad_F[i,j,...] = ∂F_j/∂x_i
-    """
-    df_dx_hat = 1j * kx * F_hat
-    df_dy_hat = 1j * ky * F_hat
-    df_dz_hat = 1j * kz * F_hat
-
-    df_dx = jnp.fft.ifftn(df_dx_hat, axes=(1, 2, 3)).real
-    df_dy = jnp.fft.ifftn(df_dy_hat, axes=(1, 2, 3)).real
-    df_dz = jnp.fft.ifftn(df_dz_hat, axes=(1, 2, 3)).real
-
-    grad_F = jnp.stack([
-        jnp.stack([df_dx[0], df_dx[1], df_dx[2]], axis=0),
-        jnp.stack([df_dy[0], df_dy[1], df_dy[2]], axis=0),
-        jnp.stack([df_dz[0], df_dz[1], df_dz[2]], axis=0),
-    ], axis=0)
-    return grad_F  # (3,3,Nx,Ny,Nz)
-
-
-def directional_derivative_vec(A, grad_B):
-    """
-    Compute (A · ∇) B in real space.
-
-    A:       (3, Nx, Ny, Nz)
-    grad_B:  (3, 3, Nx, Ny, Nz) with grad_B[i,j,...] = ∂B_j/∂x_i
-    Returns adv_j = Σ_i A_i ∂B_j/∂x_i
-    """
-    return jnp.einsum("i...,ij...->j...", A, grad_B)
-
-
-def init_equilibrium(Nx, Ny, Nz, Lx, Ly, Lz, B0=1.0, a=None,
-                     B_g=0.2, eps_B=0.01, m_y=1, m_z=0):
-    """
-    Harris-sheet-like slab tearing equilibrium in a periodic box.
-
-      B_y(x) = B0 * tanh((x - Lx/2)/a)
-      B_z    = B_g
-      B_x    = 0
-
-    Perturbation via δA_z = eps_B cos(k_y y) cos(k_z z):
-      => δB_x = -eps_B * k_y sin(k_y y) cos(k_z z)
-    """
-    if a is None:
-        a = Lx / 16.0
-
-    X, Y, Z = make_grid(Nx, Ny, Nz, Lx, Ly, Lz)
-
-    sx = (X - 0.5 * Lx) / a
-    By0 = B0 * jnp.tanh(sx)
-    Bx0 = jnp.zeros_like(By0)
-    Bz0 = B_g * jnp.ones_like(By0)
-
-    k_y = 2.0 * jnp.pi * m_y / Ly
-    k_z = 2.0 * jnp.pi * m_z / Lz
-
-    phase_y = k_y * Y
-    phase_z = k_z * Z
-
-    delta_Bx = -eps_B * k_y * jnp.sin(phase_y) * jnp.cos(phase_z)
-    delta_By = jnp.zeros_like(delta_Bx)
-    delta_Bz = jnp.zeros_like(delta_Bx)
-
-    Bx = Bx0 + delta_Bx
-    By = By0 + delta_By
-    Bz = Bz0 + delta_Bz
-
-    B0_real = jnp.stack([Bx, By, Bz], axis=0)
-    v0_real = jnp.zeros_like(B0_real)
-
-    return v0_real, B0_real
-
-
-def energy_from_hat(v_hat, B_hat, Lx, Ly, Lz):
-    v = jnp.fft.ifftn(v_hat, axes=(1, 2, 3)).real
-    B = jnp.fft.ifftn(B_hat, axes=(1, 2, 3)).real
-    dv = (Lx * Ly * Lz) / (v[0].size)
-
-    v2 = jnp.sum(v * v, axis=0)
-    B2 = jnp.sum(B * B, axis=0)
-    E_kin = 0.5 * jnp.sum(v2) * dv
-    E_mag = 0.5 * jnp.sum(B2) * dv
-    return E_kin, E_mag
-
-
-def energy_from_hat_np(v_hat, B_hat, Lx, Ly, Lz):
-    """NumPy version for post-processing."""
-    v = np.fft.ifftn(v_hat, axes=(1, 2, 3)).real
-    B = np.fft.ifftn(B_hat, axes=(1, 2, 3)).real
-    dv = (Lx * Ly * Lz) / (v[0].size)
-
-    v2 = np.sum(v * v, axis=0)
-    B2 = np.sum(B * B, axis=0)
-    E_kin = 0.5 * np.sum(v2) * dv
-    E_mag = 0.5 * np.sum(B2) * dv
-    return float(E_kin), float(E_mag)
-
-
-def make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias):
-
-    def rhs(t, y_hat, args_unused):
-        v_hat, B_hat = y_hat
-
-        v_hat = v_hat * mask_dealias
-        B_hat = B_hat * mask_dealias
-
-        v_hat_p = project_div_free(v_hat, kx, ky, kz, k2)
-        B_hat_p = project_div_free(B_hat, kx, ky, kz, k2)
-
-        v = jnp.fft.ifftn(v_hat_p, axes=(1, 2, 3)).real
-        B = jnp.fft.ifftn(B_hat_p, axes=(1, 2, 3)).real
-
-        grad_v = grad_vec_from_hat(v_hat_p, kx, ky, kz)
-        grad_B = grad_vec_from_hat(B_hat_p, kx, ky, kz)
-
-        adv_v  = directional_derivative_vec(v, grad_v)
-        strB_v = directional_derivative_vec(B, grad_B)
-
-        adv_B  = directional_derivative_vec(v, grad_B)
-        strv_B = directional_derivative_vec(B, grad_v)
-
-        Nv = -adv_v + strB_v
-        NB = -adv_B + strv_B
-
-        Nv_hat = jnp.fft.fftn(Nv, axes=(1, 2, 3)) * mask_dealias
-        NB_hat = jnp.fft.fftn(NB, axes=(1, 2, 3)) * mask_dealias
-
-        Nv_hat = project_div_free(Nv_hat, kx, ky, kz, k2)
-
-        lap_factor = -k2
-        dv_hat_dt = Nv_hat + nu * lap_factor * v_hat_p
-        dB_hat_dt = NB_hat + eta * lap_factor * B_hat_p
-
-        return (dv_hat_dt, dB_hat_dt)
-
-    return jax.jit(rhs)
-
-
-def fkr_gamma(B0, a, Ly, eta):
-    ky_val = 2.0 * math.pi / Ly   # m_y = 1
-    ka = ky_val * a
-    Delta_prime_a = 2.0 * (1.0/ka - ka)
-    vA = B0  # ρ = 1
-    S = a * vA / eta
-    C_fkr = 0.55
-    if Delta_prime_a > 0.0:
-        gamma_theory = C_fkr * vA / a * (Delta_prime_a**(4.0/5.0)) * (S**(-3.0/5.0))
-    else:
-        gamma_theory = float("nan")
-    return gamma_theory, S, Delta_prime_a
-
-
-# -----------------------------------------------------------------------------#
-# Run a single tearing simulation and save NPZ
-# -----------------------------------------------------------------------------#
-
-def solve_tearing_case(
-    Nx: int,
-    Ny: int,
-    Nz: int,
-    Lx: float,
-    Ly: float,
-    Lz: float,
-    nu: float,
-    eta: float,
-    B0: float,
-    a: float,
-    B_g: float,
-    eps_B: float,
-    t0: float,
-    t1: float,
-    n_frames: int,
-    dt0: float | None,
-    outfile: str,
-) -> str:
-    """
-    Full MHD tearing solve for a single (a, eta) and save to `outfile`.
-    Returns the outfile path.
-    """
-    print("\n=== Incompressible pseudo-spectral MHD Parameters ===")
-    print(f"Nx,Ny,Nz = {Nx},{Ny},{Nz}")
-    print(f"Lx,Ly,Lz = {Lx},{Ly},{Lz}")
-    print(f"nu={nu}, eta={eta}")
-    print(f"B0={B0}, a={a}, B_g={B_g}, eps_B={eps_B}")
-    print(f"t0={t0}, t1={t1}, n_frames={n_frames}")
-    print("=====================================================")
-
-    kx, ky, kz, k2, NX, NY, NZ = make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz)
-    mask_dealias = make_dealias_mask(Nx, Ny, Nz, NX, NY, NZ)
-
-    # indices for tearing mode (kx=0, ky=1, kz=0)
-    NX_np = np.array(NX)
-    NY_np = np.array(NY)
-    NZ_np = np.array(NZ)
-    ix0 = int(np.where(NX_np[:, 0, 0] == 0)[0][0])
-    iy1 = int(np.where(NY_np[0, :, 0] == 1)[0][0])
-    iz0 = int(np.where(NZ_np[0, 0, :] == 0)[0][0])
-
-    gamma_theory, S, Delta_prime_a = fkr_gamma(B0, a, Ly, eta)
-    print(f"[THEORY] FKR-like tearing estimate: gamma ≈ {gamma_theory:.3e}")
-    print(f"[THEORY] S = {S:.3e}, Delta' a = {Delta_prime_a:.3e}")
-
-    v0_real, B0_real = init_equilibrium(
-        Nx, Ny, Nz, Lx, Ly, Lz,
-        B0=B0, a=a, B_g=B_g, eps_B=eps_B
-    )
-    v0_hat = jnp.fft.fftn(v0_real, axes=(1, 2, 3))
-    B0_hat = jnp.fft.fftn(B0_real, axes=(1, 2, 3))
-
-    v0_hat = v0_hat * mask_dealias
-    B0_hat = B0_hat * mask_dealias
-    v0_hat = project_div_free(v0_hat, kx, ky, kz, k2)
-    B0_hat = project_div_free(B0_hat, kx, ky, kz, k2)
-
-    E_kin0, E_mag0 = energy_from_hat(v0_hat, B0_hat, Lx, Ly, Lz)
-    print(f"[INIT] E_kin0={float(E_kin0):.6e}, "
-          f"E_mag0={float(E_mag0):.6e}, "
-          f"E_tot0={float(E_kin0+E_mag0):.6e}")
-
-    # Timestep
-    if dt0 is None:
-        dt_max = estimate_max_dt(v0_hat, B0_hat, Lx, Ly, Lz, nu, eta)
-        print(f"[DT] Estimated dt_max from CFL/diffusion = {dt_max:.3e}")
-        dt0 = min(1e-3, 0.5 * dt_max)
-    print(f"[DT] Using dt0 = {dt0:.3e}")
-
-    rhs = make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias)
-    term = dfx.ODETerm(rhs)
-
-    solver = dfx.Dopri8()
-    stepsize_controller = dfx.PIDController(rtol=1e-5, atol=1e-7)
-    ts_save = jnp.linspace(t0, t1, n_frames)
-    saveat = dfx.SaveAt(ts=ts_save)
-
-    print("[RUN] Calling diffrax.diffeqsolve ...")
-    sol = dfx.diffeqsolve(
-        term,
-        solver,
-        t0=t0,
-        t1=t1,
-        dt0=dt0,
-        y0=(v0_hat, B0_hat),
-        args=None,
-        saveat=saveat,
-        max_steps=int((t1 - t0) / dt0) + 10_000,
-        stepsize_controller=stepsize_controller,
-        progress_meter=dfx.TqdmProgressMeter(),
-    )
-    print("[RUN] Solve finished.")
-    print("[RUN] Stats:", sol.stats)
-
-    ts = np.array(sol.ts)
-    v_hat_frames, B_hat_frames = sol.ys
-    v_hat_frames = np.array(v_hat_frames)
-    B_hat_frames = np.array(B_hat_frames)
-
-    v_hat_end = jnp.array(v_hat_frames[-1])
-    B_hat_end = jnp.array(B_hat_frames[-1])
-    E_kin_end, E_mag_end = energy_from_hat(v_hat_end, B_hat_end, Lx, Ly, Lz)
-    print(f"[FINAL] E_kin={float(E_kin_end):.6e}, "
-          f"E_mag={float(E_mag_end):.6e}, "
-          f"E_tot={float(E_kin_end+E_mag_end):.6e}")
-
-    out = {
-        "ts": ts,
-        "v_hat": v_hat_frames,
-        "B_hat": B_hat_frames,
-        "Nx": Nx, "Ny": Ny, "Nz": Nz,
-        "Lx": Lx, "Ly": Ly, "Lz": Lz,
-        "nu": nu, "eta": eta,
-        "B0": B0, "a": a, "B_g": B_g, "eps_B": eps_B,
-        "t0": t0, "t1": t1,
-        "n_frames": n_frames,
-        "dt0": dt0,
-        "gamma_FKR": gamma_theory,
-        "S": S,
-        "Delta_prime_a": Delta_prime_a,
-        "ix0": ix0, "iy1": iy1, "iz0": iz0,
-    }
-    np.savez(outfile, **out)
-    print(f"[SAVE] Solution saved to {outfile}")
-    return outfile
-
-
-# -----------------------------------------------------------------------------#
-# Post-processing utilities (scan analysis)
+# Post-processing utilities (NumPy only)
 # -----------------------------------------------------------------------------#
 
 def compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz):
-    """Wrapper around make_k_arrays but returning NumPy arrays."""
+    """
+    Wrapper around make_k_arrays (from mhd_tearing_solve.py) but returning NumPy arrays.
+    """
     kx_j, ky_j, kz_j, k2_j, NX_j, NY_j, NZ_j = make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz)
     return (np.array(kx_j),
             np.array(ky_j),
-            np.array(kz_j),
+            np.array(ky_j),  # NOTE: kz_j is not used directly elsewhere
             np.array(NX_j),
             np.array(NY_j),
             np.array(NZ_j))
@@ -500,6 +135,19 @@ def compute_island_width_from_mode(Az_hat_mode, B0, a):
     return 4.0 * np.sqrt(A_amp / Bprime)
 
 
+def energy_from_hat_np(v_hat, B_hat, Lx, Ly, Lz):
+    """NumPy version for post-processing."""
+    v = np.fft.ifftn(v_hat, axes=(1, 2, 3)).real
+    B = np.fft.ifftn(B_hat, axes=(1, 2, 3)).real
+    dv = (Lx * Ly * Lz) / (v[0].size)
+
+    v2 = np.sum(v * v, axis=0)
+    B2 = np.sum(B * B, axis=0)
+    E_kin = 0.5 * np.sum(v2) * dv
+    E_mag = 0.5 * np.sum(B2) * dv
+    return float(E_kin), float(E_mag)
+
+
 def _linear_regression_with_stats(x, y):
     """
     Simple y = a x + b regression with R^2 and standard error of slope.
@@ -509,15 +157,15 @@ def _linear_regression_with_stats(x, y):
     y = np.asarray(y)
     N = x.size
     a, b = np.polyfit(x, y, 1)
-    y_pred = a*x + b
+    y_pred = a * x + b
     resid = y - y_pred
     RSS = np.sum(resid**2)
     TSS = np.sum((y - np.mean(y))**2)
-    R2 = 1.0 - RSS/TSS if TSS > 0 else np.nan
+    R2 = 1.0 - RSS / TSS if TSS > 0 else np.nan
     if N > 2:
-        sigma2 = RSS/(N - 2)
+        sigma2 = RSS / (N - 2)
         x_var = np.sum((x - np.mean(x))**2)
-        a_err = np.sqrt(sigma2/x_var) if x_var > 0 else np.nan
+        a_err = np.sqrt(sigma2 / x_var) if x_var > 0 else np.nan
     else:
         a_err = np.nan
     return a, b, R2, a_err
@@ -586,7 +234,7 @@ def select_linear_window(
 
     # First pass: enforce R² >= R2_min if possible
     for s in range(0, idx.size - nwin + 1):
-        win = idx[s:s+nwin]
+        win = idx[s:s + nwin]
         t_win = ts[win]
         y_win = lnw[win]
         a, b, R2, _ = _linear_regression_with_stats(t_win, y_win)
@@ -597,7 +245,7 @@ def select_linear_window(
     # Second pass: if nothing reached R2_min, just pick max R²
     if best_slice is None:
         for s in range(0, idx.size - nwin + 1):
-            win = idx[s:s+nwin]
+            win = idx[s:s + nwin]
             t_win = ts[win]
             y_win = lnw[win]
             a, b, R2, _ = _linear_regression_with_stats(t_win, y_win)
@@ -659,7 +307,7 @@ def analyze_single_run(
     print(f"[RUN] γ_FKR={gamma_FKR:.3e}, mode indices (ix0,iy1,iz0)=({ix0},{iy1},{iz0})")
 
     # k arrays (NumPy)
-    kx, ky, kz, NX, NY, NZ = compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz)
+    kx, ky, kz_dummy, NX, NY, NZ = compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz)
     ky_val = ky[ix0, iy1, iz0]
     print(f"[DEBUG] ky for tearing mode = {ky_val:.6f}")
 
@@ -685,7 +333,7 @@ def analyze_single_run(
     wmax = np.nanmax(island_width)
     print(f"[INFO] w0 = {w0:.3e}, w_max = {wmax:.3e}")
 
-    # ----- Linear fit: tightened automatic window selector ----- #
+    # ----- Linear fit: automatic window selector ----- #
     mask_lin = select_linear_window(
         ts,
         island_width,
@@ -699,7 +347,7 @@ def analyze_single_run(
 
     if np.count_nonzero(mask_lin) < 5:
         print("[WARN] Automatic selector failed, falling back to first 25% of time.")
-        mask_lin = ts < (ts[0] + 0.25*(ts[-1]-ts[0]))
+        mask_lin = ts < (ts[0] + 0.25 * (ts[-1] - ts[0]))
 
     t_lin = ts[mask_lin]
     w_lin = island_width[mask_lin]
@@ -713,7 +361,6 @@ def analyze_single_run(
           f"R²_lin = {gamma_R2:.3f}, σ_γ = {gamma_fit_err:.3e}")
 
     # ----- Rutherford slope: w(t) ~ w0_R + (dw/dt)_R t ----- #
-    # Ensure we start after the linear window.
     f_low, f_high = ruth_frac
     T = ts[-1] - ts[0]
     t_lin_end = t_lin[-1]
@@ -759,7 +406,6 @@ def analyze_single_run(
         if dw_dt_R_R2 < 0.8 or dw_dt_R <= 0:
             print("[WARN] Rutherford fit has low R² or non-positive slope; "
                   "marking as invalid for global scaling.")
-            # keep values but flag later via R² / sign.
 
     # ----- Saturated island width (last 20% of time) ----- #
     t_sat_min = ts[0] + 0.8 * (ts[-1] - ts[0])
@@ -806,7 +452,8 @@ def analyze_single_run(
     ax_bottom = axes[1]
     ax_bottom.plot(ts, lnw_over_a, "-", label=r"$\ln(w/a)$")
     ax_bottom.plot(t_lin, lnw_lin_over_a, "o", ms=4, label=r"fit points")
-    ax_bottom.plot(t_fit_line, lnw_fit_line, "--", label=rf"fit: $\gamma={gamma_fit:.3e}$")
+    ax_bottom.plot(t_fit_line, lnw_fit_line, "--",
+                   label=rf"fit: $\gamma={gamma_fit:.3e}$")
     ax_bottom.set_xlabel(r"$t$")
     ax_bottom.set_ylabel(r"$\ln(w/a)$")
     ax_bottom.grid(True, ls=":")
@@ -845,6 +492,7 @@ def analyze_single_run(
 
     # Regime markers on all three panels
     used_labels = set()
+
     def _add_marker(ax, t, label, style="--"):
         if not np.isfinite(t):
             return
@@ -901,7 +549,8 @@ def analyze_single_run(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Run a multi-parameter tearing scan and build Loureiro-style plots."
+        description="Run multi-parameter tearing scans and build Loureiro-style "
+                    "plots for different equilibrium models."
     )
 
     # Scan parameters
@@ -909,20 +558,20 @@ def parse_args():
         "--scan-a",
         type=float,
         nargs="+",
-        # a ≈ 0.6, 0.785 → Δ'a ≈ 2.0, 0.98  (FKR/small-Δ′ regime)
+        # a ≈ 0.5, 0.6, 0.785 → Δ'a ≈ 3, 2.13, 0.98 (FKR/small-Δ′ regime)
         default=[0.5, 0.6, 0.785],
         help="List of current-sheet half-widths a to scan "
-             "(defaults give Δ'a ≈ 1–2, i.e. FKR/small-Δ′ regime).",
+             "(defaults give Δ'a ≈ 1–3, i.e. FKR/small-Δ′ regime).",
     )
 
     p.add_argument(
         "--scan-eta",
         type=float,
         nargs="+",
-        # For B0=1 this gives S ~ 600–4000 for these a's
+        # For B0=1 this gives S ~ 400–2500 for these a's
         default=[1.25e-3, 6.25e-4, 3.125e-4],
         help="List of resistivities η to scan "
-             "(defaults give S ~ 10^3–10^4 in a well-resolved FKR/Rutherford regime).",
+             "(defaults give S ~ 10^3 in a well-resolved FKR/Rutherford regime).",
     )
 
     # Grid and box
@@ -936,7 +585,7 @@ def parse_args():
     # Physical parameters
     p.add_argument("--nu", type=float, default=5e-4)
     p.add_argument("--B0", type=float, default=1.0)
-    p.add_argument("--Bg", type=float, default=0.)
+    p.add_argument("--Bg", type=float, default=0.0)
     p.add_argument("--epsB", type=float, default=1e-5)
 
     # Time integration
@@ -947,8 +596,7 @@ def parse_args():
     p.add_argument("--force-rerun", action="store_true",
                    help="Re-run simulations even if NPZ files already exist.")
 
-    # Fitting windows (kept for CLI completeness, not used directly
-    # in the auto selector, except indirectly in Rutherford fit.)
+    # Fitting windows (kept for CLI completeness)
     p.add_argument(
         "--lin-tmin",
         type=float,
@@ -968,8 +616,21 @@ def parse_args():
         default=(0.5, 0.95),
         metavar=("F_START", "F_END"),
         help=("Fractional window [F_START,F_END] of total time used as "
-              "a nominal Rutherford interval (default: 0.4 0.9). "
+              "a nominal Rutherford interval (default: 0.5 0.95). "
               "The actual fit starts after the linear window."),
+    )
+
+    # Equilibrium models to scan
+    p.add_argument(
+        "--equilibrium-modes",
+        type=str,
+        nargs="+",
+        choices=["original", "forcefree"],
+        default=["original", "forcefree"],
+        help=("Which equilibrium formulations to scan. "
+              "'original' = standard incompressible MHD; "
+              "'forcefree' = equilibrium-subtracted RHS so (v=0,B=B0) is "
+              "an exact solution. Default: both."),
     )
 
     # Output
@@ -977,15 +638,25 @@ def parse_args():
         "--outdir",
         type=str,
         default="tearing_scan_plots",
-        help="Output directory for NPZ runs, summary, and plots.",
+        help="Root output directory for NPZ runs, summaries, and plots. "
+             "Per-equilibrium results are placed in subdirs "
+             "outdir/<equilibrium_mode>/.",
     )
 
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.outdir, exist_ok=True)
+def run_scan_for_mode(args, equilibrium_mode: str):
+    """
+    Run full (a, eta) scan and analysis for a given equilibrium_mode.
+    """
+    mode_dir = os.path.join(args.outdir, equilibrium_mode)
+    os.makedirs(mode_dir, exist_ok=True)
+
+    print(f"\n======================")
+    print(f"[INFO] Equilibrium mode: {equilibrium_mode}")
+    print(f"[INFO] Output directory: {mode_dir}")
+    print(f"======================\n")
 
     # Build list of (a, eta) combinations
     combos: List[Tuple[float, float]] = []
@@ -1002,12 +673,15 @@ def main():
     for idx, (a, eta) in enumerate(combos):
         tag = f"a{a:.3g}_eta{eta:.3g}"
         tag = tag.replace(".", "p").replace("-", "m")
-        outfile = os.path.join(args.outdir, f"mhd_tearing_solution_{tag}.npz")
+        outfile = os.path.join(
+            mode_dir, f"mhd_tearing_solution_{tag}.npz"
+        )
 
         if os.path.exists(outfile) and not args.force_rerun:
-            print(f"\n[INFO] Skipping solve for {tag}, file already exists.")
+            print(f"\n[INFO] Skipping solve for {tag} ({equilibrium_mode}), "
+                  f"file already exists.")
         else:
-            print(f"\n[INFO] Running solve for {tag} ...")
+            print(f"\n[INFO] Running solve for {tag} ({equilibrium_mode}) ...")
             solve_tearing_case(
                 Nx=args.Nx,
                 Ny=args.Ny,
@@ -1026,6 +700,7 @@ def main():
                 n_frames=args.n_frames,
                 dt0=args.dt0,
                 outfile=outfile,
+                equilibrium_mode=equilibrium_mode,
             )
 
         # Postprocess
@@ -1060,7 +735,9 @@ def main():
     w_sat_over_a_std_arr = w_sat_std_arr / a_arr
 
     # Save summary
-    summary_path = os.path.join(args.outdir, "tearing_scan_summary.npz")
+    summary_path = os.path.join(
+        mode_dir, f"tearing_scan_summary_{equilibrium_mode}.npz"
+    )
     np.savez(
         summary_path,
         fnames=fnames,
@@ -1081,6 +758,7 @@ def main():
         w_sat_std=w_sat_std_arr,
         w_sat_over_a=w_sat_over_a_arr,
         w_sat_over_a_std=w_sat_over_a_std_arr,
+        equilibrium_mode=equilibrium_mode,
     )
     print(f"\n[SAVE] Summary saved to {summary_path}")
 
@@ -1094,7 +772,8 @@ def main():
     gmin = 0.5 * np.min(gamma_FKR_arr)
     gmax = 2.0 * np.max(gamma_FKR_arr)
     ref = np.linspace(gmin, gmax, 100)
-    ax1.loglog(ref, ref, "--", color="0.4", lw=1.5, label=r"$\gamma_{\rm fit}=\gamma_{\rm FKR}$")
+    ax1.loglog(ref, ref, "--", color="0.4", lw=1.5,
+               label=r"$\gamma_{\rm fit}=\gamma_{\rm FKR}$")
 
     for i, name in enumerate(fnames):
         ax1.annotate(
@@ -1107,12 +786,18 @@ def main():
 
     ax1.set_xlabel(r"$\gamma_{\rm FKR}$")
     ax1.set_ylabel(r"$\gamma_{\rm fit}$")
-    ax1.set_title(r"Linear growth: $\gamma_{\rm fit}$ vs FKR theory")
+    ax1.set_title(
+        r"Linear growth: $\gamma_{\rm fit}$ vs FKR theory"
+        + f" ({equilibrium_mode})"
+    )
     ax1.grid(True, which="both", ls=":")
     ax1.legend(loc="best")
-    fig1.savefig(os.path.join(args.outdir, "scan_gamma_fit_vs_FKR.png"))
+    fig1.savefig(os.path.join(
+        mode_dir, f"scan_gamma_fit_vs_FKR_{equilibrium_mode}.png"
+    ))
     plt.close(fig1)
-    print("[SAVE] scan_gamma_fit_vs_FKR.png")
+    print("[SAVE] scan_gamma_fit_vs_FKR_"
+          f"{equilibrium_mode}.png")
 
     # ------------------------------------------------------------------ #
     # Plot 2: Rutherford scaling: (dw/dt)_R vs η Δ' (with error bars)
@@ -1134,10 +819,16 @@ def main():
         logx = np.log(etaDelta_arr[mask_good_R])
         logy = np.log(dw_dt_R_arr[mask_good_R])
         a_fit, b_fit = np.polyfit(logx, logy, 1)
-        xfit = np.linspace(etaDelta_arr[mask_good_R].min() * 0.8,
-                           etaDelta_arr[mask_good_R].max() * 1.2, 200)
+        xfit = np.linspace(
+            etaDelta_arr[mask_good_R].min() * 0.8,
+            etaDelta_arr[mask_good_R].max() * 1.2,
+            200,
+        )
         yfit = np.exp(b_fit) * xfit**a_fit
-        ax2.loglog(xfit, yfit, "k--", label=rf"fit (good runs): slope={a_fit:.2f}")
+        ax2.loglog(
+            xfit, yfit, "k--",
+            label=rf"fit (good runs): slope={a_fit:.2f}",
+        )
     else:
         a_fit = float("nan")
         print("[WARN] Too few good Rutherford points for a global scaling fit.")
@@ -1153,12 +844,15 @@ def main():
 
     ax2.set_xlabel(r"$\eta \Delta'$")
     ax2.set_ylabel(r"$(\mathrm{d}w/\mathrm{d}t)_R$")
-    ax2.set_title(r"Rutherford scaling")
+    ax2.set_title(r"Rutherford scaling" + f" ({equilibrium_mode})")
     ax2.grid(True, which="both", ls=":")
     ax2.legend(loc="best")
-    fig2.savefig(os.path.join(args.outdir, "scan_Rutherford_dw_dt_vs_etaDelta.png"))
+    fig2.savefig(os.path.join(
+        mode_dir, f"scan_Rutherford_dw_dt_vs_etaDelta_{equilibrium_mode}.png"
+    ))
     plt.close(fig2)
-    print("[SAVE] scan_Rutherford_dw_dt_vs_etaDelta.png")
+    print("[SAVE] scan_Rutherford_dw_dt_vs_etaDelta_"
+          f"{equilibrium_mode}.png")
 
     # ------------------------------------------------------------------ #
     # Plot 3: Saturated island width vs Δ' (normalized, with error bars)
@@ -1170,7 +864,9 @@ def main():
     logx2 = np.log(Delta_prime_arr)
     logy2 = np.log(w_sat_over_a_arr)
     a_fit2, b_fit2 = np.polyfit(logx2, logy2, 1)
-    xfit2 = np.linspace(Delta_prime_arr.min() * 0.8, Delta_prime_arr.max() * 1.2, 200)
+    xfit2 = np.linspace(
+        Delta_prime_arr.min() * 0.8, Delta_prime_arr.max() * 1.2, 200
+    )
     yfit2 = np.exp(b_fit2) * xfit2**a_fit2
     ax3.loglog(xfit2, yfit2, "k--", label=rf"fit: slope={a_fit2:.2f}")
 
@@ -1185,12 +881,18 @@ def main():
 
     ax3.set_xlabel(r"$\Delta'$")
     ax3.set_ylabel(r"$w_{\rm sat}/a$")
-    ax3.set_title(r"Saturated island width vs $\Delta'$ (normalized)")
+    ax3.set_title(
+        r"Saturated island width vs $\Delta'$ (normalized)"
+        + f" ({equilibrium_mode})"
+    )
     ax3.grid(True, which="both", ls=":")
     ax3.legend(loc="best")
-    fig3.savefig(os.path.join(args.outdir, "scan_wsat_over_a_vs_Deltaprime.png"))
+    fig3.savefig(os.path.join(
+        mode_dir, f"scan_wsat_over_a_vs_Deltaprime_{equilibrium_mode}.png"
+    ))
     plt.close(fig3)
-    print("[SAVE] scan_wsat_over_a_vs_Deltaprime.png")
+    print("[SAVE] scan_wsat_over_a_vs_Deltaprime_"
+          f"{equilibrium_mode}.png")
 
     # ------------------------------------------------------------------ #
     # Plot 4: gamma_fit/gamma_FKR vs S and vs Delta'
@@ -1202,27 +904,48 @@ def main():
     ax4a.semilogx(S_arr, ratio_arr, "o")
     ax4a.set_xlabel(r"$S$")
     ax4a.set_ylabel(r"$\gamma_{\rm fit}/\gamma_{\rm FKR}$")
-    ax4a.set_title(r"Departure from FKR theory vs Lundquist number")
+    ax4a.set_title(
+        r"Departure from FKR theory vs Lundquist number"
+        + f" ({equilibrium_mode})"
+    )
     ax4a.grid(True, which="both", ls=":")
-    fig4a.savefig(os.path.join(args.outdir, "scan_gamma_ratio_vs_S.png"))
+    fig4a.savefig(os.path.join(
+        mode_dir, f"scan_gamma_ratio_vs_S_{equilibrium_mode}.png"
+    ))
     plt.close(fig4a)
-    print("[SAVE] scan_gamma_ratio_vs_S.png")
+    print("[SAVE] scan_gamma_ratio_vs_S_"
+          f"{equilibrium_mode}.png")
 
     # (b) ratio vs Delta'
     fig4b, ax4b = plt.subplots()
     ax4b.semilogx(Delta_prime_arr, ratio_arr, "o")
     ax4b.set_xlabel(r"$\Delta'$")
     ax4b.set_ylabel(r"$\gamma_{\rm fit}/\gamma_{\rm FKR}$")
-    ax4b.set_title(r"Departure from FKR theory vs $\Delta'$")
+    ax4b.set_title(
+        r"Departure from FKR theory vs $\Delta'$"
+        + f" ({equilibrium_mode})"
+    )
     ax4b.grid(True, which="both", ls=":")
-    fig4b.savefig(os.path.join(args.outdir, "scan_gamma_ratio_vs_Deltaprime.png"))
+    fig4b.savefig(os.path.join(
+        mode_dir, f"scan_gamma_ratio_vs_Deltaprime_{equilibrium_mode}.png"
+    ))
     plt.close(fig4b)
-    print("[SAVE] scan_gamma_ratio_vs_Deltaprime.png")
+    print("[SAVE] scan_gamma_ratio_vs_Deltaprime_"
+          f"{equilibrium_mode}.png")
 
-    print("\n[DONE] Scan analysis complete.")
+    print("\n[DONE] Scan analysis complete for"
+          f" equilibrium_mode = {equilibrium_mode}.")
     print("      Each point index in the plots corresponds to:")
     for i, name in enumerate(fnames):
         print(f"        {i}: {name}")
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    for equilibrium_mode in args.equilibrium_modes:
+        run_scan_for_mode(args, equilibrium_mode)
 
 
 if __name__ == "__main__":

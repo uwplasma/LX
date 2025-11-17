@@ -37,7 +37,7 @@ where
   - φ_s is a single-valued harmonic potential represented by a
     single-layer potential over Γ:
 
-        φ_s(x) = - ∫_Γ σ(y) G(x,y) dS_y,   G(x,y) = 1/(4π|x-y|).
+        φ_s(x) = ∫_Γ σ(y) G(x,y) dS_y,   G(x,y) = 1/(4π|x-y|).
 
 The field is
 
@@ -57,7 +57,10 @@ we obtain the boundary integral equation
 
 where
 
-    K'_{ij} ≈ ∂_{n_x} G(x_i, x_j) W_j.
+    K'_{ij} ≈ ∂_{n_x} G(x_i, x_j) W_j
+
+is discretized with a clipped near-field kernel to mimic integration
+over a finite patch instead of a point singularity.
 
 We construct B_mv as a linear combination of two axis-aware multivalued
 basis fields (toroidal/poloidal):
@@ -127,6 +130,12 @@ field evaluation, energy and flux functionals) are implemented in JAX,
 so that φ, B, and the energy functional are differentiable with respect
 to geometry (point cloud P, normals N, etc).
 
+We use a “brutal” Nyström discretization over a point cloud with
+kNN-based patch areas and a clipped kernel to regularize near-field
+interactions. The `clip_factor` parameter controls how aggressively the
+singularity is regularized; smaller values give sharper kernels and
+higher accuracy at the cost of conditioning.
+
 Diagnostics and plots
 ---------------------
 
@@ -147,7 +156,7 @@ and produces plots:
 Usage
 -----
 
-  python bie_vacuum_energy_min_vmec_like.py \
+  python bim.py \
       --xyz inputs/wout_precise_QH.csv \
       --normals inputs/wout_precise_QH_normals.csv \
       --phiedge 1.0
@@ -223,6 +232,9 @@ def fix_matplotlib_3d(ax):
 # ----------------------------------------------------------------------
 
 def load_surface_xyz_normals(xyz_csv, normals_csv, verbose=True):
+    """
+    Load surface point cloud P and normals N from CSV, and normalize normals.
+    """
     P = np.loadtxt(xyz_csv, delimiter=",", skiprows=1)
     N = np.loadtxt(normals_csv, delimiter=",", skiprows=1)
     assert P.shape[1] == 3 and N.shape[1] == 3, "CSV must have 3 columns"
@@ -259,7 +271,7 @@ def normalize_geometry(P, verbose=True):
 
     We retain both world coordinates (P) and normalized coordinates (Pn) for:
       - BIE kernels in world coordinates
-      - multivalued bases built in normalized coordinates
+      - multivalued bases built in normalized coordinates.
     """
     c = jnp.mean(P, axis=0)
     r = jnp.linalg.norm(P - c, axis=1)
@@ -299,23 +311,31 @@ def pairwise_dist2(P):
 @jit
 def estimate_area_weights_knn(P, k=32):
     """
-    Return:
+    Estimate patch areas and local spacing from a k-NN heuristic.
+
+    Returns:
       W : (N,) crude patch areas
       h : (N,) local spacing ~ distance to k-th nearest neighbor
 
-    We also use h to regularize near-singular kernels in build_Kprime.
+    We also use h later to regularize near-singular kernels in build_Kprime.
     """
+    k_int = jnp.asarray(k, dtype=jnp.int32)
+
     Npts = P.shape[0]
     D2 = pairwise_dist2(P)              # (N,N)
     big = jnp.max(D2) + 1.0
-    D2 = D2 + jnp.eye(Npts) * big       # kill self-distance
+    D2 = D2 + jnp.eye(Npts, dtype=D2.dtype) * big  # kill self-distance
 
     D2_sorted = jnp.sort(D2, axis=1)
-    h = jnp.sqrt(D2_sorted[:, k-1])     # (N,)
-    W = jnp.pi * h*h
+    h = jnp.sqrt(D2_sorted[:, k_int - 1])     # (N,)
+
+    # Each disk of radius h contains ~k points ⇒ area ≈ k * (true patch area).
+    # Divide by k so that ∑ W ≈ total surface area.
+    k_float = k_int.astype(P.dtype)
+    W = (jnp.pi * h * h) / k_float
 
     jdbg.print("[QUAD] k={k}, h stats: min={mn:.3e}, med={md:.3e}, max={mx:.3e}",
-               k=k, mn=jnp.min(h), md=jnp.median(h), mx=jnp.max(h))
+               k=k_int, mn=jnp.min(h), md=jnp.median(h), mx=jnp.max(h))
     jdbg.print("[QUAD] area weights: sum W ≈ {sw:.3e}", sw=jnp.sum(W))
     return W, h
 
@@ -327,15 +347,6 @@ def detect_geometry_and_axis(Pn, verbose=True):
     """
     PCA on normalized coordinates Pn to choose an axis a_hat and classify
     the geometry as 'torus' or 'mirror'.
-
-      - 'torus': two large singular values, one much smaller.
-      - 'mirror': one very large singular value, two comparable smaller.
-
-    Returns:
-      kind: 'torus' or 'mirror'
-      a_hat: unit axis vector in normalized-space coordinates
-      E:     3x3 matrix of principal directions (columns)
-      svals: singular values (descending)
     """
     X = Pn - jnp.mean(Pn, axis=0)
     U, S, Vt = jnp.linalg.svd(X, full_matrices=False)
@@ -393,10 +404,6 @@ def multivalued_bases_about_axis(Pn_ref, N_ref, a_hat, verbose=True):
       - grad_t(Xn): toroidal basis, ∇φ_tor with φ_tor = a_hat·x  (constant field).
       - grad_p(Xn): poloidal basis, ∇φ_pol = ∇ϕ_a (azimuth around axis a_hat),
                     harmonic and multi-valued, singular only on the axis line.
-
-    Both are gradients of harmonic scalars, so any linear combination
-    a_t grad_t + a_p grad_p is a vacuum field (up to the axis singularity),
-    and adding ∇φ_s (single-layer) preserves the vacuum property.
     """
     Pn_ref = jnp.asarray(Pn_ref)
     N_ref  = jnp.asarray(N_ref)
@@ -406,27 +413,16 @@ def multivalued_bases_about_axis(Pn_ref, N_ref, a_hat, verbose=True):
 
     def grad_t(Xn):
         """
-        Toroidal-like basis: constant harmonic field along the PCA axis.
+        Toroidal-like basis: constant harmonic field along the PCA axis:
 
           φ_t(X) = a_hat·X  ⇒  ∇φ_t = a_hat (constant).
-
-        In world coordinates, B_t_mv = scale * a_hat; since scale is
-        applied outside, here we just broadcast a_hat in normalized coords.
         """
         Xn = jnp.asarray(Xn)
-        # shape (M,3), each row = a_unit
         return jnp.broadcast_to(a_unit, Xn.shape)
 
     def grad_p(Xn):
         """
         Poloidal-like basis: azimuth around the axis a_hat.
-
-          r_par  = (X·a_hat)a_hat
-          r_perp = X - r_par
-          ∇ϕ_a = (a_hat × r_perp)/|r_perp|^2
-
-        This is the gradient of a multi-valued harmonic scalar away from
-        the axis line, giving the "looping" poloidal direction.
         """
         return grad_azimuth_about_axis(Xn, a_hat)
 
@@ -444,12 +440,15 @@ def multivalued_bases_about_axis(Pn_ref, N_ref, a_hat, verbose=True):
 @jit
 def build_Kprime(P, N, W, h, clip_factor=0.2):
     """
-    Build K' with near-singular regularization:
+    Build K' with *local* near-singular regularization:
 
-        r_eff^2 = max(r^2, (clip_factor * h_min)^2).
+        r_eff^2 = max(r^2, (clip_factor * h_ij)^2),
 
-    where h_min is the global min spacing. This mimics integrating over
-    a finite patch instead of a point singularity.
+    where h_ij ~ 0.5 (h_i + h_j) is a local pairwise spacing.
+
+    This mimics integrating over a finite patch instead of a point
+    singularity, while avoiding a single global h_min that can
+    over-regularize coarse regions.
     """
     X = P
     Ni = N
@@ -460,10 +459,14 @@ def build_Kprime(P, N, W, h, clip_factor=0.2):
     diff = Xi - Xj      # (N,N,3)
     r2 = jnp.sum(diff*diff, axis=-1)  # (N,N)
 
-    h_min = jnp.min(h)
-    r2_clip = (clip_factor * h_min)**2
+    Npts = X.shape[0]
+    mask = ~jnp.eye(Npts, dtype=bool)
 
-    mask = ~jnp.eye(X.shape[0], dtype=bool)
+    # Local pairwise h_ij
+    hi = h[:, None]
+    hj = h[None, :]
+    h_pair = 0.5 * (hi + hj)
+    r2_clip = (clip_factor * h_pair)**2
 
     r2_clipped = jnp.maximum(r2, r2_clip)
     r2_safe = jnp.where(mask, r2_clipped, 1.0)  # dummy diagonal
@@ -476,7 +479,7 @@ def build_Kprime(P, N, W, h, clip_factor=0.2):
 
     Kprime = n_dot_grad * Wj[None, :]
 
-    jdbg.print("[K'] clip_factor={cf:.3f}, h_min={hm:.3e}", cf=clip_factor, hm=h_min)
+    jdbg.print("[K'] clip_factor={cf:.3f}", cf=clip_factor)
     jdbg.print("[K'] Kprime shape = ({n},{m})", n=Kprime.shape[0], m=Kprime.shape[1])
     jdbg.print("[K'] |K'| stats: min={mn:.3e}, med={md:.3e}, max={mx:.3e}",
                mn=jnp.min(jnp.abs(Kprime)),
@@ -489,17 +492,26 @@ def build_Kprime(P, N, W, h, clip_factor=0.2):
 # ----------------------------------------------------------------------
 
 @jit
-def solve_density_sigma(P, N, W, h, g, reg=1e-6):
+def solve_density_sigma(P, N, W, h, g, reg=1e-6, clip_factor=0.2):
     """
     Solve (½ I + K') σ = g with clipped near-field and small
     Tikhonov regularization reg * I.
+
+    Discrete equation:
+
+        (-1/2 I + K') σ + reg I σ = -g
+
+    which corresponds to the continuous relation
+
+        ∂_n φ_s = -1/2 σ + K'σ
+
+    combined with n·B_mv + ∂_n φ_s = 0.
     """
     Npts = P.shape[0]
-    Kprime = build_Kprime(P, N, W, h)
+    Kprime = build_Kprime(P, N, W, h, clip_factor=clip_factor)
     I = jnp.eye(Npts)
     A = -0.5 * I + Kprime + reg * I
 
-    # correct RHS:
     rhs = -g
 
     jdbg.print("[SOLVE] Assembling A, shape=({n},{m})", n=A.shape[0], m=A.shape[1])
@@ -510,32 +522,33 @@ def solve_density_sigma(P, N, W, h, g, reg=1e-6):
     jdbg.print("[SOLVE] ||sigma||_2 = {ns:.3e}", ns=jnp.linalg.norm(sigma))
     return sigma
 
-def diagnostics_integral_eq(P, N, W, h, g, sigma):
+def diagnostics_integral_eq(P, N, W, h, g, sigma, clip_factor=0.2):
     """
-    Diagnostic for the integral equation (½I + K')σ = g.
+    Diagnostic for the integral equation (½I + K')σ = g:
+
+        r = (-1/2 I + K')σ + g  ≈ 0.
     """
-    Kprime = build_Kprime(P, N, W, h)
+    Kprime = build_Kprime(P, N, W, h, clip_factor=clip_factor)
     Npts = P.shape[0]
     A = -0.5 * jnp.eye(Npts) + Kprime
-    r = A @ sigma + g   # (-1/2 I + K')σ + g = 0 ideally
+    r = A @ sigma + g
 
     vec_stats("[IE] residual r = (-½I + K')σ + g", r)
     return np.asarray(r)
 
-def diagnostics_normal_on_boundary(P, N, W, h, g, sigma):
+def diagnostics_normal_on_boundary(P, N, W, h, g, sigma, clip_factor=0.2):
     """
     Compute n·B on Γ using the analytic jump relation:
 
-        n·B = g - (½ σ + K'σ),
-
-    where g = n·B_mv was used in (½I + K')σ = g.
+        ∂_n φ_s = -1/2 σ + K'σ
+        n·B     = g + ∂_n φ_s.
     """
-    Kprime = build_Kprime(P, N, W, h)
+    Kprime = build_Kprime(P, N, W, h, clip_factor=clip_factor)
     sigma = jnp.asarray(sigma)
     g = jnp.asarray(g)
 
     Ksigma = Kprime @ sigma
-    n_dot_B = g + (-0.5 * sigma + Ksigma)  # g + ∂n φ_s
+    n_dot_B = g + (-0.5 * sigma + Ksigma)
 
     vec_stats("[BC-analytic] n·B on Γ (jump formula)", n_dot_B)
 
@@ -550,6 +563,13 @@ def diagnostics_normal_on_boundary(P, N, W, h, g, sigma):
 # ----------------------------------------------------------------------
 
 def make_single_layer_evaluators(P_src, W_src, sigma, h_min, clip_factor=0.2):
+    """
+    Build batched evaluators φ_s(X) and ∇φ_s(X) from a solved density σ.
+
+    The gradient uses a clipped kernel with h_min and clip_factor to
+    avoid catastrophic near-singular contributions when evaluating
+    close to the surface.
+    """
     P_src = jnp.asarray(P_src)
     W_src = jnp.asarray(W_src)
     sigma = jnp.asarray(sigma)
@@ -618,11 +638,14 @@ def make_total_field_evaluators_for_fixed_a(P_src, W_src, sigma,
 def solve_basis_fields(P, N, W, h,
                        Pn, scinfo: ScaleInfo,
                        grad_t_fn, grad_p_fn,
-                       reg=1e-6):
+                       reg=1e-6,
+                       clip_factor=0.2):
     """
     Solve the BIE twice for basis coefficients:
 
       a^(1) = (1,0), a^(2) = (0,1),
+
+    using the same near-field kernel (clip_factor) as the production solve.
     """
     Gt_bdry = grad_t_fn(Pn)
     Gp_bdry = grad_p_fn(Pn)
@@ -636,29 +659,32 @@ def solve_basis_fields(P, N, W, h,
     vec_stats("[BASIS] g_t = n·B_t", Dt)
     vec_stats("[BASIS] g_p = n·B_p", Dp)
 
-    sigma1 = solve_density_sigma(P, N, W, h, Dt, reg=reg)
-    sigma2 = solve_density_sigma(P, N, W, h, Dp, reg=reg)
+    sigma1 = solve_density_sigma(P, N, W, h, Dt, reg=reg, clip_factor=clip_factor)
+    sigma2 = solve_density_sigma(P, N, W, h, Dp, reg=reg, clip_factor=clip_factor)
 
     return (Dt, Dp), (sigma1, sigma2), (B_t_bdry, B_p_bdry)
 
 def build_basis_evaluators(P, W, h_min,
                            scinfo: ScaleInfo,
                            grad_t_fn, grad_p_fn,
-                           sigma1, sigma2):
+                           sigma1, sigma2,
+                           clip_factor=0.2):
     """
     Build JAX field evaluators for the two basis fields:
 
       B^(1) : a = (1,0)
       B^(2) : a = (0,1)
+
+    using the same clip_factor for field evaluation.
     """
     a1 = jnp.array([1.0, 0.0])
     a2 = jnp.array([0.0, 1.0])
 
     phi1_fn, B1_fn, B1_mv_fn = make_total_field_evaluators_for_fixed_a(
-        P, W, sigma1, scinfo, a1, grad_t_fn, grad_p_fn, h_min
+        P, W, sigma1, scinfo, a1, grad_t_fn, grad_p_fn, h_min, clip_factor=clip_factor
     )
     phi2_fn, B2_fn, B2_mv_fn = make_total_field_evaluators_for_fixed_a(
-        P, W, sigma2, scinfo, a2, grad_t_fn, grad_p_fn, h_min
+        P, W, sigma2, scinfo, a2, grad_t_fn, grad_p_fn, h_min, clip_factor=clip_factor
     )
 
     return (phi1_fn, B1_fn, B1_mv_fn), (phi2_fn, B2_fn, B2_mv_fn)
@@ -747,9 +773,6 @@ def build_energy_flux_matrices_on_cross_section(P,
       - M encodes the 3D magnetic energy via volume weights
         w_vol = 2π ρ w_area.
       - c encodes the toroidal flux via Φ_tor = ∫_S B·a_hat dS.
-
-    Returns:
-      M, c, X_cs, B1_cs, B2_cs
     """
     X_cs, w_area, rho = build_poloidal_cross_section_quadrature(
         P, a_hat, E, scinfo,
@@ -810,6 +833,10 @@ def solve_energy_minimizing_coeffs(M, c, phiedge):
 
 def diagnostics_on_inner_shell(P, N, W, B_fn,
                                h_min=None, eps_factor=0.3, label="inner shell"):
+    """
+    Sample B slightly inside the boundary along normals, and report
+    magnitude and normal component, plus flux through the shell.
+    """
     X = jnp.asarray(P)
     Nw = jnp.asarray(N)
     Ww = jnp.asarray(W)
@@ -932,7 +959,10 @@ def compute_Bs_tan_on_boundary(P, N, W, sigma, h, clip_factor=0.2):
     Tangential part of B_s = ∇φ_s on Γ using singularity subtraction.
 
     For a constant σ, the tangential component is zero, so we subtract σ_i:
-        B_s^tan(x_i) = - sum_j (σ_j - σ_i) W_j ∇G(x_i, x_j), projected to tangent.
+
+        B_s^tan(x_i) = - sum_j (σ_j - σ_i) W_j ∇G(x_i, x_j),
+
+    and project to the tangent plane.
     """
     X = jnp.asarray(P)
     Nw = jnp.asarray(N)
@@ -946,8 +976,11 @@ def compute_Bs_tan_on_boundary(P, N, W, sigma, h, clip_factor=0.2):
     diff = Xi - Xj          # (N,N,3)
     r2 = jnp.sum(diff * diff, axis=-1)   # (N,N)
 
-    h_min = jnp.min(h)
-    r2_clip = (clip_factor * h_min)**2
+    # Local pairwise h_ij for clipping
+    hi = h[:, None]
+    hj = h[None, :]
+    h_pair = 0.5 * (hi + hj)
+    r2_clip = (clip_factor * h_pair)**2
     mask = ~jnp.eye(Npts, dtype=bool)
 
     r2 = jnp.where(mask, jnp.maximum(r2, r2_clip), 1.0)
@@ -967,7 +1000,6 @@ def compute_Bs_tan_on_boundary(P, N, W, sigma, h, clip_factor=0.2):
     n_dot_Bs = jnp.sum(n_hat * Bs, axis=1, keepdims=True)
     Bs_tan = Bs - n_hat * n_dot_Bs
     return Bs_tan  # (N,3)
-
 
 def build_B_on_boundary_with_jump(P, N, W, h,
                                   scinfo: ScaleInfo,
@@ -1000,7 +1032,7 @@ def build_B_on_boundary_with_jump(P, N, W, h,
     B_s_tan = compute_Bs_tan_on_boundary(P, N, W, sigma, h, clip_factor=clip_factor)
 
     # 3) normal part of B_s from jump relation
-    Kprime = build_Kprime(P, N, W, h)
+    Kprime = build_Kprime(P, N, W, h, clip_factor=clip_factor)
     Ksigma = Kprime @ sigma
     n_dot_B_s = (-0.5 * sigma + Ksigma)      # (N,)
 
@@ -1020,8 +1052,10 @@ def main(xyz_csv,
          k_nn=32,
          reg=1e-10,
          phiedge=1.0,
+         clip_factor=0.2,
          mfs_out=None,
-         verbose=True):
+         verbose=True,
+         xs_n_r=32, xs_n_theta=64, xs_margin_frac=0.15):
 
     print("========================================================")
     print(" Boundary-Integral Neumann Laplace Solver (B = ∇φ)")
@@ -1030,6 +1064,7 @@ def main(xyz_csv,
     print(f"[PARAM] k_nn   = {k_nn}")
     print(f"[PARAM] reg    = {reg:.1e} (small Tikhonov)")
     print(f"[PARAM] phiedge (toroidal flux) = {phiedge:.6g}")
+    print(f"[PARAM] clip_factor = {clip_factor:.3f}")
 
     # Load surface geometry
     P, N = load_surface_xyz_normals(xyz_csv, normals_csv, verbose=verbose)
@@ -1057,7 +1092,8 @@ def main(xyz_csv,
     # --- Step 1: basis solves for (1,0) and (0,1) ---
 
     (Dt, Dp), (sigma1, sigma2), (B_t_bdry, B_p_bdry) = solve_basis_fields(
-        P, N, W, h, Pn, scinfo, grad_t_fn, grad_p_fn, reg=reg
+        P, N, W, h, Pn, scinfo, grad_t_fn, grad_p_fn,
+        reg=reg, clip_factor=clip_factor
     )
     print(f"[BASIS] ||σ₁||₂ = {jnp.linalg.norm(sigma1):.6e}, ||σ₂||₂ = {jnp.linalg.norm(sigma2):.6e}")
     print(f"[BASIS] ||B_t||_avg = {jnp.linalg.norm(B_t_bdry)/float(B_t_bdry.shape[0]):.6e}, "
@@ -1065,13 +1101,14 @@ def main(xyz_csv,
     print(f"[BASIS] Flux_t ≈ {jnp.dot(W, Dt):.6e}, Flux_p ≈ {jnp.dot(W, Dp):.6e}")
 
     # Integral-equation residuals for each basis
-    _ = diagnostics_integral_eq(P, N, W, h, Dt, sigma1)
-    _ = diagnostics_integral_eq(P, N, W, h, Dp, sigma2)
+    _ = diagnostics_integral_eq(P, N, W, h, Dt, sigma1, clip_factor=clip_factor)
+    _ = diagnostics_integral_eq(P, N, W, h, Dp, sigma2, clip_factor=clip_factor)
 
     # --- Step 2: build basis field evaluators ---
 
     (phi1_fn, B1_fn, B1_mv_fn), (phi2_fn, B2_fn, B2_mv_fn) = build_basis_evaluators(
-        P, W, h_min, scinfo, grad_t_fn, grad_p_fn, sigma1, sigma2
+        P, W, h_min, scinfo, grad_t_fn, grad_p_fn, sigma1, sigma2,
+        clip_factor=clip_factor
     )
 
     # --- Step 3: energy matrix M and flux vector c on poloidal cross-section ---
@@ -1079,7 +1116,7 @@ def main(xyz_csv,
     M, c, X_cs, B1_cs, B2_cs = build_energy_flux_matrices_on_cross_section(
         P, a_hat, E, scinfo,
         B1_fn, B2_fn,
-        n_r=32, n_theta=64, margin_frac=0.15
+        n_r=xs_n_r, n_theta=xs_n_theta, margin_frac=xs_margin_frac
     )
 
     # --- Step 4: solve constrained minimization for a* ---
@@ -1093,15 +1130,15 @@ def main(xyz_csv,
     g_star = Dt * a_star[0] + Dp * a_star[1]
 
     # Diagnostics: integral equation residual for σ*
-    _ = diagnostics_integral_eq(P, N, W, h, g_star, sigma_star)
+    _ = diagnostics_integral_eq(P, N, W, h, g_star, sigma_star, clip_factor=clip_factor)
 
     # Analytic BC diagnostic using jump relation
-    _ = diagnostics_normal_on_boundary(P, N, W, h, g_star, sigma_star)
+    _ = diagnostics_normal_on_boundary(P, N, W, h, g_star, sigma_star, clip_factor=clip_factor)
 
     # Final field evaluators for a*
     phi_s_star_fn, B_star_fn, B_mv_star_fn = make_total_field_evaluators_for_fixed_a(
         P, W, sigma_star, scinfo, a_star, grad_t_fn, grad_p_fn,
-        h_min, clip_factor=0.2
+        h_min, clip_factor=clip_factor
     )
 
     # --- Step 6: boundary diagnostics on Γ with analytic regularization ---
@@ -1114,7 +1151,7 @@ def main(xyz_csv,
         grad_p_fn=grad_p_fn,
         sigma=sigma_star,
         g=g_star,
-        clip_factor=0.2,
+        clip_factor=clip_factor,
     )
 
     Bmag_bdry = jnp.linalg.norm(B_bdry, axis=1)
@@ -1189,12 +1226,20 @@ if __name__ == "__main__":
                         help="CSV file with nx,ny,nz columns (positional or --normals)")
     parser.add_argument("--k-nn", type=int, default=32,
                         help="k for kNN-based area weights (default: 32)")
+    parser.add_argument("--clip-factor", type=float, default=0.2,
+                        help="Near-singular clipping factor in K' and field evaluation")
     parser.add_argument("--reg", type=float, default=1e-6,
                         help="Small Tikhonov regularization for Neumann system")
     parser.add_argument("--phiedge", type=float, default=1.0,
                         help="Toroidal flux (phiedge) for energy minimization")
     parser.add_argument("--out", dest="mfs_out", default=None,
                         help="Output .npz path for checkpoint (optional)")
+    parser.add_argument("--xs-n-r", type=int, default=32,
+                        help="Number of radial points in the poloidal cross-section")
+    parser.add_argument("--xs-n-theta", type=int, default=64,
+                        help="Number of angular points in the poloidal cross-section")
+    parser.add_argument("--xs-margin-frac", type=float, default=0.15,
+                        help="Fractional radial margin inside boundary for cross-section")
 
     args = parser.parse_args()
 
@@ -1206,4 +1251,8 @@ if __name__ == "__main__":
         phiedge=args.phiedge,
         mfs_out=args.mfs_out,
         verbose=True,
+        clip_factor=args.clip_factor,
+        xs_n_r=args.xs_n_r,
+        xs_n_theta=args.xs_n_theta,
+        xs_margin_frac=args.xs_margin_frac,
     )
