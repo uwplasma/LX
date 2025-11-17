@@ -532,7 +532,7 @@ def select_linear_window(
     w,
     w0=None,
     min_pts: int = 6,
-    frac_sat: float = 0.12,
+    frac_sat: float = 0.13,
     nwin: int = 8,
     curv_tol: float = 0.02,
     R2_min: float = 0.97,
@@ -691,7 +691,7 @@ def analyze_single_run(
         island_width,
         w0=w0,
         min_pts=6,
-        frac_sat=0.12,
+        frac_sat=0.13,
         nwin=8,
         curv_tol=0.02,
         R2_min=0.97,
@@ -909,37 +909,40 @@ def parse_args():
         "--scan-a",
         type=float,
         nargs="+",
-        default=[0.25, 0.35, 0.45],
+        # a ≈ 0.6, 0.785 → Δ'a ≈ 2.0, 0.98  (FKR/small-Δ′ regime)
+        default=[0.5, 0.6, 0.785],
         help="List of current-sheet half-widths a to scan "
-             "(defaults chosen to give positive Δ' and span typical tearing values).",
+             "(defaults give Δ'a ≈ 1–2, i.e. FKR/small-Δ′ regime).",
     )
+
     p.add_argument(
         "--scan-eta",
         type=float,
         nargs="+",
-        default=[5e-4, 1e-3, 2e-3],
+        # For B0=1 this gives S ~ 600–4000 for these a's
+        default=[1.25e-3, 6.25e-4, 3.125e-4],
         help="List of resistivities η to scan "
-             "(defaults give S ~ 10^2–10^3 for B0=1, suitable for Rutherford scaling tests).",
+             "(defaults give S ~ 10^3–10^4 in a well-resolved FKR/Rutherford regime).",
     )
 
     # Grid and box
-    p.add_argument("--Nx", type=int, default=48)
-    p.add_argument("--Ny", type=int, default=48)
-    p.add_argument("--Nz", type=int, default=48)
+    p.add_argument("--Nx", type=int, default=152)
+    p.add_argument("--Ny", type=int, default=152)
+    p.add_argument("--Nz", type=int, default=1)
     p.add_argument("--Lx", type=float, default=2.0 * math.pi)
     p.add_argument("--Ly", type=float, default=2.0 * math.pi)
     p.add_argument("--Lz", type=float, default=2.0 * math.pi)
 
     # Physical parameters
-    p.add_argument("--nu", type=float, default=1e-3)
+    p.add_argument("--nu", type=float, default=5e-4)
     p.add_argument("--B0", type=float, default=1.0)
-    p.add_argument("--Bg", type=float, default=0.2)
-    p.add_argument("--epsB", type=float, default=0.01)
+    p.add_argument("--Bg", type=float, default=0.)
+    p.add_argument("--epsB", type=float, default=1e-5)
 
     # Time integration
     p.add_argument("--t0", type=float, default=0.0)
     p.add_argument("--t1", type=float, default=100.0)
-    p.add_argument("--n-frames", type=int, default=80)
+    p.add_argument("--n-frames", type=int, default=200)
     p.add_argument("--dt0", type=float, default=None)
     p.add_argument("--force-rerun", action="store_true",
                    help="Re-run simulations even if NPZ files already exist.")
@@ -962,7 +965,7 @@ def parse_args():
         "--ruth-frac",
         type=float,
         nargs=2,
-        default=(0.4, 0.9),
+        default=(0.5, 0.95),
         metavar=("F_START", "F_END"),
         help=("Fractional window [F_START,F_END] of total time used as "
               "a nominal Rutherford interval (default: 0.4 0.9). "
@@ -1091,7 +1094,7 @@ def main():
     gmin = 0.5 * np.min(gamma_FKR_arr)
     gmax = 2.0 * np.max(gamma_FKR_arr)
     ref = np.linspace(gmin, gmax, 100)
-    ax1.loglog(ref, ref, "k--", label=r"$\gamma_{\rm fit}=\gamma_{\rm FKR}$")
+    ax1.loglog(ref, ref, "--", color="0.4", lw=1.5, label=r"$\gamma_{\rm fit}=\gamma_{\rm FKR}$")
 
     for i, name in enumerate(fnames):
         ax1.annotate(

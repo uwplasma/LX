@@ -223,3 +223,4 @@ hpo_viz/*
 *psi_fci*.npz
 *tearing*.npz
 *.npz
+*.pkl
