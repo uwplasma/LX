@@ -20,6 +20,12 @@ This script does *both*:
        (iii) w_sat vs Δ',
        (iv)  γ_fit/γ_FKR vs S and vs Δ'.
 
+Per-run diagnostics include:
+  - w/a and ln(w/a) with linear window and fit,
+  - instantaneous growth rate γ_inst(t),
+  - E_kin(t), E_mag(t) with regime markers,
+  - reconnected flux proxy ψ_rec(t) ∝ |A_1|(t).
+
 All runs are saved as mhd_tearing_solution_*.npz in --outdir, and a
 summary file tearing_scan_summary.npz plus PNGs are written there.
 
@@ -32,7 +38,7 @@ python mhd_tearing_scan.py \
     --Nx 48 --Ny 48 --Nz 48 \
     --Lx 6.283185307179586 --Ly 6.283185307179586 --Lz 6.283185307179586 \
     --t0 0.0 --t1 100.0 --n-frames 80 \
-    --outdir tearing_scan
+    --outdir tearing_scan_plots
 
 """
 
@@ -245,6 +251,19 @@ def energy_from_hat(v_hat, B_hat, Lx, Ly, Lz):
     E_kin = 0.5 * jnp.sum(v2) * dv
     E_mag = 0.5 * jnp.sum(B2) * dv
     return E_kin, E_mag
+
+
+def energy_from_hat_np(v_hat, B_hat, Lx, Ly, Lz):
+    """NumPy version for post-processing."""
+    v = np.fft.ifftn(v_hat, axes=(1, 2, 3)).real
+    B = np.fft.ifftn(B_hat, axes=(1, 2, 3)).real
+    dv = (Lx * Ly * Lz) / (v[0].size)
+
+    v2 = np.sum(v * v, axis=0)
+    B2 = np.sum(B * B, axis=0)
+    E_kin = 0.5 * np.sum(v2) * dv
+    E_mag = 0.5 * np.sum(B2) * dv
+    return float(E_kin), float(E_mag)
 
 
 def make_mhd_rhs(nu, eta, kx, ky, kz, k2, mask_dealias):
@@ -481,63 +500,6 @@ def compute_island_width_from_mode(Az_hat_mode, B0, a):
     return 4.0 * np.sqrt(A_amp / Bprime)
 
 
-# -----------------------------------------------------------------------------#
-# Robust automatic linear-window selector
-# -----------------------------------------------------------------------------#
-
-def select_linear_window(ts, w, w0=None, min_pts=6, frac_sat=0.3, nwin=8):
-    """
-    Data-driven selector for the exponentially growing window of ln(w).
-
-    - Avoids early transient: requires w > 1.2 w0.
-    - Avoids near-saturation: requires w < w0 + frac_sat*(w_max-w0).
-    - Slides a window of size nwin over candidate points.
-    - Picks window with smallest mean-squared error in ln(w) fit.
-
-    Returns mask_lin (boolean array).
-    """
-    ts = np.asarray(ts)
-    w = np.asarray(w)
-
-    if w0 is None:
-        w0 = w[0]
-
-    wmax = np.nanmax(w)
-    upper = w0 + frac_sat*(wmax - w0)
-
-    # Candidate indices
-    mask = (w > 1.2*w0) & (w < upper) & np.isfinite(w)
-    idx = np.where(mask)[0]
-
-    if idx.size < min_pts:
-        # fallback: earliest quarter of the simulation
-        return ts < (ts[0] + 0.25*(ts[-1]-ts[0]))
-
-    nwin = min(nwin, idx.size)
-    lnw = np.log(w)
-    best_err = np.inf
-    best_slice = None
-
-    for s in range(0, idx.size - nwin + 1):
-        win = idx[s:s+nwin]
-        t_win = ts[win]
-        y_win = lnw[win]
-        a, b = np.polyfit(t_win, y_win, 1)
-        fit = a*t_win + b
-        err = np.mean((y_win - fit)**2)
-        if err < best_err:
-            best_err = err
-            best_slice = win
-
-    mask_lin = np.zeros_like(w, dtype=bool)
-    mask_lin[best_slice] = True
-    return mask_lin
-
-
-# -----------------------------------------------------------------------------#
-# Scan analysis for a single run
-# -----------------------------------------------------------------------------#
-
 def _linear_regression_with_stats(x, y):
     """
     Simple y = a x + b regression with R^2 and standard error of slope.
@@ -560,6 +522,97 @@ def _linear_regression_with_stats(x, y):
         a_err = np.nan
     return a, b, R2, a_err
 
+
+# -----------------------------------------------------------------------------#
+# Robust automatic linear-window selector
+# -----------------------------------------------------------------------------#
+
+def select_linear_window(
+    ts,
+    w,
+    w0=None,
+    min_pts: int = 6,
+    frac_sat: float = 0.12,
+    nwin: int = 8,
+    curv_tol: float = 0.02,
+    R2_min: float = 0.97,
+):
+    """
+    Data-driven selector for the exponentially growing window of ln(w).
+
+    Strategy:
+      * Avoid early transient: require w > 1.2 w0.
+      * Avoid near-saturation: require w < w0 + frac_sat*(w_max - w0).
+      * Require small curvature in ln(w): |d²/dt² ln(w)| < curv_tol.
+      * Slide a window of size nwin over candidate points.
+      * Among windows with R² >= R2_min, choose the one with largest R².
+        If none passes R2_min, choose the window with maximum R².
+
+    Returns
+    -------
+    mask_lin : boolean array
+        True for points in the selected linear window.
+    """
+    ts = np.asarray(ts)
+    w = np.asarray(w)
+
+    if w0 is None:
+        w0 = w[0]
+
+    wmax = np.nanmax(w)
+    upper = w0 + frac_sat * (wmax - w0)
+
+    lnw = np.log(w)
+    # instantaneous slope and curvature of ln(w)
+    d1 = np.gradient(lnw, ts)
+    d2 = np.gradient(d1, ts)
+
+    mask = (
+        (w > 1.2 * w0) &
+        (w < upper) &
+        np.isfinite(lnw) &
+        (np.abs(d2) < curv_tol)
+    )
+    idx = np.where(mask)[0]
+
+    if idx.size < max(min_pts, 3):
+        # fallback: earliest quarter of the simulation
+        mask_fb = ts < (ts[0] + 0.25 * (ts[-1] - ts[0]))
+        return mask_fb
+
+    nwin = min(nwin, idx.size)
+    best_slice = None
+    best_R2 = -np.inf
+
+    # First pass: enforce R² >= R2_min if possible
+    for s in range(0, idx.size - nwin + 1):
+        win = idx[s:s+nwin]
+        t_win = ts[win]
+        y_win = lnw[win]
+        a, b, R2, _ = _linear_regression_with_stats(t_win, y_win)
+        if R2 >= R2_min and R2 > best_R2:
+            best_R2 = R2
+            best_slice = win
+
+    # Second pass: if nothing reached R2_min, just pick max R²
+    if best_slice is None:
+        for s in range(0, idx.size - nwin + 1):
+            win = idx[s:s+nwin]
+            t_win = ts[win]
+            y_win = lnw[win]
+            a, b, R2, _ = _linear_regression_with_stats(t_win, y_win)
+            if R2 > best_R2:
+                best_R2 = R2
+                best_slice = win
+
+    mask_lin = np.zeros_like(w, dtype=bool)
+    mask_lin[best_slice] = True
+    return mask_lin
+
+
+# -----------------------------------------------------------------------------#
+# Scan analysis for a single run
+# -----------------------------------------------------------------------------#
 
 def analyze_single_run(
     fname: str,
@@ -613,6 +666,8 @@ def analyze_single_run(
     n_t = ts.size
     island_width = np.zeros(n_t)
     Az_amp = np.zeros(n_t)
+    E_kin_arr = np.zeros(n_t)
+    E_mag_arr = np.zeros(n_t)
 
     for it in range(n_t):
         B_hat = B_hat_frames[it]
@@ -621,18 +676,25 @@ def analyze_single_run(
         Az_amp[it] = np.abs(A_mode)
         island_width[it] = compute_island_width_from_mode(A_mode, B0, a)
 
+        v_hat = v_hat_frames[it]
+        Ek, Em = energy_from_hat_np(v_hat, B_hat, Lx, Ly, Lz)
+        E_kin_arr[it] = Ek
+        E_mag_arr[it] = Em
+
     w0 = island_width[0]
     wmax = np.nanmax(island_width)
     print(f"[INFO] w0 = {w0:.3e}, w_max = {wmax:.3e}")
 
-    # ----- Linear fit: use automatic window selector ----- #
+    # ----- Linear fit: tightened automatic window selector ----- #
     mask_lin = select_linear_window(
         ts,
         island_width,
         w0=w0,
         min_pts=6,
-        frac_sat=0.30,
+        frac_sat=0.12,
         nwin=8,
+        curv_tol=0.02,
+        R2_min=0.97,
     )
 
     if np.count_nonzero(mask_lin) < 5:
@@ -651,11 +713,19 @@ def analyze_single_run(
           f"R²_lin = {gamma_R2:.3f}, σ_γ = {gamma_fit_err:.3e}")
 
     # ----- Rutherford slope: w(t) ~ w0_R + (dw/dt)_R t ----- #
+    # Ensure we start after the linear window.
     f_low, f_high = ruth_frac
-    t_start = ts[0] + f_low * (ts[-1] - ts[0])
-    t_end = ts[0] + f_high * (ts[-1] - ts[0])
+    T = ts[-1] - ts[0]
+    t_lin_end = t_lin[-1]
+    t_start_nom = ts[0] + f_low * T
+    t_end_nom = ts[0] + f_high * T
+    # Enforce start > linear end + small margin
+    t_start = max(t_start_nom, t_lin_end + 0.05 * T)
+    t_end = max(t_end_nom, t_start + 0.05 * T)
+
     mask_ruth = (ts >= t_start) & (ts <= t_end)
 
+    # If too few points, try last half of the time interval.
     if np.count_nonzero(mask_ruth) < 5:
         print("[WARN] Too few points for Rutherford fit; "
               "using last half of time as fallback.")
@@ -663,9 +733,33 @@ def analyze_single_run(
 
     t_ruth = ts[mask_ruth]
     w_ruth = island_width[mask_ruth]
-    dw_dt_R, b_R, dw_dt_R_R2, dw_dt_R_err = _linear_regression_with_stats(t_ruth, w_ruth)
-    print(f"[RESULT] (dw/dt)_R = {dw_dt_R:.3e}, R²_R = {dw_dt_R_R2:.3f}, "
-          f"σ_{'{'}dw/dt{'}'} = {dw_dt_R_err:.3e}")
+
+    # Enforce monotonic increase of w during Rutherford stage.
+    # Trim from the left until strictly increasing or too short.
+    while w_ruth.size >= 5 and np.any(np.diff(w_ruth) <= 0):
+        t_ruth = t_ruth[1:]
+        w_ruth = w_ruth[1:]
+
+    if w_ruth.size < 5:
+        print("[WARN] No clean monotonic Rutherford regime found.")
+        dw_dt_R = np.nan
+        b_R = np.nan
+        dw_dt_R_R2 = np.nan
+        dw_dt_R_err = np.nan
+        t_Ruth_start = np.nan
+        t_Ruth_end = np.nan
+    else:
+        t_Ruth_start = t_ruth[0]
+        t_Ruth_end = t_ruth[-1]
+        dw_dt_R, b_R, dw_dt_R_R2, dw_dt_R_err = _linear_regression_with_stats(
+            t_ruth, w_ruth
+        )
+        print(f"[RESULT] (dw/dt)_R = {dw_dt_R:.3e}, R²_R = {dw_dt_R_R2:.3f}, "
+              f"σ_{{dw/dt}} = {dw_dt_R_err:.3e}")
+        if dw_dt_R_R2 < 0.8 or dw_dt_R <= 0:
+            print("[WARN] Rutherford fit has low R² or non-positive slope; "
+                  "marking as invalid for global scaling.")
+            # keep values but flag later via R² / sign.
 
     # ----- Saturated island width (last 20% of time) ----- #
     t_sat_min = ts[0] + 0.8 * (ts[-1] - ts[0])
@@ -675,9 +769,19 @@ def analyze_single_run(
     w_sat_std = float(np.std(w_sat_samples))
     print(f"[RESULT] w_sat = {w_sat:.3e} ± {w_sat_std:.3e}")
 
+    # ----- Derived nonlinear diagnostics ----- #
+    w_over_a = island_width / a
+    lnw_over_a = np.log(w_over_a)
+    gamma_inst = np.gradient(lnw_over_a, ts)  # instantaneous growth rate
+    psi_rec = 2.0 * Az_amp  # proxy for reconnected flux (O-X difference)
+
+    # Times for regime markers
+    t_lin_start = t_lin[0]
+    # t_lin_end already set
+    # t_Ruth_start, t_Ruth_end possibly nan if invalid
+
     # ----- Per-run diagnostic plot: w/a and ln(w/a) with fit ----- #
     outdir = os.path.dirname(fname)
-    w_over_a = island_width / a
     w_lin_over_a = w_lin / a
     lnw_lin_over_a = np.log(w_lin_over_a)
     # Fit line in normalized units for plotting
@@ -700,7 +804,7 @@ def analyze_single_run(
 
     # Bottom: ln(w/a) vs t
     ax_bottom = axes[1]
-    ax_bottom.plot(ts, np.log(w_over_a), "-", label=r"$\ln(w/a)$")
+    ax_bottom.plot(ts, lnw_over_a, "-", label=r"$\ln(w/a)$")
     ax_bottom.plot(t_lin, lnw_lin_over_a, "o", ms=4, label=r"fit points")
     ax_bottom.plot(t_fit_line, lnw_fit_line, "--", label=rf"fit: $\gamma={gamma_fit:.3e}$")
     ax_bottom.set_xlabel(r"$t$")
@@ -715,6 +819,59 @@ def analyze_single_run(
     fig_diag.savefig(diag_name)
     plt.close(fig_diag)
     print(f"[SAVE] {diag_name}")
+
+    # ----- Nonlinear diagnostics figure ----- #
+    fig_nl, axes_nl = plt.subplots(3, 1, sharex=True, figsize=(5.5, 7.0))
+
+    ax1 = axes_nl[0]
+    ax1.plot(ts, gamma_inst, "-")
+    ax1.axhline(gamma_fit, ls="--", lw=1.0, label=r"$\gamma_{\rm fit}$")
+    ax1.set_ylabel(r"$\gamma_{\rm inst}(t)$")
+    ax1.set_title(r"Instantaneous growth rate and energies")
+    ax1.grid(True, ls=":")
+
+    ax2 = axes_nl[1]
+    ax2.semilogy(ts, E_kin_arr, "-", label=r"$E_{\rm kin}$")
+    ax2.semilogy(ts, E_mag_arr, "-", label=r"$E_{\rm mag}$")
+    ax2.set_ylabel(r"Energies")
+    ax2.grid(True, ls=":")
+    ax2.legend(loc="best")
+
+    ax3 = axes_nl[2]
+    ax3.plot(ts, psi_rec, "-")
+    ax3.set_xlabel(r"$t$")
+    ax3.set_ylabel(r"$\psi_{\rm rec} \propto |A_1|$")
+    ax3.grid(True, ls=":")
+
+    # Regime markers on all three panels
+    used_labels = set()
+    def _add_marker(ax, t, label, style="--"):
+        if not np.isfinite(t):
+            return
+        lab = label if label not in used_labels else None
+        ax.axvline(t, ls=style, lw=0.8, color="k", alpha=0.7, label=lab)
+        if lab is not None:
+            used_labels.add(label)
+
+    for ax in axes_nl:
+        _add_marker(ax, t_lin_start, "linear start", "--")
+        _add_marker(ax, t_lin_end, "linear end", "-.")
+        _add_marker(ax, t_Ruth_start, "Rutherford start", "--")
+        _add_marker(ax, t_Ruth_end, "Rutherford end", "-.")
+        _add_marker(ax, t_sat_min, "saturation start", ":")
+
+    # Only show marker legend on the top panel
+    handles, labels = ax1.get_legend_handles_labels()
+    if handles:
+        ax1.legend(handles, labels, loc="best")
+
+    nl_name = os.path.join(
+        outdir,
+        "tearing_nonlinear_" + os.path.basename(fname).replace(".npz", ".png"),
+    )
+    fig_nl.savefig(nl_name)
+    plt.close(fig_nl)
+    print(f"[SAVE] {nl_name}")
 
     return {
         "fname": os.path.basename(fname),
@@ -787,7 +944,8 @@ def parse_args():
     p.add_argument("--force-rerun", action="store_true",
                    help="Re-run simulations even if NPZ files already exist.")
 
-    # Fitting windows (kept for CLI completeness, not used in auto selector)
+    # Fitting windows (kept for CLI completeness, not used directly
+    # in the auto selector, except indirectly in Rutherford fit.)
     p.add_argument(
         "--lin-tmin",
         type=float,
@@ -806,8 +964,9 @@ def parse_args():
         nargs=2,
         default=(0.4, 0.9),
         metavar=("F_START", "F_END"),
-        help=("Fractional window [F_START,F_END] of total time used for "
-              "Rutherford fit (default: 0.4 0.9)."),
+        help=("Fractional window [F_START,F_END] of total time used as "
+              "a nominal Rutherford interval (default: 0.4 0.9). "
+              "The actual fit starts after the linear window."),
     )
 
     # Output
@@ -959,12 +1118,26 @@ def main():
     ax2.errorbar(etaDelta_arr, dw_dt_R_arr, yerr=dw_dt_R_err_arr,
                  fmt="o", capsize=3, label=r"runs")
 
-    logx = np.log(etaDelta_arr)
-    logy = np.log(dw_dt_R_arr)
-    a_fit, b_fit = np.polyfit(logx, logy, 1)
-    xfit = np.linspace(etaDelta_arr.min() * 0.8, etaDelta_arr.max() * 1.2, 200)
-    yfit = np.exp(b_fit) * xfit**a_fit
-    ax2.loglog(xfit, yfit, "k--", label=rf"fit: slope={a_fit:.2f}")
+    # Only use well-behaved Rutherford fits for the power-law.
+    R2_min_Ruth = 0.8
+    mask_good_R = (
+        np.isfinite(dw_dt_R_arr) &
+        (dw_dt_R_arr > 0.0) &
+        np.isfinite(etaDelta_arr) &
+        (dw_dt_R_R2_arr >= R2_min_Ruth)
+    )
+
+    if np.count_nonzero(mask_good_R) >= 2:
+        logx = np.log(etaDelta_arr[mask_good_R])
+        logy = np.log(dw_dt_R_arr[mask_good_R])
+        a_fit, b_fit = np.polyfit(logx, logy, 1)
+        xfit = np.linspace(etaDelta_arr[mask_good_R].min() * 0.8,
+                           etaDelta_arr[mask_good_R].max() * 1.2, 200)
+        yfit = np.exp(b_fit) * xfit**a_fit
+        ax2.loglog(xfit, yfit, "k--", label=rf"fit (good runs): slope={a_fit:.2f}")
+    else:
+        a_fit = float("nan")
+        print("[WARN] Too few good Rutherford points for a global scaling fit.")
 
     for i, name in enumerate(fnames):
         ax2.annotate(

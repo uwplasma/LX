@@ -943,7 +943,12 @@ def make_iota_plots(
 # ============================================================
 
 def main():
-    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QH_solution.npz"
+    # default_solution = "wout_SLAM_4_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
+    default_solution = "knot_tube_solution.npz"
+    
     default_psi_npz = default_solution.replace(".npz", "_psi_fci_cyl_N64_Nphi128.npz")
 
     parser = argparse.ArgumentParser(
@@ -974,7 +979,7 @@ def main():
     parser.add_argument(
         "--band-frac",
         type=float,
-        default=0.01,
+        default=0.5,
         help="Relative ψ-band half-width around each level",
     )
     parser.add_argument(

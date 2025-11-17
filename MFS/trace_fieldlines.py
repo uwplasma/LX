@@ -731,10 +731,10 @@ if __name__ == "__main__":
     if 'QH' in default_solution: nfp_default = 4
     if 'SLAM' in default_solution:
         n_save_default = 0.5; tfinal_default = 15000
-        seeds_default = "2.55:0:0,2.65:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
+        seeds_default = "2.55:0:0,2.:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
     if 'knot' in default_solution:
-        nfp_default = 1; tfinal_default = 200; n_save_default = 5
-        seeds_default = "1.2:0:0,1.25:0:0,1.3:0:0,1.35:0:0,1.4:0:0,1.45:0:0,1.5:0:0,1.55:0:0"
+        nfp_default = 3; tfinal_default = 120; n_save_default = 5
+        seeds_default = "1.14:0:0,1.17:0:0,1.2:0:0,1.23:0:0,1.26:0:0,1.29:0:0,1.32:0:0,1.35:0:0"
     ap = argparse.ArgumentParser()
     ### MAIN PARAMETERS TO CHANGE
     ap.add_argument("file", nargs="?", type=str, default=resolve_npz_file_location(default_solution),
@@ -749,8 +749,8 @@ if __name__ == "__main__":
     ap.add_argument("--normalize", action="store_true")
     ap.add_argument("--clip", type=float, default=None)
     ap.add_argument("--eps", type=float, default=1e-2)
-    ap.add_argument("--rtol", type=float, default=1e-6)
-    ap.add_argument("--atol", type=float, default=1e-6)
+    ap.add_argument("--rtol", type=float, default=1e-7)
+    ap.add_argument("--atol", type=float, default=1e-7)
     ap.add_argument("--poincare-label-pi", action="store_true", help="Use π-fraction labels on Poincaré plots.")
     ap.add_argument("--box-pad", type=float, default=0.40)
     ap.add_argument("--poincare-nphi", type=int, default=4)

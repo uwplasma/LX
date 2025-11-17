@@ -719,7 +719,7 @@ def main():
                         help="Candidate λ values for Tikhonov regularization")
     parser.add_argument("--out", default=None,
                         help="Output .npz for exterior solution "
-                             "(default: <input_stem>_exterior_solution.npz)")
+                             "(default: <input_stem>_exterior.npz)")
     parser.add_argument("--no-plot", action="store_true",
                         help="Disable diagnostic plots even if matplotlib "
                              "is available.")
@@ -730,7 +730,7 @@ def main():
         raise FileNotFoundError(f"Input checkpoint not found: {in_path}")
 
     if args.out is None:
-        out_path = in_path.with_name(in_path.stem + "_exterior_solution.npz")
+        out_path = in_path.with_name(in_path.stem + "_exterior.npz")
     else:
         out_path = Path(args.out).resolve()
 
@@ -847,7 +847,6 @@ def main():
             grad_out_on_Gamma=np.asarray(grad_out_on_Gamma),
         )
         plt.show()
-
 
     # 9) Save exterior checkpoint (same layout as interior solver)
     out_dir = out_path.parent
