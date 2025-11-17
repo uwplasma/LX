@@ -5,50 +5,37 @@ mhd_tearing_scan.py
 
 "Loureiro-style" scan driver for Harris-sheet tearing.
 
-This script does, for each chosen equilibrium model
-    equilibrium_mode ∈ {"original", "forcefree"}:
-
+This script does *both*:
   1) runs the incompressible pseudo-spectral MHD tearing simulation
      for a scan over (a, eta) by calling
-         mhd_tearing_solve.solve_tearing_case(..., equilibrium_mode=...)
+        mhd_tearing_solve.solve_tearing_case,
+     separately for each equilibrium branch:
+        - "original"  : classic Harris-sheet / Sweet–Parker-like
+        - "forcefree" : equilibrium-subtracted, FKR/plasmoid-like
   2) postprocesses each run to extract:
        - island width w(t),
        - linear growth rate γ_fit,
        - Rutherford slope (dw/dt)_R,
        - saturated width w_sat,
-     and then builds scan plots:
+     and then builds Loureiro-style scan plots.
 
-       (i)   γ_fit vs γ_FKR,
-       (ii)  (dw/dt)_R vs ηΔ',
-       (iii) w_sat vs Δ',
-       (iv)  γ_fit/γ_FKR vs S and vs Δ'.
-
-Per-run diagnostics include:
-  - w/a and ln(w/a) with linear window and fit,
-  - instantaneous growth rate γ_inst(t),
-  - E_kin(t), E_mag(t) with regime markers,
-  - reconnected flux proxy ψ_rec(t) ∝ |A_1|(t).
-
-For each equilibrium_mode, runs are saved as
+For each branch `equilibrium_mode` we create:
     outdir/<equilibrium_mode>/mhd_tearing_solution_*.npz
-
-and a summary file
+    outdir/<equilibrium_mode>/tearing_profile_*.png
+    outdir/<equilibrium_mode>/tearing_nonlinear_*.png
+    outdir/<equilibrium_mode>/scan_*.png
     outdir/<equilibrium_mode>/tearing_scan_summary_<equilibrium_mode>.npz
 
-plus PNGs with names ending in _<equilibrium_mode>.png are written there.
-
-Example usage
+Typical usage
 -------------
 
 python mhd_tearing_scan.py \
-    --scan-a 0.5 0.6 0.785 \
-    --scan-eta 1.25e-3 6.25e-4 3.125e-4 \
-    --Nx 152 --Ny 152 --Nz 1 \
-    --Lx 6.283185307179586 --Ly 6.283185307179586 --Lz 6.283185307179586 \
-    --t0 0.0 --t1 100.0 --n-frames 200 \
-    --outdir tearing_scan_plots \
-    --equilibrium-modes original forcefree
+    --outdir tearing_scan_plots
 
+You can still override grid / box / viscosity / guide field / etc
+from the command line, but the (a, eta), epsB and time windows are
+chosen branch-by-branch inside the script for publication-ready
+comparisons.
 """
 
 from __future__ import annotations
@@ -62,11 +49,10 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-# Import the physics + numerics + solver from the base file
 from mhd_tearing_solve import solve_tearing_case, make_k_arrays
 
 # -----------------------------------------------------------------------------#
-# Matplotlib style
+# Matplotlib style (publication-ready)
 # -----------------------------------------------------------------------------#
 
 mpl.rcParams.update({
@@ -82,8 +68,41 @@ mpl.rcParams.update({
     "figure.dpi": 120,
     "savefig.bbox": "tight",
     "savefig.dpi": 300,
+    "axes.grid": True,
+    "grid.linestyle": ":",
+    "grid.alpha": 0.5,
 })
 
+# -----------------------------------------------------------------------------#
+# Branch-specific scan configuration
+# -----------------------------------------------------------------------------#
+# You can tweak these lists if you want different coverage.
+#
+# "original"  branch: Sweet–Parker-like regime
+# "forcefree" branch: FKR/plasmoid regime (equilibrium subtraction)
+#
+# Both branches use the same (a, eta) grid here so you can compare
+# 1:1, but they differ in epsB and in the time window (t1, n_frames).
+
+BRANCH_CONFIG = {
+    "original": {
+        # Sweet–Parker-like: moderate Lundquist numbers, larger seed
+        "scan_a":  [0.5, 0.6, 0.785],          # gives Δ'a ~ O(1)
+        "scan_eta": [1.25e-3, 6.25e-4, 3.125e-4],  # S ~ 10^3–10^4
+        "epsB": 1e-2,
+        "t1": 100.0,
+        "n_frames": 200,
+    },
+    "forcefree": {
+        # FKR/plasmoid-like: same (a, eta) but tiny seed for a long
+        # clean linear stage and plasmoid-friendly evolution.
+        "scan_a":  [0.5, 0.6, 0.785],
+        "scan_eta": [1.25e-3, 6.25e-4, 3.125e-4],
+        "epsB": 1e-5,
+        "t1": 80.0,
+        "n_frames": 220,
+    },
+}
 
 # -----------------------------------------------------------------------------#
 # Post-processing utilities (NumPy only)
@@ -96,7 +115,7 @@ def compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz):
     kx_j, ky_j, kz_j, k2_j, NX_j, NY_j, NZ_j = make_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz)
     return (np.array(kx_j),
             np.array(ky_j),
-            np.array(ky_j),  # NOTE: kz_j is not used directly elsewhere
+            np.array(kz_j),
             np.array(NX_j),
             np.array(NY_j),
             np.array(NZ_j))
@@ -211,7 +230,6 @@ def select_linear_window(
     upper = w0 + frac_sat * (wmax - w0)
 
     lnw = np.log(w)
-    # instantaneous slope and curvature of ln(w)
     d1 = np.gradient(lnw, ts)
     d2 = np.gradient(d1, ts)
 
@@ -234,7 +252,7 @@ def select_linear_window(
 
     # First pass: enforce R² >= R2_min if possible
     for s in range(0, idx.size - nwin + 1):
-        win = idx[s:s + nwin]
+        win = idx[s:s+nwin]
         t_win = ts[win]
         y_win = lnw[win]
         a, b, R2, _ = _linear_regression_with_stats(t_win, y_win)
@@ -245,7 +263,7 @@ def select_linear_window(
     # Second pass: if nothing reached R2_min, just pick max R²
     if best_slice is None:
         for s in range(0, idx.size - nwin + 1):
-            win = idx[s:s + nwin]
+            win = idx[s:s+nwin]
             t_win = ts[win]
             y_win = lnw[win]
             a, b, R2, _ = _linear_regression_with_stats(t_win, y_win)
@@ -297,6 +315,7 @@ def analyze_single_run(
     ix0 = int(data["ix0"])
     iy1 = int(data["iy1"])
     iz0 = int(data["iz0"])
+    eq_mode = str(data["equilibrium_mode"])
 
     Delta_prime = Delta_prime_a / a
     etaDelta = eta * Delta_prime
@@ -305,9 +324,10 @@ def analyze_single_run(
     print(f"[RUN] nu={nu:.3e}, eta={eta:.3e}, B0={B0:.3e}, a={a:.3e}, eps_B={eps_B:.3e}")
     print(f"[RUN] S={S:.3e}, Delta'*a={Delta_prime_a:.3e}, Delta'={Delta_prime:.3e}")
     print(f"[RUN] γ_FKR={gamma_FKR:.3e}, mode indices (ix0,iy1,iz0)=({ix0},{iy1},{iz0})")
+    print(f"[RUN] equilibrium_mode = {eq_mode}")
 
     # k arrays (NumPy)
-    kx, ky, kz_dummy, NX, NY, NZ = compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz)
+    kx, ky, kz, NX, NY, NZ = compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz)
     ky_val = ky[ix0, iy1, iz0]
     print(f"[DEBUG] ky for tearing mode = {ky_val:.6f}")
 
@@ -372,7 +392,6 @@ def analyze_single_run(
 
     mask_ruth = (ts >= t_start) & (ts <= t_end)
 
-    # If too few points, try last half of the time interval.
     if np.count_nonzero(mask_ruth) < 5:
         print("[WARN] Too few points for Rutherford fit; "
               "using last half of time as fallback.")
@@ -381,8 +400,6 @@ def analyze_single_run(
     t_ruth = ts[mask_ruth]
     w_ruth = island_width[mask_ruth]
 
-    # Enforce monotonic increase of w during Rutherford stage.
-    # Trim from the left until strictly increasing or too short.
     while w_ruth.size >= 5 and np.any(np.diff(w_ruth) <= 0):
         t_ruth = t_ruth[1:]
         w_ruth = w_ruth[1:]
@@ -418,26 +435,22 @@ def analyze_single_run(
     # ----- Derived nonlinear diagnostics ----- #
     w_over_a = island_width / a
     lnw_over_a = np.log(w_over_a)
-    gamma_inst = np.gradient(lnw_over_a, ts)  # instantaneous growth rate
-    psi_rec = 2.0 * Az_amp  # proxy for reconnected flux (O-X difference)
+    gamma_inst = np.gradient(lnw_over_a, ts)
+    psi_rec = 2.0 * Az_amp  # proxy for reconnected flux
 
-    # Times for regime markers
     t_lin_start = t_lin[0]
-    # t_lin_end already set
-    # t_Ruth_start, t_Ruth_end possibly nan if invalid
 
     # ----- Per-run diagnostic plot: w/a and ln(w/a) with fit ----- #
     outdir = os.path.dirname(fname)
     w_lin_over_a = w_lin / a
     lnw_lin_over_a = np.log(w_lin_over_a)
-    # Fit line in normalized units for plotting
+
     t_fit_line = np.linspace(t_lin[0], t_lin[-1], 200)
     lnw_fit_line = a_lin * t_fit_line + b_lin
     w_fit_line_over_a = np.exp(lnw_fit_line) / a
 
     fig_diag, axes = plt.subplots(2, 1, sharex=True, figsize=(5.5, 6.0))
 
-    # Top: w/a vs t
     ax_top = axes[0]
     ax_top.plot(ts, w_over_a, "-", label=r"$w/a$")
     ax_top.plot(ts[mask_lin], w_over_a[mask_lin], "o", ms=4,
@@ -448,7 +461,6 @@ def analyze_single_run(
     ax_top.grid(True, ls=":")
     ax_top.legend(loc="best")
 
-    # Bottom: ln(w/a) vs t
     ax_bottom = axes[1]
     ax_bottom.plot(ts, lnw_over_a, "-", label=r"$\ln(w/a)$")
     ax_bottom.plot(t_lin, lnw_lin_over_a, "o", ms=4, label=r"fit points")
@@ -490,7 +502,6 @@ def analyze_single_run(
     ax3.set_ylabel(r"$\psi_{\rm rec} \propto |A_1|$")
     ax3.grid(True, ls=":")
 
-    # Regime markers on all three panels
     used_labels = set()
 
     def _add_marker(ax, t, label, style="--"):
@@ -508,7 +519,6 @@ def analyze_single_run(
         _add_marker(ax, t_Ruth_end, "Rutherford end", "-.")
         _add_marker(ax, t_sat_min, "saturation start", ":")
 
-    # Only show marker legend on the top panel
     handles, labels = ax1.get_legend_handles_labels()
     if handles:
         ax1.legend(handles, labels, loc="best")
@@ -540,7 +550,207 @@ def analyze_single_run(
         "w_sat": w_sat,
         "w_sat_std": w_sat_std,
         "mask_lin": mask_lin,
+        "equilibrium_mode": eq_mode,
     }
+
+
+# -----------------------------------------------------------------------------#
+# Summary + Loureiro-style plots for one branch
+# -----------------------------------------------------------------------------#
+
+def build_summary_and_plots(results, outdir: str, eq_mode: str):
+    mode_str = "force-free" if eq_mode == "forcefree" else "original"
+
+    fnames = np.array([r["fname"] for r in results], dtype=object)
+    eta_arr = np.array([r["eta"] for r in results])
+    a_arr = np.array([r["a"] for r in results])
+    S_arr = np.array([r["S"] for r in results])
+    Delta_prime_a_arr = np.array([r["Delta_prime_a"] for r in results])
+    Delta_prime_arr = np.array([r["Delta_prime"] for r in results])
+    etaDelta_arr = np.array([r["etaDelta"] for r in results])
+    gamma_FKR_arr = np.array([r["gamma_FKR"] for r in results])
+    gamma_fit_arr = np.array([r["gamma_fit"] for r in results])
+    gamma_fit_err_arr = np.array([r["gamma_fit_err"] for r in results])
+    gamma_R2_arr = np.array([r["gamma_R2"] for r in results])
+    dw_dt_R_arr = np.array([r["dw_dt_R"] for r in results])
+    dw_dt_R_err_arr = np.array([r["dw_dt_R_err"] for r in results])
+    dw_dt_R_R2_arr = np.array([r["dw_dt_R_R2"] for r in results])
+    w_sat_arr = np.array([r["w_sat"] for r in results])
+    w_sat_std_arr = np.array([r["w_sat_std"] for r in results])
+
+    w_sat_over_a_arr = w_sat_arr / a_arr
+    w_sat_over_a_std_arr = w_sat_std_arr / a_arr
+
+    summary_path = os.path.join(outdir, f"tearing_scan_summary_{eq_mode}.npz")
+    np.savez(
+        summary_path,
+        fnames=fnames,
+        eta=eta_arr,
+        a=a_arr,
+        S=S_arr,
+        Delta_prime_a=Delta_prime_a_arr,
+        Delta_prime=Delta_prime_arr,
+        etaDelta=etaDelta_arr,
+        gamma_FKR=gamma_FKR_arr,
+        gamma_fit=gamma_fit_arr,
+        gamma_fit_err=gamma_fit_err_arr,
+        gamma_R2=gamma_R2_arr,
+        dw_dt_R=dw_dt_R_arr,
+        dw_dt_R_err=dw_dt_R_err_arr,
+        dw_dt_R_R2=dw_dt_R_R2_arr,
+        w_sat=w_sat_arr,
+        w_sat_std=w_sat_std_arr,
+        w_sat_over_a=w_sat_over_a_arr,
+        w_sat_over_a_std=w_sat_over_a_std_arr,
+        equilibrium_mode=eq_mode,
+    )
+    print(f"\n[SAVE] Summary saved to {summary_path}")
+
+    # ------------------------------------------------------------------ #
+    # Plot 1: γ_fit vs γ_FKR (with error bars)
+    # ------------------------------------------------------------------ #
+    fig1, ax1 = plt.subplots()
+    ax1.errorbar(gamma_FKR_arr, gamma_fit_arr, yerr=gamma_fit_err_arr,
+                 fmt="o", capsize=3, label=r"runs")
+
+    if eq_mode == "forcefree":
+        gmin = 0.5 * np.min(gamma_FKR_arr)
+        gmax = 2.0 * np.max(gamma_FKR_arr)
+        ref = np.linspace(gmin, gmax, 100)
+        ax1.loglog(ref, ref, "--", color="0.4", lw=1.5,
+                   label=r"$\gamma_{\rm fit}=\gamma_{\rm FKR}$")
+
+    for i, name in enumerate(fnames):
+        ax1.annotate(
+            str(i),
+            (gamma_FKR_arr[i], gamma_fit_arr[i]),
+            textcoords="offset points",
+            xytext=(4, 2),
+            fontsize=8,
+        )
+
+    ax1.set_xlabel(r"$\gamma_{\rm FKR}$")
+    ax1.set_ylabel(r"$\gamma_{\rm fit}$")
+    ax1.set_title(rf"Linear growth: $\gamma_{{\rm fit}}$ vs FKR theory ({mode_str})")
+    ax1.grid(True, which="both", ls=":")
+    ax1.legend(loc="best")
+    fig1.savefig(os.path.join(outdir, f"scan_gamma_fit_vs_FKR_{eq_mode}.png"))
+    plt.close(fig1)
+    print(f"[SAVE] scan_gamma_fit_vs_FKR_{eq_mode}.png")
+
+    # ------------------------------------------------------------------ #
+    # Plot 2: Rutherford scaling: (dw/dt)_R vs η Δ' (with error bars)
+    # ------------------------------------------------------------------ #
+    fig2, ax2 = plt.subplots()
+    ax2.errorbar(etaDelta_arr, dw_dt_R_arr, yerr=dw_dt_R_err_arr,
+                 fmt="o", capsize=3, label=r"runs")
+
+    R2_min_Ruth = 0.8
+    mask_good_R = (
+        np.isfinite(dw_dt_R_arr) &
+        (dw_dt_R_arr > 0.0) &
+        np.isfinite(etaDelta_arr) &
+        (dw_dt_R_R2_arr >= R2_min_Ruth)
+    )
+
+    if np.count_nonzero(mask_good_R) >= 2:
+        logx = np.log(etaDelta_arr[mask_good_R])
+        logy = np.log(dw_dt_R_arr[mask_good_R])
+        a_fit, b_fit = np.polyfit(logx, logy, 1)
+        xfit = np.linspace(etaDelta_arr[mask_good_R].min() * 0.8,
+                           etaDelta_arr[mask_good_R].max() * 1.2, 200)
+        yfit = np.exp(b_fit) * xfit**a_fit
+        ax2.loglog(xfit, yfit, "k--",
+                   label=rf"fit (good runs): slope={a_fit:.2f}")
+    else:
+        print("[WARN] Too few good Rutherford points for a global scaling fit.")
+
+    for i, name in enumerate(fnames):
+        ax2.annotate(
+            str(i),
+            (etaDelta_arr[i], dw_dt_R_arr[i]),
+            textcoords="offset points",
+            xytext=(4, 2),
+            fontsize=8,
+        )
+
+    ax2.set_xlabel(r"$\eta \Delta'$")
+    ax2.set_ylabel(r"$(\mathrm{d}w/\mathrm{d}t)_R$")
+    ax2.set_title(rf"Rutherford scaling ({mode_str})")
+    ax2.grid(True, which="both", ls=":")
+    ax2.legend(loc="best")
+    fig2.savefig(os.path.join(outdir,
+                              f"scan_Rutherford_dw_dt_vs_etaDelta_{eq_mode}.png"))
+    plt.close(fig2)
+    print(f"[SAVE] scan_Rutherford_dw_dt_vs_etaDelta_{eq_mode}.png")
+
+    # ------------------------------------------------------------------ #
+    # Plot 3: Saturated island width vs Δ' (normalized, with error bars)
+    # ------------------------------------------------------------------ #
+    fig3, ax3 = plt.subplots()
+    ax3.errorbar(Delta_prime_arr, w_sat_over_a_arr, yerr=w_sat_over_a_std_arr,
+                 fmt="o", capsize=3, label=r"runs")
+
+    logx2 = np.log(Delta_prime_arr)
+    logy2 = np.log(w_sat_over_a_arr)
+    a_fit2, b_fit2 = np.polyfit(logx2, logy2, 1)
+    xfit2 = np.linspace(Delta_prime_arr.min() * 0.8,
+                        Delta_prime_arr.max() * 1.2, 200)
+    yfit2 = np.exp(b_fit2) * xfit2**a_fit2
+    ax3.loglog(xfit2, yfit2, "k--", label=rf"fit: slope={a_fit2:.2f}")
+
+    for i, name in enumerate(fnames):
+        ax3.annotate(
+            str(i),
+            (Delta_prime_arr[i], w_sat_over_a_arr[i]),
+            textcoords="offset points",
+            xytext=(4, 2),
+            fontsize=8,
+        )
+
+    ax3.set_xlabel(r"$\Delta'$")
+    ax3.set_ylabel(r"$w_{\rm sat}/a$")
+    ax3.set_title(rf"Saturated island width vs $\Delta'$ ({mode_str})")
+    ax3.grid(True, which="both", ls=":")
+    ax3.legend(loc="best")
+    fig3.savefig(os.path.join(outdir,
+                              f"scan_wsat_over_a_vs_Deltaprime_{eq_mode}.png"))
+    plt.close(fig3)
+    print(f"[SAVE] scan_wsat_over_a_vs_Deltaprime_{eq_mode}.png")
+
+    # ------------------------------------------------------------------ #
+    # Plot 4: gamma_fit/gamma_FKR vs S and vs Delta'
+    # ------------------------------------------------------------------ #
+    ratio_arr = gamma_fit_arr / gamma_FKR_arr
+
+    # (a) ratio vs S
+    fig4a, ax4a = plt.subplots()
+    ax4a.semilogx(S_arr, ratio_arr, "o")
+    ax4a.set_xlabel(r"$S$")
+    ax4a.set_ylabel(r"$\gamma_{\rm fit}/\gamma_{\rm FKR}$")
+    ax4a.set_title(rf"Departure from FKR theory vs $S$ ({mode_str})")
+    ax4a.grid(True, which="both", ls=":")
+    fig4a.savefig(os.path.join(outdir,
+                               f"scan_gamma_ratio_vs_S_{eq_mode}.png"))
+    plt.close(fig4a)
+    print(f"[SAVE] scan_gamma_ratio_vs_S_{eq_mode}.png")
+
+    # (b) ratio vs Delta'
+    fig4b, ax4b = plt.subplots()
+    ax4b.semilogx(Delta_prime_arr, ratio_arr, "o")
+    ax4b.set_xlabel(r"$\Delta'$")
+    ax4b.set_ylabel(r"$\gamma_{\rm fit}/\gamma_{\rm FKR}$")
+    ax4b.set_title(rf"Departure from FKR theory vs $\Delta'$ ({mode_str})")
+    ax4b.grid(True, which="both", ls=":")
+    fig4b.savefig(os.path.join(outdir,
+                               f"scan_gamma_ratio_vs_Deltaprime_{eq_mode}.png"))
+    plt.close(fig4b)
+    print(f"[SAVE] scan_gamma_ratio_vs_Deltaprime_{eq_mode}.png")
+
+    print("\n[DONE] Scan analysis complete for", eq_mode)
+    print("      Each point index in the plots corresponds to:")
+    for i, name in enumerate(fnames):
+        print(f"        {i}: {name}")
 
 
 # -----------------------------------------------------------------------------#
@@ -549,32 +759,11 @@ def analyze_single_run(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Run multi-parameter tearing scans and build Loureiro-style "
-                    "plots for different equilibrium models."
+        description="Run a multi-parameter tearing scan and build Loureiro-style plots "
+                    "for both original and force-free equilibria."
     )
 
-    # Scan parameters
-    p.add_argument(
-        "--scan-a",
-        type=float,
-        nargs="+",
-        # a ≈ 0.5, 0.6, 0.785 → Δ'a ≈ 3, 2.13, 0.98 (FKR/small-Δ′ regime)
-        default=[0.5, 0.6, 0.785],
-        help="List of current-sheet half-widths a to scan "
-             "(defaults give Δ'a ≈ 1–3, i.e. FKR/small-Δ′ regime).",
-    )
-
-    p.add_argument(
-        "--scan-eta",
-        type=float,
-        nargs="+",
-        # For B0=1 this gives S ~ 400–2500 for these a's
-        default=[1.25e-3, 6.25e-4, 3.125e-4],
-        help="List of resistivities η to scan "
-             "(defaults give S ~ 10^3 in a well-resolved FKR/Rutherford regime).",
-    )
-
-    # Grid and box
+    # Grid and box (shared by both branches)
     p.add_argument("--Nx", type=int, default=152)
     p.add_argument("--Ny", type=int, default=152)
     p.add_argument("--Nz", type=int, default=1)
@@ -582,21 +771,25 @@ def parse_args():
     p.add_argument("--Ly", type=float, default=2.0 * math.pi)
     p.add_argument("--Lz", type=float, default=2.0 * math.pi)
 
-    # Physical parameters
+    # Physical parameters (shared)
     p.add_argument("--nu", type=float, default=5e-4)
     p.add_argument("--B0", type=float, default=1.0)
     p.add_argument("--Bg", type=float, default=0.0)
-    p.add_argument("--epsB", type=float, default=1e-5)
-
-    # Time integration
+    # t0 and dt0 common; t1/n_frames are branch-specific in BRANCH_CONFIG
     p.add_argument("--t0", type=float, default=0.0)
-    p.add_argument("--t1", type=float, default=100.0)
-    p.add_argument("--n-frames", type=int, default=200)
     p.add_argument("--dt0", type=float, default=None)
+
     p.add_argument("--force-rerun", action="store_true",
                    help="Re-run simulations even if NPZ files already exist.")
+    
+    p.add_argument(
+        "--keep-npz",
+        action="store_true",
+        help="Keep per-run mhd_tearing_solution_*.npz files. "
+             "By default they are deleted after postprocessing to save disk."
+    )
 
-    # Fitting windows (kept for CLI completeness)
+    # Fitting windows (kept for completeness; auto selector is used)
     p.add_argument(
         "--lin-tmin",
         type=float,
@@ -620,17 +813,14 @@ def parse_args():
               "The actual fit starts after the linear window."),
     )
 
-    # Equilibrium models to scan
+    # Branch selection
     p.add_argument(
         "--equilibrium-modes",
         type=str,
         nargs="+",
         choices=["original", "forcefree"],
         default=["original", "forcefree"],
-        help=("Which equilibrium formulations to scan. "
-              "'original' = standard incompressible MHD; "
-              "'forcefree' = equilibrium-subtracted RHS so (v=0,B=B0) is "
-              "an exact solution. Default: both."),
+        help="Which equilibrium models to scan.",
     )
 
     # Output
@@ -638,314 +828,96 @@ def parse_args():
         "--outdir",
         type=str,
         default="tearing_scan_plots",
-        help="Root output directory for NPZ runs, summaries, and plots. "
-             "Per-equilibrium results are placed in subdirs "
-             "outdir/<equilibrium_mode>/.",
+        help="Output directory for NPZ runs, summary, and plots.",
     )
 
     return p.parse_args()
-
-
-def run_scan_for_mode(args, equilibrium_mode: str):
-    """
-    Run full (a, eta) scan and analysis for a given equilibrium_mode.
-    """
-    mode_dir = os.path.join(args.outdir, equilibrium_mode)
-    os.makedirs(mode_dir, exist_ok=True)
-
-    print(f"\n======================")
-    print(f"[INFO] Equilibrium mode: {equilibrium_mode}")
-    print(f"[INFO] Output directory: {mode_dir}")
-    print(f"======================\n")
-
-    # Build list of (a, eta) combinations
-    combos: List[Tuple[float, float]] = []
-    for a in args.scan_a:
-        for eta in args.scan_eta:
-            combos.append((a, eta))
-
-    print("[INFO] Scan combinations (a, eta):")
-    for a, eta in combos:
-        print(f"   a={a:.4g}, eta={eta:.4g}")
-
-    results = []
-
-    for idx, (a, eta) in enumerate(combos):
-        tag = f"a{a:.3g}_eta{eta:.3g}"
-        tag = tag.replace(".", "p").replace("-", "m")
-        outfile = os.path.join(
-            mode_dir, f"mhd_tearing_solution_{tag}.npz"
-        )
-
-        if os.path.exists(outfile) and not args.force_rerun:
-            print(f"\n[INFO] Skipping solve for {tag} ({equilibrium_mode}), "
-                  f"file already exists.")
-        else:
-            print(f"\n[INFO] Running solve for {tag} ({equilibrium_mode}) ...")
-            solve_tearing_case(
-                Nx=args.Nx,
-                Ny=args.Ny,
-                Nz=args.Nz,
-                Lx=args.Lx,
-                Ly=args.Ly,
-                Lz=args.Lz,
-                nu=args.nu,
-                eta=eta,
-                B0=args.B0,
-                a=a,
-                B_g=args.Bg,
-                eps_B=args.epsB,
-                t0=args.t0,
-                t1=args.t1,
-                n_frames=args.n_frames,
-                dt0=args.dt0,
-                outfile=outfile,
-                equilibrium_mode=equilibrium_mode,
-            )
-
-        # Postprocess
-        res = analyze_single_run(
-            outfile,
-            args.lin_tmin,
-            args.lin_tmax,
-            tuple(args.ruth_frac),
-        )
-        results.append(res)
-
-    # Convert to arrays
-    fnames = np.array([r["fname"] for r in results], dtype=object)
-    eta_arr = np.array([r["eta"] for r in results])
-    a_arr = np.array([r["a"] for r in results])
-    S_arr = np.array([r["S"] for r in results])
-    Delta_prime_a_arr = np.array([r["Delta_prime_a"] for r in results])
-    Delta_prime_arr = np.array([r["Delta_prime"] for r in results])
-    etaDelta_arr = np.array([r["etaDelta"] for r in results])
-    gamma_FKR_arr = np.array([r["gamma_FKR"] for r in results])
-    gamma_fit_arr = np.array([r["gamma_fit"] for r in results])
-    gamma_fit_err_arr = np.array([r["gamma_fit_err"] for r in results])
-    gamma_R2_arr = np.array([r["gamma_R2"] for r in results])
-    dw_dt_R_arr = np.array([r["dw_dt_R"] for r in results])
-    dw_dt_R_err_arr = np.array([r["dw_dt_R_err"] for r in results])
-    dw_dt_R_R2_arr = np.array([r["dw_dt_R_R2"] for r in results])
-    w_sat_arr = np.array([r["w_sat"] for r in results])
-    w_sat_std_arr = np.array([r["w_sat_std"] for r in results])
-
-    # Normalized saturated width
-    w_sat_over_a_arr = w_sat_arr / a_arr
-    w_sat_over_a_std_arr = w_sat_std_arr / a_arr
-
-    # Save summary
-    summary_path = os.path.join(
-        mode_dir, f"tearing_scan_summary_{equilibrium_mode}.npz"
-    )
-    np.savez(
-        summary_path,
-        fnames=fnames,
-        eta=eta_arr,
-        a=a_arr,
-        S=S_arr,
-        Delta_prime_a=Delta_prime_a_arr,
-        Delta_prime=Delta_prime_arr,
-        etaDelta=etaDelta_arr,
-        gamma_FKR=gamma_FKR_arr,
-        gamma_fit=gamma_fit_arr,
-        gamma_fit_err=gamma_fit_err_arr,
-        gamma_R2=gamma_R2_arr,
-        dw_dt_R=dw_dt_R_arr,
-        dw_dt_R_err=dw_dt_R_err_arr,
-        dw_dt_R_R2=dw_dt_R_R2_arr,
-        w_sat=w_sat_arr,
-        w_sat_std=w_sat_std_arr,
-        w_sat_over_a=w_sat_over_a_arr,
-        w_sat_over_a_std=w_sat_over_a_std_arr,
-        equilibrium_mode=equilibrium_mode,
-    )
-    print(f"\n[SAVE] Summary saved to {summary_path}")
-
-    # ------------------------------------------------------------------ #
-    # Plot 1: γ_fit vs γ_FKR (with error bars)
-    # ------------------------------------------------------------------ #
-    fig1, ax1 = plt.subplots()
-    ax1.errorbar(gamma_FKR_arr, gamma_fit_arr, yerr=gamma_fit_err_arr,
-                 fmt="o", capsize=3, label=r"runs")
-
-    gmin = 0.5 * np.min(gamma_FKR_arr)
-    gmax = 2.0 * np.max(gamma_FKR_arr)
-    ref = np.linspace(gmin, gmax, 100)
-    ax1.loglog(ref, ref, "--", color="0.4", lw=1.5,
-               label=r"$\gamma_{\rm fit}=\gamma_{\rm FKR}$")
-
-    for i, name in enumerate(fnames):
-        ax1.annotate(
-            str(i),
-            (gamma_FKR_arr[i], gamma_fit_arr[i]),
-            textcoords="offset points",
-            xytext=(4, 2),
-            fontsize=8,
-        )
-
-    ax1.set_xlabel(r"$\gamma_{\rm FKR}$")
-    ax1.set_ylabel(r"$\gamma_{\rm fit}$")
-    ax1.set_title(
-        r"Linear growth: $\gamma_{\rm fit}$ vs FKR theory"
-        + f" ({equilibrium_mode})"
-    )
-    ax1.grid(True, which="both", ls=":")
-    ax1.legend(loc="best")
-    fig1.savefig(os.path.join(
-        mode_dir, f"scan_gamma_fit_vs_FKR_{equilibrium_mode}.png"
-    ))
-    plt.close(fig1)
-    print("[SAVE] scan_gamma_fit_vs_FKR_"
-          f"{equilibrium_mode}.png")
-
-    # ------------------------------------------------------------------ #
-    # Plot 2: Rutherford scaling: (dw/dt)_R vs η Δ' (with error bars)
-    # ------------------------------------------------------------------ #
-    fig2, ax2 = plt.subplots()
-    ax2.errorbar(etaDelta_arr, dw_dt_R_arr, yerr=dw_dt_R_err_arr,
-                 fmt="o", capsize=3, label=r"runs")
-
-    # Only use well-behaved Rutherford fits for the power-law.
-    R2_min_Ruth = 0.8
-    mask_good_R = (
-        np.isfinite(dw_dt_R_arr) &
-        (dw_dt_R_arr > 0.0) &
-        np.isfinite(etaDelta_arr) &
-        (dw_dt_R_R2_arr >= R2_min_Ruth)
-    )
-
-    if np.count_nonzero(mask_good_R) >= 2:
-        logx = np.log(etaDelta_arr[mask_good_R])
-        logy = np.log(dw_dt_R_arr[mask_good_R])
-        a_fit, b_fit = np.polyfit(logx, logy, 1)
-        xfit = np.linspace(
-            etaDelta_arr[mask_good_R].min() * 0.8,
-            etaDelta_arr[mask_good_R].max() * 1.2,
-            200,
-        )
-        yfit = np.exp(b_fit) * xfit**a_fit
-        ax2.loglog(
-            xfit, yfit, "k--",
-            label=rf"fit (good runs): slope={a_fit:.2f}",
-        )
-    else:
-        a_fit = float("nan")
-        print("[WARN] Too few good Rutherford points for a global scaling fit.")
-
-    for i, name in enumerate(fnames):
-        ax2.annotate(
-            str(i),
-            (etaDelta_arr[i], dw_dt_R_arr[i]),
-            textcoords="offset points",
-            xytext=(4, 2),
-            fontsize=8,
-        )
-
-    ax2.set_xlabel(r"$\eta \Delta'$")
-    ax2.set_ylabel(r"$(\mathrm{d}w/\mathrm{d}t)_R$")
-    ax2.set_title(r"Rutherford scaling" + f" ({equilibrium_mode})")
-    ax2.grid(True, which="both", ls=":")
-    ax2.legend(loc="best")
-    fig2.savefig(os.path.join(
-        mode_dir, f"scan_Rutherford_dw_dt_vs_etaDelta_{equilibrium_mode}.png"
-    ))
-    plt.close(fig2)
-    print("[SAVE] scan_Rutherford_dw_dt_vs_etaDelta_"
-          f"{equilibrium_mode}.png")
-
-    # ------------------------------------------------------------------ #
-    # Plot 3: Saturated island width vs Δ' (normalized, with error bars)
-    # ------------------------------------------------------------------ #
-    fig3, ax3 = plt.subplots()
-    ax3.errorbar(Delta_prime_arr, w_sat_over_a_arr, yerr=w_sat_over_a_std_arr,
-                 fmt="o", capsize=3, label=r"runs")
-
-    logx2 = np.log(Delta_prime_arr)
-    logy2 = np.log(w_sat_over_a_arr)
-    a_fit2, b_fit2 = np.polyfit(logx2, logy2, 1)
-    xfit2 = np.linspace(
-        Delta_prime_arr.min() * 0.8, Delta_prime_arr.max() * 1.2, 200
-    )
-    yfit2 = np.exp(b_fit2) * xfit2**a_fit2
-    ax3.loglog(xfit2, yfit2, "k--", label=rf"fit: slope={a_fit2:.2f}")
-
-    for i, name in enumerate(fnames):
-        ax3.annotate(
-            str(i),
-            (Delta_prime_arr[i], w_sat_over_a_arr[i]),
-            textcoords="offset points",
-            xytext=(4, 2),
-            fontsize=8,
-        )
-
-    ax3.set_xlabel(r"$\Delta'$")
-    ax3.set_ylabel(r"$w_{\rm sat}/a$")
-    ax3.set_title(
-        r"Saturated island width vs $\Delta'$ (normalized)"
-        + f" ({equilibrium_mode})"
-    )
-    ax3.grid(True, which="both", ls=":")
-    ax3.legend(loc="best")
-    fig3.savefig(os.path.join(
-        mode_dir, f"scan_wsat_over_a_vs_Deltaprime_{equilibrium_mode}.png"
-    ))
-    plt.close(fig3)
-    print("[SAVE] scan_wsat_over_a_vs_Deltaprime_"
-          f"{equilibrium_mode}.png")
-
-    # ------------------------------------------------------------------ #
-    # Plot 4: gamma_fit/gamma_FKR vs S and vs Delta'
-    # ------------------------------------------------------------------ #
-    ratio_arr = gamma_fit_arr / gamma_FKR_arr
-
-    # (a) ratio vs S
-    fig4a, ax4a = plt.subplots()
-    ax4a.semilogx(S_arr, ratio_arr, "o")
-    ax4a.set_xlabel(r"$S$")
-    ax4a.set_ylabel(r"$\gamma_{\rm fit}/\gamma_{\rm FKR}$")
-    ax4a.set_title(
-        r"Departure from FKR theory vs Lundquist number"
-        + f" ({equilibrium_mode})"
-    )
-    ax4a.grid(True, which="both", ls=":")
-    fig4a.savefig(os.path.join(
-        mode_dir, f"scan_gamma_ratio_vs_S_{equilibrium_mode}.png"
-    ))
-    plt.close(fig4a)
-    print("[SAVE] scan_gamma_ratio_vs_S_"
-          f"{equilibrium_mode}.png")
-
-    # (b) ratio vs Delta'
-    fig4b, ax4b = plt.subplots()
-    ax4b.semilogx(Delta_prime_arr, ratio_arr, "o")
-    ax4b.set_xlabel(r"$\Delta'$")
-    ax4b.set_ylabel(r"$\gamma_{\rm fit}/\gamma_{\rm FKR}$")
-    ax4b.set_title(
-        r"Departure from FKR theory vs $\Delta'$"
-        + f" ({equilibrium_mode})"
-    )
-    ax4b.grid(True, which="both", ls=":")
-    fig4b.savefig(os.path.join(
-        mode_dir, f"scan_gamma_ratio_vs_Deltaprime_{equilibrium_mode}.png"
-    ))
-    plt.close(fig4b)
-    print("[SAVE] scan_gamma_ratio_vs_Deltaprime_"
-          f"{equilibrium_mode}.png")
-
-    print("\n[DONE] Scan analysis complete for"
-          f" equilibrium_mode = {equilibrium_mode}.")
-    print("      Each point index in the plots corresponds to:")
-    for i, name in enumerate(fnames):
-        print(f"        {i}: {name}")
 
 
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    for equilibrium_mode in args.equilibrium_modes:
-        run_scan_for_mode(args, equilibrium_mode)
+    for eq_mode in args.equilibrium_modes:
+        if eq_mode not in BRANCH_CONFIG:
+            raise ValueError(f"No branch configuration for equilibrium_mode={eq_mode}")
+
+        cfg = BRANCH_CONFIG[eq_mode]
+        scan_a = cfg["scan_a"]
+        scan_eta = cfg["scan_eta"]
+        epsB = cfg["epsB"]
+        t1 = cfg["t1"]
+        n_frames = cfg["n_frames"]
+
+        print("\n" + "=" * 72)
+        print(f"[INFO] Starting scan for equilibrium_mode = '{eq_mode}'")
+        print("=" * 72)
+        print(f"[INFO] Branch parameters: epsB={epsB:g}, t1={t1:g}, "
+              f"n_frames={n_frames}, scan_a={scan_a}, scan_eta={scan_eta}")
+
+        eq_outdir = os.path.join(args.outdir, eq_mode)
+        os.makedirs(eq_outdir, exist_ok=True)
+
+        # Build list of (a, eta) combinations
+        combos: List[Tuple[float, float]] = []
+        for a in scan_a:
+            for eta in scan_eta:
+                combos.append((a, eta))
+
+        print("[INFO] Scan combinations (a, eta):")
+        for a, eta in combos:
+            print(f"   a={a:.4g}, eta={eta:.4g}")
+
+        results = []
+
+        for idx, (a, eta) in enumerate(combos):
+            tag = f"a{a:.3g}_eta{eta:.3g}_{eq_mode}"
+            tag = tag.replace(".", "p").replace("-", "m")
+            outfile = os.path.join(eq_outdir,
+                                   f"mhd_tearing_solution_{tag}.npz")
+
+            if os.path.exists(outfile) and not args.force_rerun:
+                print(f"\n[INFO] Skipping solve for {tag}, file already exists.")
+            else:
+                print(f"\n[INFO] Running solve for {tag} ...")
+                solve_tearing_case(
+                    Nx=args.Nx,
+                    Ny=args.Ny,
+                    Nz=args.Nz,
+                    Lx=args.Lx,
+                    Ly=args.Ly,
+                    Lz=args.Lz,
+                    nu=args.nu,
+                    eta=eta,
+                    B0=args.B0,
+                    a=a,
+                    B_g=args.Bg,
+                    eps_B=epsB,
+                    t0=args.t0,
+                    t1=t1,
+                    n_frames=n_frames,
+                    dt0=args.dt0,
+                    outfile=outfile,
+                    equilibrium_mode=eq_mode,
+                )
+
+            res = analyze_single_run(
+                outfile,
+                args.lin_tmin,
+                args.lin_tmax,
+                tuple(args.ruth_frac),
+            )
+            results.append(res)
+            
+            # Optionally delete the heavy NPZ file to save disk.
+            if not args.keep_npz:
+                try:
+                    os.remove(outfile)
+                    print(f"[CLEAN] Removed {outfile}")
+                except OSError as e:
+                    print(f"[WARN] Could not remove {outfile}: {e}")
+
+        build_summary_and_plots(results, eq_outdir, eq_mode)
 
 
 if __name__ == "__main__":

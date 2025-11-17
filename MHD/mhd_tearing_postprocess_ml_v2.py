@@ -626,6 +626,7 @@ def plot_prl_multi_panel(
     eq_params: np.ndarray,
     latent_model,
     indices: List[int],
+    gamma_th: np.ndarray,
     seed: int = 0,
 ) -> None:
     """
@@ -697,34 +698,34 @@ def plot_prl_multi_panel(
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False, loc="upper left")
 
-    # --- (c) γ vs S -----------------------------------------------------------
-    mask = np.isfinite(S_arr) & (S_arr > 0.0)
-    S = S_arr[mask]
-    g_fit = gamma_true[mask]
-    g_pred = gamma_pred[mask]
+    # --- (c) γ vs γ_FKR (theory) --------------------------------------------
+    mask_th = np.isfinite(gamma_th) & (gamma_th > 0.0)
+    g_th = gamma_th[mask_th]
+    g_fit_plot = gamma_true[mask_th]
+    g_pred_plot = gamma_pred[mask_th]
 
     ax = ax_c
-    ax.scatter(S, g_fit, s=28, marker="o", label=r"Sim. $\gamma_{\mathrm{fit}}$")
-    ax.scatter(S, g_pred, s=28, marker="s", label=r"Sur. $\gamma_{\mathrm{pred}}$")
+    ax.scatter(g_th, g_fit_plot, s=28, marker="o",
+               label=r"Sim. $\gamma_{\mathrm{fit}}$")
+    ax.scatter(g_th, g_pred_plot, s=28, marker="s",
+               label=r"Sur. $\gamma_{\mathrm{pred}}$")
 
-    S_ref = np.linspace(0.9 * np.min(S), 1.1 * np.max(S), 200)
-    S0 = np.median(S)
-    g0 = np.median(g_fit)
-    gamma_sp = g0 * (S_ref / S0) ** (-0.5)
+    gmin = np.min(g_th)
+    gmax = np.max(g_th)
+    pad = 0.05 * (gmax - gmin + 1e-8)
     ax.plot(
-        S_ref,
-        gamma_sp,
+        [gmin - pad, gmax + pad],
+        [gmin - pad, gmax + pad],
         "k--",
         lw=1.1,
-        label=r"$\propto S^{-1/2}$",
+        label="Ideal",
     )
 
-    ax.set_xscale("log")
-    ax.set_xlabel(r"$S$")
+    ax.set_xlabel(r"$\gamma_{\mathrm{FKR}}$")
     ax.set_ylabel(r"$\gamma$")
-    ax.set_title("(c) Linear tearing growth vs Lundquist number")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend(frameon=False, loc="upper right")
+    ax.set_title("(c) Linear tearing physics across the scan")
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False, loc="upper left")
 
     # --- (d) surrogate γ error histogram -------------------------------------
     rel_err_gamma = (gamma_pred - gamma_true) / (gamma_true + 1e-16)
@@ -869,7 +870,7 @@ def main():
     # Combined PRL-style multipanel summary figure
     plot_prl_multi_panel(ml_dir, ts,
         gamma_fit, gamma_pred, A_sat, Asat_pred, S_arr, amp,
-        amp_hat, eq_params, latent_model, indices, seed=seed,)
+        amp_hat, eq_params, latent_model, indices, gamma_th, seed=seed,)
 
     print("\n[DONE] v2 ML postprocessing complete.")
     print("Figures written to:")

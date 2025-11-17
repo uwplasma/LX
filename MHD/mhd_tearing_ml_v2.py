@@ -80,44 +80,61 @@ def safe_log(x, eps: float = 1e-16):
 def fit_growth_rate(
     ts: jnp.ndarray,
     amp: jnp.ndarray,
-    frac_window: Tuple[float, float] = (0.2, 0.6),
+    frac_window: Tuple[float, float] = (0.15, 0.5),
 ) -> float:
     """
     Fit γ from A(t) ≈ A0 exp(γ t) using least-squares on log A.
 
-    frac_window: use [t0 + f1*(t1-t0), t0 + f2*(t1-t0)] as "linear phase"
+    Strategy:
+      1) select a coarse window [f1, f2] in time,
+      2) scan a few overlapping subwindows inside it,
+      3) pick the subwindow with the best linear fit (largest R^2).
     """
     ts = jnp.asarray(ts)
     amp = jnp.asarray(amp)
+    t0, t1 = ts[0], ts[-1]
+    T = t1 - t0
 
-    t0 = ts[0]
-    t1 = ts[-1]
-    t_start = t0 + frac_window[0] * (t1 - t0)
-    t_end = t0 + frac_window[1] * (t1 - t0)
+    t_start = t0 + frac_window[0] * T
+    t_end   = t0 + frac_window[1] * T
+    base_mask = (ts >= t_start) & (ts <= t_end)
+    ts_base = ts[base_mask]
+    amp_base = amp[base_mask]
 
-    # primary window
-    mask = (ts >= t_start) & (ts <= t_end)
-    ts_sel = ts[mask]
-    amp_sel = amp[mask]
+    # Fallbacks if something went wrong
+    if ts_base.shape[0] < 6:
+        ts_base = ts
+        amp_base = amp
 
-    # if too few points, fall back to a broader middle window
-    if ts_sel.shape[0] < 4:
-        mid_mask = (ts >= (t0 + 0.25 * (t1 - t0))) & (ts <= (t0 + 0.75 * (t1 - t0)))
-        ts_sel = ts[mid_mask]
-        amp_sel = amp[mid_mask]
+    y_base = safe_log(amp_base)
 
-    # final safety: if still too small, just use all points
-    if ts_sel.shape[0] < 2:
-        ts_sel = ts
-        amp_sel = amp
+    # Scan 3 overlapping subwindows inside the base window
+    n = ts_base.shape[0]
+    n_sub = max(4, n // 2)
+    best_gamma = 0.0
+    best_r2 = -jnp.inf
 
-    y = safe_log(amp_sel)
-    t_mean = jnp.mean(ts_sel)
-    y_mean = jnp.mean(y)
-    cov_ty = jnp.mean((ts_sel - t_mean) * (y - y_mean))
-    var_t = jnp.mean((ts_sel - t_mean) ** 2) + 1e-16
-    gamma = cov_ty / var_t
-    return float(gamma)
+    for offset in [0, (n - n_sub) // 2, n - n_sub]:
+        offset = int(jnp.clip(offset, 0, n - n_sub))
+        ts_sub = ts_base[offset : offset + n_sub]
+        y_sub = y_base[offset : offset + n_sub]
+
+        t_mean = jnp.mean(ts_sub)
+        y_mean = jnp.mean(y_sub)
+        cov_ty = jnp.mean((ts_sub - t_mean) * (y_sub - y_mean))
+        var_t = jnp.mean((ts_sub - t_mean) ** 2) + 1e-16
+        gamma = cov_ty / var_t
+
+        # R^2 of this local fit
+        y_pred = y_mean + gamma * (ts_sub - t_mean)
+        ss_res = jnp.mean((y_sub - y_pred) ** 2)
+        ss_tot = jnp.mean((y_sub - y_mean) ** 2) + 1e-16
+        r2 = 1.0 - ss_res / ss_tot
+
+        best_gamma = jnp.where(r2 > best_r2, gamma, best_gamma)
+        best_r2 = jnp.maximum(best_r2, r2)
+
+    return float(best_gamma)
 
 
 def compute_saturated_amplitude(amp: jnp.ndarray, frac_tail: float = 0.2) -> float:
@@ -308,13 +325,20 @@ def build_dataset(
     records: List[Dict[str, Any]] = []
 
     for i in range(n_cases):
-        # Sample physically reasonable parameters around a baseline
+        # Baseline geometry and equilibrium
         B0 = 1.0
-        a = grid.Lx / 16.0 * rng.uniform(0.7, 1.3)
-        B_g = 0.2 * rng.uniform(0.7, 1.3)
-        eps_B = 0.01 * rng.uniform(0.5, 2.0)
-        nu = 1e-3 * rng.uniform(0.3, 3.0)
-        eta = 1e-3 * rng.uniform(0.3, 3.0)
+        a = grid.Lx / 16.0      # fixed shear-layer width
+        B_g = 0.2               # fixed guide field (cleaner scan)
+        eps_B = 1.0e-2          # fixed perturbation amplitude
+
+        # Wider log-uniform scan in resistivity:
+        #   eta ~ [3e-5, 3e-3]  → S ~ O(10^2–10^4)
+        log_eta = rng.uniform(-4.5, -2.5)
+        eta = 10.0 ** log_eta
+
+        # Keep Pm ≈ 1 to avoid additional parameter entanglement
+        Pm_target = 1.0
+        nu = Pm_target * eta
 
         phys = PhysicalParams(
             nu=nu,
@@ -439,7 +463,7 @@ def init_surrogate_model(
         rng_key,
         in_dim=in_dim,
         out_dim=out_dim,
-        width=32,
+        width=48,
         depth=2,
     )
     optimizer = optax.chain(
@@ -626,7 +650,7 @@ def init_latent_ode_model(
     rng_key,
     amp_len: int,
     eq_dim: int,
-    latent_dim: int = 2,
+    latent_dim: int = 3,
 ) -> LatentODEModel:
     k1, k2, k3, k4 = jax.random.split(rng_key, 4)
 
@@ -636,8 +660,8 @@ def init_latent_ode_model(
         k1,
         in_dim=encoder_in_dim,
         out_dim=latent_dim,
-        width=32,
-        depth=2,
+        width=64,
+        depth=3,
     )
 
     # Prior: eq_params -> z0_prior
@@ -645,8 +669,8 @@ def init_latent_ode_model(
         k2,
         in_dim=eq_dim,
         out_dim=latent_dim,
-        width=32,
-        depth=2,
+        width=64,
+        depth=3,
     )
 
     # ODE field: z -> dz/dt  (shared dynamics; no explicit param dependence)
@@ -655,8 +679,8 @@ def init_latent_ode_model(
         k3,
         in_dim=ode_in_dim,
         out_dim=latent_dim,
-        width=32,
-        depth=2,
+        width=64,
+        depth=3,
     )
 
     # Decoder: (z, eq_params) -> log_amp_norm_hat
@@ -665,8 +689,8 @@ def init_latent_ode_model(
         k4,
         in_dim=dec_in_dim,
         out_dim=1,
-        width=32,
-        depth=2,
+        width=64,
+        depth=3,
     )
 
     dummy_tree = dict(
@@ -851,13 +875,20 @@ def latent_ode_loss_batched(
             decoder_params, dec_input
         )  # (B,1)
         return log_amp_hat_n_t[:, 0]  # (B,)
-
+    
     log_amp_hat_n_TB = jax.vmap(decode_time_step)(z_traj)  # (T, B)
     log_amp_hat_n = log_amp_hat_n_TB.T  # (B, T)
 
-    recon = jnp.mean((log_amp_hat_n - log_amp_n) ** 2)
+    # --- time-weighted reconstruction loss: emphasize nonlinear / late times
+    T = log_amp_n.shape[1]
+    w_t = jnp.linspace(0.5, 1.8, T)          # slightly larger weight near t = t1
+    w_t = w_t / jnp.mean(w_t)                # normalize so <w_t> = 1
+    T = log_amp_n.shape[1]
+
+    recon = jnp.mean(w_t[None, :] * (log_amp_hat_n - log_amp_n) ** 2)
     prior_pen = jnp.mean((z0_prior - z0_enc) ** 2)
     return w_recon * recon + w_prior * prior_pen
+
 
 
 def make_latent_ode_train_step(
@@ -1207,8 +1238,8 @@ def main():
     print("=== Generating tearing database (v2, using mhd_tearing_solve.py) ===")
     t0 = 0.0
     t1 = 40.0
-    n_frames = 80
-    n_cases = 32  # adjust depending on HPC resources
+    n_frames = 100
+    n_cases = 48  # adjust depending on HPC resources
 
     t_start = time.time()
     data = build_dataset(
@@ -1358,7 +1389,7 @@ def main():
         ts,
         amp,
         eq_params,
-        latent_dim=2,
+        latent_dim=3,
         n_epochs=200,
         batch_size=8,
         seed=1,
