@@ -88,7 +88,7 @@ def resample_polyline_periodic(C: np.ndarray, n_out: int) -> np.ndarray:
     # Make periodic by appending C[0] at end for each coord:
     C_per = np.vstack([C, C[0]])
     # Target equal spacing in [0, L)
-    s_target = np.linspace(0.0, L, n_out, endpoint=False)
+    s_target = np.linspace(0.0, L, n_out, endpoint=True)
     # Interp each coord independently (np.interp expects increasing x):
     X = np.interp(s_target, s, C_per[:, 0])
     Y = np.interp(s_target, s, C_per[:, 1])
@@ -166,7 +166,7 @@ def tube_surface_from_centerline(
         Surface points and outward unit normals on a regular grid.
     """
     n_u = C.shape[0]
-    thetas = np.linspace(0.0, 2.0*np.pi, n_theta, endpoint=False)
+    thetas = np.linspace(0.0, 2.0*np.pi, n_theta, endpoint=True)
     ct = np.cos(thetas)[None, :, None]
     st = np.sin(thetas)[None, :, None]
     Rdir = N[:, None, :] * ct + B[:, None, :] * st
@@ -207,7 +207,7 @@ def build_torus_knot_surface(
     if oversample is None:
         oversample = max(10 * nu, 8 * q * p)  # ensure plenty of samples
 
-    u_dense = np.linspace(0.0, 2.0*np.pi, oversample, endpoint=False)
+    u_dense = np.linspace(0.0, 2.0*np.pi, oversample, endpoint=True)
     C_dense = torus_knot_centerline(u_dense, p=p, q=q, R=R, r0=r0)
 
     # Equal-arclength resample to nu points (periodic/closed)
@@ -262,7 +262,7 @@ def quick_plot(X, Y, Z, title="Torus-knot tube (surface)"):
         return
     fig = plt.figure(figsize=(7, 6))
     ax = fig.add_subplot(1, 1, 1, projection="3d")
-    ax.plot_surface(X, Y, Z, rstride=1, cstride=1, linewidth=0, alpha=1.0, shade=False)
+    ax.plot_surface(X, Y, Z, rstride=1, cstride=1, linewidth=0.1, alpha=1.0, shade=False)
     ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
     ax.set_title(title)
     _equal_aspect_3d(ax)
@@ -277,10 +277,10 @@ def main():
     ap.add_argument("--p", type=int, default=2, help="Torus-knot toroidal wraps (e.g., 2 for trefoil (2,3)).")
     ap.add_argument("--q", type=int, default=3, help="Torus-knot poloidal wraps (e.g., 3 for trefoil (2,3)).")
     ap.add_argument("--R", type=float, default=1.0, help="Base torus major radius.")
-    ap.add_argument("--r0", type=float, default=0.45, help="Base torus minor amplitude for the knot path.")
-    ap.add_argument("--tube_r", type=float, default=0.35, help="Tube (surface) minor radius.")
-    ap.add_argument("--nu", type=int, default=128, help="Samples along knot (u-direction).")
-    ap.add_argument("--ntheta", type=int, default=16, help="Samples around tube cross-section (theta-direction).")
+    ap.add_argument("--r0", type=float, default=0.25, help="Base torus minor amplitude for the knot path.")
+    ap.add_argument("--tube_r", type=float, default=0.15, help="Tube (surface) minor radius.")
+    ap.add_argument("--nu", type=int, default=152, help="Samples along knot (u-direction).")
+    ap.add_argument("--ntheta", type=int, default=32, help="Samples around tube cross-section (theta-direction).")
     ap.add_argument("--out", type=str, default="knot_tube.csv", help="Output: .npz | .npy | .csv")
     ap.add_argument("--preview", action="store_true", default=True, help="Show a quick 3D preview (default: True).")
     args = ap.parse_args()

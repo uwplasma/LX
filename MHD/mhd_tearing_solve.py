@@ -378,8 +378,8 @@ def parse_args():
     p.add_argument("--epsB", type=float, default=0.01,
                    help="perturbation amplitude in A_z")
     p.add_argument("--t0", type=float, default=0.0)
-    p.add_argument("--t1", type=float, default=100.0)
-    p.add_argument("--n_frames", type=int, default=80)
+    p.add_argument("--t1", type=float, default=50.0)
+    p.add_argument("--n_frames", type=int, default=150)
     p.add_argument("--dt0", type=float, default=None,
                    help="initial dt; if None, estimated via CFL")
     p.add_argument("--outfile", type=str,
@@ -444,7 +444,7 @@ def main():
     if args.dt0 is None:
         dt_max = estimate_max_dt(v0_hat, B0_hat, Lx, Ly, Lz, nu, eta)
         print(f"[DT] Estimated dt_max from CFL/diffusion = {dt_max:.3e}")
-        dt0 = min(1e-3, 0.5 * dt_max)
+        dt0 = min(5e-4, 0.5 * dt_max)
     else:
         dt0 = args.dt0
 
@@ -454,7 +454,7 @@ def main():
     term = dfx.ODETerm(rhs)
 
     solver = dfx.Dopri8()
-    stepsize_controller = dfx.PIDController(rtol=1e-5, atol=1e-7)
+    stepsize_controller = dfx.PIDController(rtol=1e-7, atol=1e-7)
     ts_save = jnp.linspace(t0, t1, n_frames)
     saveat = dfx.SaveAt(ts=ts_save)
 

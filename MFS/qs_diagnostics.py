@@ -1,40 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""
-Quasisymmetry triple-product metric from flux-function ψ and MFS magnetic field.
+"""
+Quasisymmetry metric from flux-function ψ and MFS magnetic field.
 
 This script:
   1) Loads ψ(𝐱) from a psi_fci snapshot (.npz).
   2) Loads the MFS solution checkpoint (center, scale, Yn, alpha, a, a_hat, P, N).
-  3) Rebuilds ∇φ(𝐱) (so B = ∇φ) using the same Evaluators pattern.
-  4) Precomputes ∇ψ on the ψ grid (finite differences in cylindrical or Cartesian).
-  5) For several ψ-levels (flux surfaces), samples points in a thin ψ-band.
-  6) At each surface point, evaluates the Landreman/DESC triple-product quantity
-
-         f_T = (∇ψ × ∇B) · ∇( B · ∇B ),
-
-     where B = |𝐁| and ∇B and ∇(B·∇B) are obtained via JAX autodiff.
-  7) Defines a normalized QS error per surface
-
-         \hat f_T(ψ) = <R>^2 <|f_T|> / <B>^4,
-
-     approximating <·> as simple averages over sampled points.
-  8) Aggregates to a global QS metric and makes publication-ready plots:
-
-       - |B|(θ, φ) on a mid-radius surface
-       - |B|(θ, φ) on an outer surface
-       - \hat f_T vs normalized ψ.
-
-References:
-  - Landreman, "Introduction to quasisymmetry", Sec. 8, condition (d).
-  - DESC documentation, basic_optimization tutorial (quasisymmetry triple-product objective).
+  3) Rebuilds grad_phi(𝐱) (so B = ∇φ) using the same Evaluators pattern.
+  4) For several ψ-levels (flux surfaces), samples points in a thin ψ-band.
+  5) For each point, computes geometric angles (φ, θ) using the magnetic axis:
+        φ = atan2(y, x)
+        θ = poloidal angle in (R,Z) around the axis position at that φ.
+  6) Fits a Fourier series B(θ, φ) on each surface via least-squares.
+  7) Computes a QA-style QS metric: fraction of Fourier power in n≠0 modes.
+  8) Aggregates to a global metric and prints/saves it.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any
 
 import numpy as np
 import jax
@@ -43,14 +29,14 @@ import jax.numpy as jnp
 from jax import jit, vmap
 
 from scipy.interpolate import interp1d
+from scipy.interpolate import griddata        ### NEW
+
+import matplotlib.pyplot as plt               ### NEW
 
 import os
 from pathlib import Path
-import matplotlib.pyplot as plt
-from matplotlib.tri import Triangulation
 
 # -------------------------- Paths and utils ------------------------- #
-
 script_dir = Path(__file__).resolve().parent
 
 def resolve_npz_file_location(npz_file, subdir="outputs"):
@@ -260,125 +246,6 @@ def geometric_angles_from_axis(X: np.ndarray,
     return phi, theta, R
 
 # ---------------------------------------------------------------------------
-# ∇ψ on the ψ grid (finite differences)
-# ---------------------------------------------------------------------------
-
-def compute_grad_psi_cartesian(psi3: np.ndarray,
-                               xs: np.ndarray,
-                               ys: np.ndarray,
-                               zs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Finite-difference gradient of ψ on a Cartesian grid."""
-    nx, ny, nz = psi3.shape
-    gx = np.zeros_like(psi3)
-    gy = np.zeros_like(psi3)
-    gz = np.zeros_like(psi3)
-
-    # d/dx
-    for i in range(nx):
-        if i == 0:
-            dx = xs[1] - xs[0]
-            gx[i, :, :] = (psi3[1, :, :] - psi3[0, :, :]) / dx
-        elif i == nx - 1:
-            dx = xs[-1] - xs[-2]
-            gx[i, :, :] = (psi3[-1, :, :] - psi3[-2, :, :]) / dx
-        else:
-            dx = xs[i+1] - xs[i-1]
-            gx[i, :, :] = (psi3[i+1, :, :] - psi3[i-1, :, :]) / dx
-
-    # d/dy
-    for j in range(ny):
-        if j == 0:
-            dy = ys[1] - ys[0]
-            gy[:, j, :] = (psi3[:, 1, :] - psi3[:, 0, :]) / dy
-        elif j == ny - 1:
-            dy = ys[-1] - ys[-2]
-            gy[:, j, :] = (psi3[:, -1, :] - psi3[:, -2, :]) / dy
-        else:
-            dy = ys[j+1] - ys[j-1]
-            gy[:, j, :] = (psi3[:, j+1, :] - psi3[:, j-1, :]) / dy
-
-    # d/dz
-    for k in range(nz):
-        if k == 0:
-            dz = zs[1] - zs[0]
-            gz[:, :, k] = (psi3[:, :, 1] - psi3[:, :, 0]) / dz
-        elif k == nz - 1:
-            dz = zs[-1] - zs[-2]
-            gz[:, :, k] = (psi3[:, :, -1] - psi3[:, :, -2]) / dz
-        else:
-            dz = zs[k+1] - zs[k-1]
-            gz[:, :, k] = (psi3[:, :, k+1] - psi3[:, :, k-1]) / dz
-
-    return gx, gy, gz
-
-def compute_grad_psi_cylindrical(psi3: np.ndarray,
-                                 Rs: np.ndarray,
-                                 phis: np.ndarray,
-                                 Zs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Finite-difference gradient of ψ on a cylindrical grid (R,φ,Z),
-    returned as Cartesian components (ψ_x, ψ_y, ψ_z) on the same grid.
-    """
-    nR, nphi, nZ = psi3.shape
-    dpsi_dR = np.zeros_like(psi3)
-    dpsi_dphi = np.zeros_like(psi3)
-    dpsi_dZ = np.zeros_like(psi3)
-
-    # ∂ψ/∂R (one-sided at boundaries, central inside)
-    for i in range(nR):
-        if i == 0:
-            dR = Rs[1] - Rs[0]
-            dpsi_dR[i, :, :] = (psi3[1, :, :] - psi3[0, :, :]) / dR
-        elif i == nR - 1:
-            dR = Rs[-1] - Rs[-2]
-            dpsi_dR[i, :, :] = (psi3[-1, :, :] - psi3[-2, :, :]) / dR
-        else:
-            dR = Rs[i+1] - Rs[i-1]
-            dpsi_dR[i, :, :] = (psi3[i+1, :, :] - psi3[i-1, :, :]) / dR
-
-    # ∂ψ/∂φ (periodic)
-    for j in range(nphi):
-        jm = (j - 1) % nphi
-        jp = (j + 1) % nphi
-        dphi = phis[jp] - phis[jm]
-        dpsi_dphi[:, j, :] = (psi3[:, jp, :] - psi3[:, jm, :]) / dphi
-
-    # ∂ψ/∂Z
-    for k in range(nZ):
-        if k == 0:
-            dZ = Zs[1] - Zs[0]
-            dpsi_dZ[:, :, k] = (psi3[:, :, 1] - psi3[:, :, 0]) / dZ
-        elif k == nZ - 1:
-            dZ = Zs[-1] - Zs[-2]
-            dpsi_dZ[:, :, k] = (psi3[:, :, -1] - psi3[:, :, -2]) / dZ
-        else:
-            dZ = Zs[k+1] - Zs[k-1]
-            dpsi_dZ[:, :, k] = (psi3[:, :, k+1] - psi3[:, :, k-1]) / dZ
-
-    # Convert to Cartesian: ∇ψ = (∂ψ/∂R) e_R + (1/R) ∂ψ/∂φ e_φ + (∂ψ/∂Z) e_Z
-    psi_x = np.zeros_like(psi3)
-    psi_y = np.zeros_like(psi3)
-    psi_z = np.zeros_like(psi3)
-
-    for i, R in enumerate(Rs):
-        if R == 0.0:
-            # On-axis: cylindrical basis is singular; set to 0 (we avoid axis surfaces anyway)
-            psi_x[i, :, :] = 0.0
-            psi_y[i, :, :] = 0.0
-        else:
-            for j, phi in enumerate(phis):
-                cosp = np.cos(phi)
-                sinp = np.sin(phi)
-                dRpsi = dpsi_dR[i, j, :]
-                dphipsi = dpsi_dphi[i, j, :] / R
-                # e_R = (cosφ, sinφ, 0), e_φ = (-sinφ, cosφ, 0)
-                psi_x[i, j, :] = dRpsi * cosp - dphipsi * sinp
-                psi_y[i, j, :] = dRpsi * sinp + dphipsi * cosp
-
-    psi_z = dpsi_dZ
-    return psi_x, psi_y, psi_z
-
-# ---------------------------------------------------------------------------
 # Sampling points on flux surfaces (ψ bands)
 # ---------------------------------------------------------------------------
 
@@ -387,9 +254,7 @@ def sample_points_on_psi_levels(psi3: np.ndarray,
                                 inside: np.ndarray,
                                 psi_levels: np.ndarray,
                                 band_frac: float = 0.01,
-                                max_points_per_level: int = 8000,
-                                gradpsi_flat: Tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-                                ) -> List[Dict[str, Any]]:
+                                max_points_per_level: int = 8000):
     """
     For each ψ_level, build a thin band:
         |ψ - ψ_level| < band_width
@@ -400,7 +265,6 @@ def sample_points_on_psi_levels(psi3: np.ndarray,
         "psi_level": float
         "X": (Ni,3) points in Cartesian coords
         "psi": (Ni,) local ψ
-        "grad_psi": (Ni,3) gradient vectors (if gradpsi_flat is provided)
     """
     psi_flat = psi3.ravel(order="C")
     mask_inside = inside.astype(bool)
@@ -410,9 +274,8 @@ def sample_points_on_psi_levels(psi3: np.ndarray,
     psi_max = float(np.max(psi_inside))
     band_width = band_frac * (psi_max - psi_min)
 
-    level_data: List[Dict[str, Any]] = []
+    level_data = []
 
-    # build Xall mapping consistent with psi_flat ordering
     if grid["type"] == "cylindrical":
         Rs = grid["Rs"]
         phis = grid["phis"]
@@ -423,11 +286,9 @@ def sample_points_on_psi_levels(psi3: np.ndarray,
         XX = RR * np.cos(PHI)
         YY = RR * np.sin(PHI)
 
-        Xall = np.column_stack([
-            XX.ravel(order="C"),
-            YY.ravel(order="C"),
-            ZZ.ravel(order="C"),
-        ])
+        Xall = np.column_stack([XX.ravel(order="C"),
+                                YY.ravel(order="C"),
+                                ZZ.ravel(order="C")])
 
     else:
         xs = grid["xs"]
@@ -439,16 +300,9 @@ def sample_points_on_psi_levels(psi3: np.ndarray,
         XX = XX.transpose(1, 0, 2)
         YY = YY.transpose(1, 0, 2)
         ZZ = ZZ.transpose(1, 0, 2)
-        Xall = np.column_stack([
-            XX.ravel(order="C"),
-            YY.ravel(order="C"),
-            ZZ.ravel(order="C"),
-        ])
-
-    if gradpsi_flat is not None:
-        gx_flat, gy_flat, gz_flat = gradpsi_flat
-    else:
-        gx_flat = gy_flat = gz_flat = None
+        Xall = np.column_stack([XX.ravel(order="C"),
+                                YY.ravel(order="C"),
+                                ZZ.ravel(order="C")])
 
     for psi0 in psi_levels:
         mask_band = (
@@ -465,70 +319,150 @@ def sample_points_on_psi_levels(psi3: np.ndarray,
 
         X_band = Xall[idx, :]
         psi_band = psi_flat[idx]
-        surf_dict: Dict[str, Any] = {
+        level_data.append({
             "psi_level": float(psi0),
             "X": X_band,
             "psi": psi_band,
-        }
-
-        if gx_flat is not None:
-            g_band = np.column_stack([
-                gx_flat[idx],
-                gy_flat[idx],
-                gz_flat[idx],
-            ])
-            surf_dict["grad_psi"] = g_band
-
-        level_data.append(surf_dict)
+        })
 
     return level_data
 
 # ---------------------------------------------------------------------------
-# Triple-product f_T via JAX autodiff
+# Fourier fit of B(θ, φ) on a flux surface
 # ---------------------------------------------------------------------------
 
-def build_triple_product_fn(grad_phi):
+def build_fourier_design(theta: np.ndarray,
+                         phi: np.ndarray,
+                         m_max: int,
+                         n_max: int):
     """
-    Build a JAX-jitted function that, for a batch of points X (N,3) and
-    precomputed ∇ψ(X) (N,3), returns:
-      f_T(X) = (∇ψ × ∇B) · ∇(B · ∇B),
-      Bmag(X), and R(X).
+    Build design matrix A for Fourier expansion:
+
+      B ≈ Σ_{m=-m_max..m_max} Σ_{n=-n_max..n_max}
+           C_{mn} cos(m θ + n φ) + S_{mn} sin(m θ + n φ)
+
+    We index coefficients in a 2D (m_idx, n_idx) grid, but store them flattened.
+
+    Returns:
+      A: (N_points, 2 * n_modes)
+      mode_list: list of (m,n) pairs corresponding to columns.
     """
+    theta = theta[:, None]  # (N,1)
+    phi = phi[:, None]      # (N,1)
 
-    def fT_surface(X_pts: np.ndarray,
-                   gradpsi_pts: np.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        X = jnp.asarray(X_pts, dtype=jnp.float64)          # (N,3)
-        Gpsi = jnp.asarray(gradpsi_pts, dtype=jnp.float64) # (N,3)
+    modes = []
+    cols_cos = []
+    cols_sin = []
 
-        def Bmag_fn(x):
-            B = grad_phi(x[jnp.newaxis, :])[0]
-            return jnp.linalg.norm(B)
+    for m in range(-m_max, m_max + 1):
+        for n in range(-n_max, n_max + 1):
+            arg = m*theta + n*phi
+            cols_cos.append(np.cos(arg))
+            cols_sin.append(np.sin(arg))
+            modes.append((m, n))
 
-        grad_Bmag_fn = jax.grad(Bmag_fn)
+    # concatenate along columns: [cos(m1n1) ... cos(mK nK) | sin(m1 n1) ...]
+    A_cos = np.concatenate(cols_cos, axis=1)   # (N, K)
+    A_sin = np.concatenate(cols_sin, axis=1)   # (N, K)
+    A = np.concatenate([A_cos, A_sin], axis=1) # (N, 2K)
 
-        def BdotgradB_fn(x):
-            B = grad_phi(x[jnp.newaxis, :])[0]
-            gB = grad_Bmag_fn(x)
-            return jnp.dot(B, gB)
+    return A, modes
 
-        grad_BdotgradB_fn = jax.grad(BdotgradB_fn)
+def fit_fourier_B(theta: np.ndarray,
+                  phi: np.ndarray,
+                  Bvals: np.ndarray,
+                  m_max: int,
+                  n_max: int):
+    """
+    Least-squares fit of Fourier series for B(θ, φ) on one flux surface.
+    Returns:
+      C: (K,) cos coefficients
+      S: (K,) sin coefficients
+      modes: list of (m,n) with length K
+    """
+    A, modes = build_fourier_design(theta, phi, m_max, n_max)
+    # regularized least squares to avoid pathological ill-conditioning
+    lam = 1e-10
+    ATA = A.T @ A + lam * np.eye(A.shape[1])
+    ATb = A.T @ Bvals
+    coeff = np.linalg.solve(ATA, ATb)  # (2K,)
 
-        # Evaluate gradients in batch
-        grad_Bmag = vmap(grad_Bmag_fn)(X)           # (N,3)
-        grad_BdotgradB = vmap(grad_BdotgradB_fn)(X) # (N,3)
+    K = len(modes)
+    C = coeff[:K]
+    S = coeff[K:]
+    return C, S, modes
 
-        # Triple product
-        cross = jnp.cross(Gpsi, grad_Bmag)
-        fT = jnp.sum(cross * grad_BdotgradB, axis=1)   # (N,)
+# ---------------------------------------------------------------------------
+# QS metrics (QA and QH-style)
+# ---------------------------------------------------------------------------
 
-        # Also return |B| and R at these points
-        B_vec = grad_phi(X)                           # (N,3)
-        Bmag = jnp.linalg.norm(B_vec, axis=1)         # (N,)
-        R = jnp.sqrt(X[:, 0]**2 + X[:, 1]**2)         # (N,)
+def qs_metric_QA(C: np.ndarray, S: np.ndarray, modes) -> float:
+    """
+    QA-style metric: only modes with n=0 are "QS-allowed".
+    Return fraction of Fourier power in n≠0 modes.
+    """
+    power_all = 0.0
+    power_qs = 0.0
+    for k, (m, n) in enumerate(modes):
+        amp2 = C[k]**2 + S[k]**2
+        power_all += amp2
+        if n == 0:
+            power_qs += amp2
+    if power_all == 0.0:
+        return 0.0
+    return float((power_all - power_qs) / power_all)
 
-        return fT, Bmag, R
+def qs_metric_QH(C: np.ndarray, S: np.ndarray, modes,
+                 helicity_M: int, helicity_N: int) -> float:
+    """
+    QH-style metric: "QS-allowed" modes satisfy N*m + M*n = 0 in Boozer coords.
+    For a simple choice, set M = 1, N = Nfp (field periods).
 
-    return jit(fT_surface)
+    This is approximate in geometric coordinates.
+    """
+    power_all = 0.0
+    power_qs = 0.0
+    for k, (m, n) in enumerate(modes):
+        amp2 = C[k]**2 + S[k]**2
+        power_all += amp2
+        if (helicity_N * m + helicity_M * n) == 0:
+            power_qs += amp2
+    if power_all == 0.0:
+        return 0.0
+    return float((power_all - power_qs) / power_all)
+
+# ---------------------------------------------------------------------------
+# Helper for B(θ,φ) grid and plots                ### NEW
+# ---------------------------------------------------------------------------
+
+def make_Btheta_phi_grid(theta, phi, Bmag,
+                         n_theta=64, n_phi=128):
+    """
+    Interpolate scattered (theta,phi,B) onto a regular grid for plotting.
+    All angles mapped into [0, 2π).
+    """
+    theta_mod = np.mod(theta, 2.0 * np.pi)
+    phi_mod = np.mod(phi, 2.0 * np.pi)
+
+    # Regular grid
+    theta_grid = np.linspace(0.0, 2.0*np.pi, n_theta, endpoint=False)
+    phi_grid = np.linspace(0.0, 2.0*np.pi, n_phi, endpoint=False)
+    TH, PH = np.meshgrid(theta_grid, phi_grid, indexing="ij")  # (n_theta,n_phi)
+
+    # Interpolate using griddata
+    pts = np.column_stack([theta_mod, phi_mod])
+    grid_pts = np.column_stack([TH.ravel(), PH.ravel()])
+
+    B_grid = griddata(pts, Bmag, grid_pts, method="linear")
+    B_grid = B_grid.reshape(TH.shape)
+
+    # Fill NaNs with nearest-neighbor interpolation
+    if np.any(~np.isfinite(B_grid)):
+        B_nn = griddata(pts, Bmag, grid_pts, method="nearest").reshape(TH.shape)
+        mask_bad = ~np.isfinite(B_grid)
+        B_grid[mask_bad] = B_nn[mask_bad]
+
+    return theta_grid, phi_grid, B_grid
 
 # ---------------------------------------------------------------------------
 # Main: put it all together
@@ -538,131 +472,94 @@ def main(psi_npz: str,
          mfs_npz: str,
          n_surfaces: int = 8,
          band_frac: float = 0.01,
-         max_points_per_level: int = 8000):
-
-    # Matplotlib style (tweak as needed)
-    plt.rcParams.update({
-        "font.size": 11,
-        "axes.labelsize": 13,
-        "axes.titlesize": 13,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "figure.figsize": (6.0, 4.5),
-    })
+         m_max: int = 4,
+         n_max: int = 4,
+         qs_type: str = "QA",
+         nfp: int = 2):
 
     # 1) Load ψ snapshot and MFS grad_phi
     psi_data = load_psi_snapshot(psi_npz)
     psi3 = psi_data["psi3"]
     grid = psi_data["grid"]
     inside = psi_data["inside"]
+    boundary_band = psi_data["boundary_band"]
     axis_points = psi_data["axis_points"]
 
     grad_phi, P_surf, N_surf = load_mfs_grad_phi(mfs_npz)
 
-    # 2) Precompute ∇ψ on the grid (Cartesian components)
-    if grid["type"] == "cylindrical":
-        Rs = grid["Rs"]
-        phis = grid["phis"]
-        Zs = grid["Zs"]
-        psi_x, psi_y, psi_z = compute_grad_psi_cylindrical(psi3, Rs, phis, Zs)
-    else:
-        xs = grid["xs"]
-        ys = grid["ys"]
-        zs = grid["zs"]
-        psi_x, psi_y, psi_z = compute_grad_psi_cartesian(psi3, xs, ys, zs)
-
-    gx_flat = psi_x.ravel(order="C")
-    gy_flat = psi_y.ravel(order="C")
-    gz_flat = psi_z.ravel(order="C")
-
-    # 3) Build axis interpolants (for θ,φ coordinates and plotting)
+    # 2) Build axis interpolants
     R_axis_interp, Z_axis_interp = build_axis_interp(axis_points)
 
-    # 4) Choose ψ-levels for surfaces (exclude bands near ψ≈min and ψ≈max)
+    # 3) Choose ψ-levels for surfaces (exclude bands near ψ≈0 and ψ≈1)
     psi_flat = psi3.ravel(order="C")
     mask_inside = inside.astype(bool)
     psi_inside = psi_flat[mask_inside]
     psi_min = float(np.min(psi_inside))
     psi_max = float(np.max(psi_inside))
 
+    # Avoid extreme axis/boundary bands
     eps_psi = 0.05 * (psi_max - psi_min)
     psi_levels = np.linspace(psi_min + eps_psi, psi_max - eps_psi, n_surfaces)
 
-    # 5) Sample points in thin ψ-bands, with ∇ψ evaluated at those nodes
+    # 4) Sample points in thin ψ-bands
     level_data = sample_points_on_psi_levels(
         psi3, grid, inside,
         psi_levels=psi_levels,
         band_frac=band_frac,
-        max_points_per_level=max_points_per_level,
-        gradpsi_flat=(gx_flat, gy_flat, gz_flat),
+        max_points_per_level=8000,
     )
 
     if len(level_data) == 0:
         print("[ERROR] No ψ-levels with valid points; check band_frac and ψ-range.")
         return
 
-    # 6) Build triple-product evaluator
-    triple_prod_fn = build_triple_product_fn(grad_phi)
-
+    # 5) Evaluate B = ∇φ and build angles, then Fourier-fit per surface
     qs_values = []
-    surfaces_for_B_plots: List[Dict[str, Any]] = []
+    plot_data = []     ### NEW: store for plotting
 
-    n_levels_total = len(level_data)
-    mid_idx = n_levels_total // 2
-    outer_idx = n_levels_total - 1
-
-    for isurf, surf in enumerate(level_data):
+    for surf in level_data:
         psi0 = surf["psi_level"]
-        X = surf["X"]               # (N,3)
-        gradpsi = surf["grad_psi"]  # (N,3)
+        X = surf["X"]   # (N,3)
 
-        # Evaluate triple product and |B|
-        fT_j, Bmag_j, R_j = triple_prod_fn(X, gradpsi)
-        fT = np.asarray(fT_j)
-        Bmag = np.asarray(Bmag_j)
-        R_vals = np.asarray(R_j)
+        # Evaluate B via JAX grad_phi in batch
+        X_j = jnp.asarray(X, dtype=jnp.float64)
+        B = np.asarray(grad_phi(X_j))  # (N,3)
 
-        # Filter out any pathological points
-        mask_good = (
-            np.isfinite(fT) &
-            np.isfinite(Bmag) &
-            (Bmag > 1e-14)
-        )
-        if mask_good.sum() < 200:
+        Bmag = np.linalg.norm(B, axis=1)
+        # Filter out weird points
+        mask = np.isfinite(Bmag) & (Bmag > 1e-12)
+        if mask.sum() < 200:
             print(f"[WARN] Not enough good points on ψ≈{psi0:.3f}, skipping.")
             continue
 
-        fT = fT[mask_good]
-        Bmag = Bmag[mask_good]
-        R_vals = R_vals[mask_good]
-        X_good = X[mask_good, :]
+        X_good = X[mask, :]
+        Bmag_good = Bmag[mask]
 
-        # Geometric angles (φ, θ) using axis
-        phi, theta, _ = geometric_angles_from_axis(X_good,
-                                                   R_axis_interp,
-                                                   Z_axis_interp)
+        # Geometric angles
+        phi, theta, R = geometric_angles_from_axis(X_good, R_axis_interp, Z_axis_interp)
 
-        # Normalized triple-product QS error per surface:
-        #   \hat f_T(ψ) = <R>^2 <|f_T|> / <B>^4
-        mean_abs_fT = float(np.mean(np.abs(fT)))
-        mean_R = float(np.mean(R_vals))
-        mean_B = float(np.mean(Bmag))
-        if mean_B <= 0.0:
-            qs_surf = 0.0
+        # Fourier fit
+        C, S, modes = fit_fourier_B(theta, phi, Bmag_good, m_max=m_max, n_max=n_max)
+
+        # QS metric
+        if qs_type.upper() == "QA":
+            q_surf = qs_metric_QA(C, S, modes)
+        elif qs_type.upper() == "QH":
+            # For QH with field-period Nfp, typical choice is helicity (M=1, N=nfp)
+            q_surf = qs_metric_QH(C, S, modes, helicity_M=1, helicity_N=nfp)
         else:
-            qs_surf = (mean_R**2 * mean_abs_fT) / (mean_B**4)
+            raise ValueError(f"Unknown qs_type={qs_type}; use 'QA' or 'QH'.")
 
-        qs_values.append((psi0, qs_surf))
-        print(f"[QS] ψ≈{psi0:.3f}:  hat(f_T) = {qs_surf:.3e}")
+        qs_values.append((psi0, q_surf))
+        print(f"[QS] ψ≈{psi0:.3f}: QS error = {q_surf:.3e}")
 
-        # Store data for |B|(θ, φ) plots on mid and outer surfaces
-        if isurf in (mid_idx, outer_idx):
-            surfaces_for_B_plots.append({
-                "psi_level": psi0,
-                "phi": phi,
-                "theta": theta,
-                "Bmag": Bmag,
-            })
+        # Store for plotting
+        plot_data.append({
+            "psi_level": psi0,
+            "theta": theta,
+            "phi": phi,
+            "Bmag": Bmag_good,
+        })
 
     if len(qs_values) == 0:
         print("[ERROR] No surfaces produced a QS metric; aborting.")
@@ -672,67 +569,66 @@ def main(psi_npz: str,
     psi_levels_used = qs_values[:, 0]
     qs_errors = qs_values[:, 1]
 
-    # 7) Global QS metric (simple average over surfaces)
+    # 6) Aggregate to a single global QS metric (simple average for now)
     qs_global = float(np.mean(qs_errors))
-    print("==============================================")
-    print(f"[QS] Global triple-product metric (mean hat f_T) = {qs_global:.5e}")
-    print("==============================================")
+    print("=========================================")
+    print(f"[QS] Global {qs_type} metric (mean over surfaces) = {qs_global:.5e}")
+    print("=========================================")
 
-    # 8) Publication-style plots
-    base = psi_npz.replace(".npz", "_QS_triple")
-
-    # (a) |B|(θ, φ) on chosen surfaces
-    if len(surfaces_for_B_plots) > 0:
-        nfig = len(surfaces_for_B_plots)
-        fig, axes = plt.subplots(1, nfig, figsize=(6.0 * nfig, 4.5),
-                                 constrained_layout=True)
-        if nfig == 1:
-            axes = [axes]
-
-        for ax, surf_plot in zip(axes, surfaces_for_B_plots):
-            phi = np.mod(surf_plot["phi"], 2*np.pi)
-            theta = np.mod(surf_plot["theta"], 2*np.pi)
-            Bmag = surf_plot["Bmag"]
-            psi0 = surf_plot["psi_level"]
-
-            triang = Triangulation(phi, theta)
-            tcf = ax.tricontourf(triang, Bmag, levels=40)
-            cbar = fig.colorbar(tcf, ax=ax)
-            cbar.set_label(r"$|B|$")
-
-            ax.set_xlabel(r"$\varphi$")
-            ax.set_ylabel(r"$\theta$")
-            ax.set_title(rf"$|B|(\theta,\varphi)$ on $\psi \approx {psi0:.3f}$")
-
-        fig.suptitle(r"Magnetic field strength on selected flux surfaces",
-                     y=1.02)
-        out_B = base + "_Bmaps.png"
-        fig.savefig(out_B, dpi=300, bbox_inches="tight")
-        print(f"[PLOT] Saved |B|(θ,φ) maps to {out_B}")
-
-    # (b) hat(f_T) vs normalized ψ
-    psi_norm = (psi_levels_used - psi_min) / (psi_max - psi_min)
-    fig2, ax2 = plt.subplots()
-    ax2.plot(psi_norm, qs_errors, "o-", lw=1.5)
-    ax2.set_xlabel(r"Normalized flux $(\psi - \psi_\mathrm{min}) / (\psi_\mathrm{max} - \psi_\mathrm{min})$")
-    ax2.set_ylabel(r"$\hat f_T(\psi)$")
-    ax2.set_title("Quasisymmetry triple-product diagnostic")
-    ax2.grid(True, alpha=0.3)
-    out_prof = base + "_profile.png"
-    fig2.savefig(out_prof, dpi=300, bbox_inches="tight")
-    print(f"[PLOT] Saved triple-product profile to {out_prof}")
-
-    # 9) Save numerical data
-    out_name = psi_npz.replace(".npz", "_QS_triple_product.npz")
+    # Save for post-processing
+    out_name = psi_npz.replace(".npz", f"_QS_{qs_type.upper()}.npz")
     np.savez(
         out_name,
         psi_levels=psi_levels_used,
         qs_errors=qs_errors,
         qs_global=qs_global,
-        psi_min=psi_min,
-        psi_max=psi_max,
+        qs_type=qs_type,
+        m_max=m_max,
+        n_max=n_max,
     )
-    print(f"[SAVE] Saved QS triple-product data to {out_name}")
+    print(f"[SAVE] Saved QS metric data to {out_name}")
+
+    # 7) Plot |B|(θ,φ) on inner-radius and outer surfaces     ### NEW
+    if len(plot_data) >= 2:
+        # Sort by psi_level (inner to outer)
+        plot_data_sorted = sorted(plot_data, key=lambda d: d["psi_level"])
+        # inner-radius: middle index
+        mid_idx = len(plot_data_sorted) // 4
+        # boundary-ish: outermost surface
+        outer_idx = len(plot_data_sorted) - 1
+
+        surfaces_to_plot = [
+            ("inner-radius", plot_data_sorted[mid_idx]),
+            ("outer", plot_data_sorted[outer_idx]),
+        ]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+        if len(axes.shape) == 0:  # just in case matplotlib returns single Axes
+            axes = np.array([axes])
+
+        for ax, (label, sdata) in zip(axes, surfaces_to_plot):
+            theta = sdata["theta"]
+            phi = sdata["phi"]
+            Bmag = sdata["Bmag"]
+            psi0 = sdata["psi_level"]
+
+            theta_grid, phi_grid, B_grid = make_Btheta_phi_grid(theta, phi, Bmag)
+
+            cf = ax.contourf(phi_grid, theta_grid, B_grid, levels=40)
+            fig.colorbar(cf, ax=ax)
+
+            ax.set_xlabel(r"$\phi$ (geom)")
+            ax.set_ylabel(r"$\theta$ (geom)")
+            ax.set_title(rf"$|B|(\theta,\phi)$, {label}, $\psi \approx {psi0:.3f}$")
+
+        # Save figure
+        png_name = psi_npz.replace(".npz", f"_Btheta_phi_contours.png")
+        fig.suptitle("|B|(θ,φ) contours on selected flux surfaces")
+        fig.savefig(png_name, dpi=200)
+        plt.close(fig)
+        print(f"[PLOT] Saved |B|(θ,φ) contour plot to {png_name}")
+    else:
+        print("[PLOT] Not enough surfaces for B(theta,phi) plotting; skipping.")
 
 if __name__ == "__main__":
     default_solution = "wout_precise_QA_solution.npz"
@@ -740,47 +636,32 @@ if __name__ == "__main__":
     # default_solution = "wout_SLAM_4_coils_solution.npz"
     # default_solution = "wout_SLAM_6_coils_solution.npz"
     # default_solution = "knot_tube_solution.npz"
-
+    
     default_psi_npz = default_solution.replace(".npz", "_psi_fci_cyl_N64_Nphi128.npz")
 
-    parser = argparse.ArgumentParser(
-        description="Quasisymmetry triple-product metric from ψ and MFS field."
-    )
-    parser.add_argument(
-        "mfs_npz",
-        nargs="?",
-        default=resolve_npz_file_location(default_solution),
-        help="MFS solution checkpoint (.npz) to rebuild grad_phi",
-    )
-    parser.add_argument(
-        "--psi-npz",
-        default=default_psi_npz,
-        help="psi_fci snapshot (.npz)",
-    )
-    parser.add_argument(
-        "--n-surfaces",
-        type=int,
-        default=8,
-        help="Number of ψ surfaces to sample",
-    )
-    parser.add_argument(
-        "--band-frac",
-        type=float,
-        default=0.01,
-        help="Relative ψ-band half-width around each level",
-    )
-    parser.add_argument(
-        "--max-points-per-level",
-        type=int,
-        default=8000,
-        help="Maximum number of points per ψ level used in QS diagnostic",
-    )
+    nfp_default = 2
+    if 'QH' in default_solution:
+        nfp_default = 4
+
+    parser = argparse.ArgumentParser(description="Quasisymmetry metric from ψ and MFS field.")
+    parser.add_argument("mfs_npz", nargs="?", default=resolve_npz_file_location(default_solution),
+                        help="MFS solution checkpoint (.npz) to rebuild grad_phi")
+    parser.add_argument("--psi-npz", default=default_psi_npz, help="psi_fci snapshot (.npz)")
+    parser.add_argument("--n-surfaces", type=int, default=8, help="Number of ψ surfaces to sample")
+    parser.add_argument("--band-frac", type=float, default=0.01,
+                        help="Relative ψ-band half-width around each level")
+    parser.add_argument("--m-max", type=int, default=4, help="Maximum poloidal mode index |m|")
+    parser.add_argument("--n-max", type=int, default=4, help="Maximum toroidal mode index |n|")
+    parser.add_argument("--qs-type", choices=["QA", "QH"], default="QA",
+                        help="QS flavor: QA or QH")
+    parser.add_argument("--nfp", type=int, default=2, help="Number of field periods (used for QH)")
     args = parser.parse_args()
 
-    main(
-        psi_npz=args.psi_npz,
-        mfs_npz=args.mfs_npz,
-        n_surfaces=args.n_surfaces,
-        band_frac=args.band_frac,
-        max_points_per_level=args.max_points_per_level,
-    )
+    main(args.psi_npz,
+         mfs_npz=args.mfs_npz,
+         n_surfaces=args.n_surfaces,
+         band_frac=args.band_frac,
+         m_max=args.m_max,
+         n_max=args.n_max,
+         qs_type=args.qs_type,
+         nfp=args.nfp)

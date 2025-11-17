@@ -724,12 +724,17 @@ if __name__ == "__main__":
     # default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    default_solution = "wout_SLAM_6_coils_solution.npz"
+    # default_solution = "wout_SLAM_6_coils_solution.npz"
+    default_solution = "knot_tube_solution.npz"
 
     nfp_default = 2; tfinal_default = 1200.0; seeds_default = None; n_save_default = 10
     if 'QH' in default_solution: nfp_default = 4
     if 'SLAM' in default_solution:
-        n_save_default = 0.5; tfinal_default = 15000; seeds_default = "2.55:0:0,2.65:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
+        n_save_default = 0.5; tfinal_default = 15000
+        seeds_default = "2.55:0:0,2.65:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
+    if 'knot' in default_solution:
+        nfp_default = 1; tfinal_default = 200; n_save_default = 5
+        seeds_default = "1.2:0:0,1.25:0:0,1.3:0:0,1.35:0:0,1.4:0:0,1.45:0:0,1.5:0:0,1.55:0:0"
     ap = argparse.ArgumentParser()
     ### MAIN PARAMETERS TO CHANGE
     ap.add_argument("file", nargs="?", type=str, default=resolve_npz_file_location(default_solution),

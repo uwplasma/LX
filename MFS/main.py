@@ -125,7 +125,7 @@ def bfgs_2d(value_and_grad_fn, p0, *,
         log_sf, log_lam = p
         sf = jnp.exp(log_sf)
         sf_clamped = jnp.clip(sf, sf_min, sf_max)
-        log_lam_clamped = jnp.clip(log_lam, -9.0, -3.0)  # λ in [e^-9, e^-3] ≈ [1e-4, 5e-2]
+        log_lam_clamped = jnp.clip(log_lam, -9.0, -4.0)  # λ in [e^-9, e^-3] ≈ [1e-4, 5e-2]
         return jnp.array([jnp.log(sf_clamped), log_lam_clamped], dtype=p.dtype)
 
     def one_step(state):
@@ -296,17 +296,26 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
              use_mv=True,
              mv_weight=0.5,
              interior_eps_factor=5e-3,
-             verbose=True,
+             verbose=True, bc_weight=20.0,
              sf_min=1.0, sf_max=6.5,
-             lbfgs_maxiter=15, lbfgs_tol=1e-8):
-    # 1) MV bases and a (once)
-    if use_mv:
+             lbfgs_maxiter=15, lbfgs_tol=1e-8,
+             geom_kind="auto"):
+    if geom_kind == "auto":
         kind, a_hat, E_axes, c_axes, svals = detect_geometry_and_axis(Pn, verbose=True)
+    else:
+        # Force the 'kind' but still get some axis from PCA
+        auto_kind, a_hat, E_axes, c_axes, svals = detect_geometry_and_axis(Pn, verbose=True)
+        kind = geom_kind
+
+    # --- Multivalued bases + initial a, g_raw ---
+    if use_mv:
+        # true MV bases
         phi_t, grad_t, phi_p, grad_p = multivalued_bases_about_axis(Pn, Nn, a_hat, verbose=True)
         gt_b, gp_b = grad_t(Pn), grad_p(Pn)
         a, _, _ = fit_mv_coeffs_minimize_rhs(Nn, W, gt_b, gp_b, verbose=False)
         g_raw = scinfo.scale * jnp.sum(Nn * (a[0]*gt_b + a[1]*gp_b), axis=1)
     else:
+        # turn MV completely off
         def phi_t(Xn): return jnp.zeros((Xn.shape[0],), dtype=jnp.float64)
         def grad_t(Xn): return jnp.zeros_like(Xn)
         def phi_p(Xn): return jnp.zeros((Xn.shape[0],), dtype=jnp.float64)
@@ -319,12 +328,13 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
     obj = make_objective_for_delta_lambda(
         P, N, Pn, Nn, W, rk, scinfo,
         grad_t, grad_p, a, g_raw,
-        interior_eps_factor=interior_eps_factor, h_med=h_med
+        interior_eps_factor=interior_eps_factor, h_med=h_med,
+        use_mv=use_mv, bc_weight=bc_weight,
     )
 
     # robust starting point (you were scanning 1.5..2.5)
     log_sf0  = jnp.log(1.5)
-    log_lam0 = jnp.log(5e-3)
+    log_lam0 = jnp.log(1e-4)
     p0 = jnp.array([log_sf0, log_lam0], dtype=jnp.float64)
 
     # small box for sf, keep λ unbounded in log-space (still positive)
@@ -347,7 +357,8 @@ def autotune(P, N, Pn, Nn, W, rk, scinfo,
 
 def make_objective_for_delta_lambda(P, N, Pn, Nn, W, rk, scinfo,
                                     grad_t, grad_p, a, g_raw,
-                                    interior_eps_factor, h_med):
+                                    interior_eps_factor, h_med, use_mv,
+                                    bc_weight=10.0):
     eps_factor_obj = jnp.maximum(2e-2, interior_eps_factor)
     Wsqrt = jnp.sqrt(W)
     eps_n = jnp.maximum(1e-6, eps_factor_obj * h_med)
@@ -365,7 +376,7 @@ def make_objective_for_delta_lambda(P, N, Pn, Nn, W, rk, scinfo,
 
         Yn, _ = build_mfs_sources(Pn, Nn, rk, scinfo, source_factor=sf, verbose=False)
         A, _  = build_system_matrices(Pn, Nn, Yn, W, grad_t, grad_p, scinfo,
-                                      use_mv=True, center_D=True, verbose=False)
+                                      use_mv=use_mv, center_D=True, verbose=False)
 
         # Boundary quantities (unchanged)
         c_bdry, d_bdry = make_flux_constraint(A, W, g_raw)
@@ -395,7 +406,7 @@ def make_objective_for_delta_lambda(P, N, Pn, Nn, W, rk, scinfo,
         term_bc = jnp.dot(W, n_dot**2)
 
         reg = 1e-6 * (log_sf**2 + log_lam**2)
-        return term_res + term_bc + reg
+        return term_res + bc_weight * term_bc + reg
 
     return jit(jax.value_and_grad(objective))
 
@@ -1179,7 +1190,8 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
          interior_eps_factor=5e-3,  # ε ~ interior offset for evaluation, in *normalized* h units
          verbose=True, show_normals=False,
          toroidal_flux=None,          # prescribe Φ_t (sets a_t = Φ_t/(2π)) if not None
-         sf_min=1.0, sf_max=6.5, lbfgs_maxiter=30, lbfgs_tol=1e-8
+         sf_min=1.0, sf_max=6.5, lbfgs_maxiter=30, lbfgs_tol=1e-8,
+         geom_kind="auto", bc_weight=20.0
         ):
 
     # Load & orient
@@ -1199,8 +1211,9 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     # --- Auto-tune ---
     best = autotune(P, N, Pn, Nn, W, rk, scinfo, use_mv=use_mv, mv_weight=mv_weight,
                     interior_eps_factor=interior_eps_factor, verbose=True,
-                    sf_min=sf_min, sf_max=sf_max,
-                    lbfgs_maxiter=lbfgs_maxiter, lbfgs_tol=lbfgs_tol)
+                    sf_min=sf_min, sf_max=sf_max, bc_weight=bc_weight,
+                    lbfgs_maxiter=lbfgs_maxiter, lbfgs_tol=lbfgs_tol,
+                    geom_kind=geom_kind)
     source_factor_opt = best["source_factor"]
     lambda_reg_opt    = best["lambda_reg"]
     # Reuse pre-built things to avoid recompute:
@@ -1271,8 +1284,7 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
         c_cap_high, d_cap_high = build_cap_flux_constraint(P, N, Pn, Nn, scinfo, Yn,
                                                         grad_t, grad_p, a, best["a_hat"],
                                                         q=0.02, ds_frac=0.02, k_cap=k_nn, side="high")
-        cap_constraints = [(c_cap_low,  -d_cap_low),
-                        (c_cap_high, -d_cap_high)]
+        cap_constraints = [(c_cap_low,  -d_cap_low), (c_cap_high, -d_cap_high)]
     except Exception as e:
         print("[WARN] Cap constraints failed; continuing without them:", e)
         cap_constraints = []
@@ -1283,7 +1295,7 @@ def main(xyz_csv="slam_surface.csv", nrm_csv="slam_surface_normals.csv",
     # 2) Enforce on both Γ and Γ₋ (two constraints):
     # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)]
     # 3) Enforce on Γ, Γ₋, and end-caps (four constraints):
-    # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints  # <-- NEW
+    # constraints = [(c_bdry, -d_bdry), (c_int, -d_int)] + cap_constraints
 
     alpha = augmented_lagrangian_solve(
         A, W, g_raw, lam=lambda_reg_opt, constraints=constraints,
@@ -1372,19 +1384,32 @@ if __name__ == "__main__":
                     help="CSV file with nx,ny,nz columns (positional or --nrm)")
     ap.add_argument("--sf_min", type=float, default=1.0, help="Min source factor for autotuning")
     ap.add_argument("--sf_max", type=float, default=6.5, help="Max source factor for autotuning")
-    ap.add_argument("--lbfgs-maxiter", type=int, default=5, help="Max iterations for L-BFGS")
+    ap.add_argument("--lbfgs-maxiter", type=int, default=10, help="Max iterations for L-BFGS")
     ap.add_argument("--lbfgs-tol", type=float, default=1e-8, help="Tolerance for L-BFGS")
-    ap.add_argument("--k-nn", type=int, default=64) # this sets the k for kNN weights & scales (computational cost)
-    ap.add_argument("--use-mv", action="store_true")
+    ap.add_argument("--k-nn", type=int, default=26, help="k for kNN geometry stats")
+    ap.add_argument("--no-use-mv", dest="use_mv", action="store_false", help="Disable MV regularization")
+    ap.add_argument("--no-verbose", dest="verbose", action="store_false", help="Disable verbose logging")
     ap.add_argument("--mv-weight", type=float, default=0.5)
     ap.add_argument("--interior-eps-factor", type=float, default=5e-3)
-    ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show-normals", action="store_true")
     ap.add_argument("--toroidal-flux", type=float, default=None,
                     help="If set, prescribes the toroidal flux Φ_t (sets a_t = Φ_t/(2π))")
     ap.add_argument("--mfs-out", default=None,
                     help="Write portable MFS solution to this .npz (center,scale,Yn,alpha,a,a_hat,P,N,kind)")
+    ap.add_argument("--geom-kind", choices=["auto", "torus", "mirror"], default="auto",
+                    help="Override geometry classification (torus/mirror) or let it auto-detect")
+    ap.add_argument("--bc-weight", type=float, default=1e5,
+                    help="Weight for boundary condition constraint in autotuning")
     args = ap.parse_args()
+
+    if "knot" in os.path.basename(args.xyz).lower():
+        print("[INFO] Detected knot-like surface; enabling knotatron defaults:")
+        # Keep torus-like classification (good for a tube), but DO NOT disable MV:
+        # print("       - Disabling multivalued basis (use_mv=False)")
+        print("       - Forcing torus-like geometry classification")
+        # leave args.use_mv unchanged so you can still pass --no-use-mv if you really want
+        if args.geom_kind == "auto":
+            args.geom_kind = "torus"
 
     if args.mfs_out == None:
         args.mfs_out = args.xyz.replace(".csv", "_solution.npz")
@@ -1393,14 +1418,15 @@ if __name__ == "__main__":
 
     out = main(
         xyz_csv=args.xyz, nrm_csv=args.normals,
-        use_mv=args.use_mv or True, k_nn=args.k_nn,
+        use_mv=args.use_mv, k_nn=args.k_nn,
         mv_weight=args.mv_weight,
         interior_eps_factor=args.interior_eps_factor,
-        verbose=args.verbose or True,
+        verbose=args.verbose,
         show_normals=args.show_normals,
         toroidal_flux=args.toroidal_flux,
         sf_min=args.sf_min, sf_max=args.sf_max,
-        lbfgs_maxiter=args.lbfgs_maxiter, lbfgs_tol=args.lbfgs_tol
+        lbfgs_maxiter=args.lbfgs_maxiter, lbfgs_tol=args.lbfgs_tol,
+        geom_kind=args.geom_kind, bc_weight=args.bc_weight
     )
 
     # --- SAVE a portable checkpoint for the tracer ---

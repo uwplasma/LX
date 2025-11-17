@@ -222,3 +222,4 @@ hpo_viz/*
 *.png
 *psi_fci*.npz
 *tearing*.npz
+*.npz
