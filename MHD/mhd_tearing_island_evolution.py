@@ -72,6 +72,89 @@ mpl.rcParams.update({
 # Helpers
 # -----------------------------------------------------------------------------#
 
+def select_linear_window(ts, w, w0=None, min_pts=6, frac_sat=0.3, nwin=8):
+    """
+    Automatically pick a 'best' linear window for ln w(t):
+
+    - Avoids very early transient (w ~ w0) and near-saturation.
+    - Restricts to  w > 1.2 w0  and  w < w0 + frac_sat*(w_max - w0).
+    - Slides a fixed-size window of length nwin over candidates and
+      chooses the one that minimizes the mean-squared residual of a
+      linear fit to ln w.
+
+    Parameters
+    ----------
+    ts : array, shape (N,)
+        Time grid.
+    w : array, shape (N,)
+        Island half-width.
+    w0 : float or None
+        Reference initial width; if None, uses w[0].
+    min_pts : int
+        Minimum # of points required for a linear window.
+    frac_sat : float
+        Fraction of the distance from w0 to w_max to allow; e.g. 0.3
+        means we only use w up to ~30% towards saturation.
+    nwin : int
+        Sliding window length for the search.
+
+    Returns
+    -------
+    mask_lin : bool array, shape (N,)
+        True where points are in the chosen linear window.
+    """
+    ts = np.asarray(ts)
+    w = np.asarray(w)
+
+    if w0 is None:
+        w0 = w[0]
+
+    # Basic sanity
+    if ts.size < min_pts + 2:
+        # not enough points, fall back to earliest quarter
+        return ts < (ts[0] + 0.25 * (ts[-1] - ts[0]))
+
+    w_max = np.nanmax(w)
+
+    # Candidates: bigger than initial, but not too close to saturation
+    upper = w0 + frac_sat * (w_max - w0)
+    mask_cand = (w > 1.2 * w0) & (w < upper) & np.isfinite(w)
+    idx_cand = np.where(mask_cand)[0]
+
+    if idx_cand.size < min_pts:
+        # fall back: early chunk
+        return ts < (ts[0] + 0.25 * (ts[-1] - ts[0]))
+
+    nwin = min(nwin, idx_cand.size)
+    lnw = np.log(w)
+
+    best_err = np.inf
+    best_idx_slice = None
+
+    # Slide an nwin-sized window over candidate indices
+    for start in range(0, idx_cand.size - nwin + 1):
+        win_idx = idx_cand[start:start + nwin]
+        t_win = ts[win_idx]
+        y_win = lnw[win_idx]
+
+        # linear fit ln w = a t + b
+        coeffs = np.polyfit(t_win, y_win, 1)
+        fit = np.polyval(coeffs, t_win)
+        err = np.mean((y_win - fit)**2)
+
+        if err < best_err:
+            best_err = err
+            best_idx_slice = win_idx
+
+    mask_lin = np.zeros_like(w, dtype=bool)
+    if best_idx_slice is not None and best_idx_slice.size >= min_pts:
+        mask_lin[best_idx_slice] = True
+    else:
+        # conservative fallback
+        mask_lin = ts < (ts[0] + 0.25 * (ts[-1] - ts[0]))
+
+    return mask_lin
+
 def compute_k_arrays(Nx, Ny, Nz, Lx, Ly, Lz):
     """Rebuild kx, ky, kz consistent with mhd_tearing_solve.py."""
     nx = np.fft.fftfreq(Nx) * Nx
@@ -281,15 +364,37 @@ def main():
     # Linear phase fit: w(t) ~ w0 exp(γ t)
     # --------------------------------------------------------------------- #
     w0 = island_width[0]
+
     if args.lin_tmax is None:
-        mask_lin = (island_width > 1.1 * w0) & (island_width < 1.9 * w0)
+        # Automatic, data-driven choice of the linear window
+        mask_lin = select_linear_window(
+            ts,
+            island_width,
+            w0=w0,
+            min_pts=6,
+            frac_sat=0.3,
+            nwin=8,
+        )
     else:
-        mask_lin = (ts <= args.lin_tmax) & (island_width > 5.0 * w0)
-    # print("[DEBUG] Linear fit data:")
-    # print(f"Island width data for linear fit")
-    # print(island_width)
-    # print(f"W0 = {w0}")
-    # print(f"[INFO] Linear fit window: t ∈ [{ts[mask_lin][0]:.3f}, {ts[mask_lin][-1]:.3f}]")
+        # User overrides upper bound, but still avoid very early transient
+        mask_lin = (ts <= args.lin_tmax) & (island_width > 1.2 * w0)
+
+    if np.count_nonzero(mask_lin) < 5:
+        print("[WARN] Not enough points for a robust linear-phase fit, "
+              "falling back to an early-time window.")
+        mask_lin = ts < (ts[0] + 0.25 * (ts[-1] - ts[0]))
+
+    t_lin = ts[mask_lin]
+    w_lin = island_width[mask_lin]
+    lnw_lin = np.log(w_lin)
+
+    print(f"[INFO] Linear fit window: t ∈ [{t_lin[0]:.3f}, {t_lin[-1]:.3f}] "
+          f"({t_lin.size} points)")
+
+    coeffs_lin = np.polyfit(t_lin, lnw_lin, 1)
+    gamma_fit = coeffs_lin[0]
+    lnw0_fit = coeffs_lin[1]
+    w_fit_lin = np.exp(lnw0_fit + gamma_fit * ts)
     if np.count_nonzero(mask_lin) < 5:
         print("[WARN] Not enough points for a robust linear-phase fit, "
               "trying a simple early-time window.")
@@ -552,16 +657,39 @@ def main():
 
     fig2, axs2 = plt.subplots(1, 3, figsize=(10, 3.4), sharex=True, sharey=True)
 
-    for ax, Az_xy, label, t_val in zip(
+    # Symmetric contour levels around zero
+    A_abs = max(abs(vmin), abs(vmax))
+    levels = np.linspace(-A_abs, A_abs, 17)
+
+    # X- and O-point flux levels for the three snapshot times
+    A_X_early, A_O_early = Az_X[idx_early], Az_O[idx_early]
+    A_X_mid,   A_O_mid   = Az_X[idx_mid],   Az_O[idx_mid]
+    A_X_late,  A_O_late  = Az_X[idx_late],  Az_O[idx_late]
+
+    for ax, Az_xy, label, t_val, A_X_val, A_O_val in zip(
         axs2,
         [Az_early, Az_mid, Az_late],
         [r"Early (linear)", r"Rutherford", r"Saturated"],
         [ts[idx_early], ts[idx_mid], ts[idx_late]],
+        [A_X_early, A_X_mid, A_X_late],
+        [A_O_early, A_O_mid, A_O_late],
     ):
+        # background color map
         im = ax.pcolormesh(X, Y, Az_xy, shading="auto", vmin=vmin, vmax=vmax)
+        # many thin contours (field lines)
+        cs = ax.contour(X, Y, Az_xy, levels=levels, colors="k",
+                        linewidths=0.4, alpha=0.7)
+        # highlight X-point separatrix (solid white)
+        ax.contour(X, Y, Az_xy, levels=[A_X_val], colors="w",
+                   linewidths=1.5)
+        # highlight O-point contour (dashed white)
+        ax.contour(X, Y, Az_xy, levels=[A_O_val], colors="w",
+                   linewidths=1.0, linestyles="--")
+
         ax.set_title(fr"{label}, $t={t_val:.1f}$")
         ax.set_xlabel(r"$x$")
         ax.set_aspect("equal")
+
     axs2[0].set_ylabel(r"$y$")
 
     cbar = fig2.colorbar(im, ax=axs2.ravel().tolist(), shrink=0.8)
