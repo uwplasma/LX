@@ -69,10 +69,10 @@ import matplotlib.pyplot as plt
 
 plt.rcParams.update(
     {
-        "font.size": 12,
-        "axes.labelsize": 12,
-        "axes.titlesize": 14,
-        "legend.fontsize": 11,
+        "font.size": 10,
+        "axes.labelsize": 10,
+        "axes.titlesize": 11,
+        "legend.fontsize": 9,
         "figure.dpi": 200,
         "text.usetex": False,
     }

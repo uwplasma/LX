@@ -8,9 +8,9 @@ mhd_tearing_solve.py and generate publication-ready diagnostics:
 
   - Energies and dissipation (E_kin, E_mag, E_tot, E_cons)
   - Tearing-mode amplitudes (RMS Bx and |Bx(kx=0,ky=1,kz=0)|)
-  - Robust automatic linear-phase fit for gamma (vs FKR gamma)
+  - Robust linear-phase fit for gamma (vs FKR gamma)
   - Energy invariant error
-  - Reconnected flux and (smoothed) reconnection rate
+  - Reconnected flux and reconnection rate (X-point based if available)
   - Shell spectra E_B(k_perp), E_v(k_perp) at selected times
   - PDFs of Jz at selected times, with kurtosis
   - Snapshots of Bx, Jz, and A_z field lines
@@ -19,6 +19,8 @@ mhd_tearing_solve.py and generate publication-ready diagnostics:
   - Plasmoid/island count vs time
   - Jz kurtosis vs time
   - Dimensionless reconnection rate
+  - Amplitude–flux & reconnection phase-space plots
+  - Plasmoid/intermittency correlation plots
 
 The script accepts a glob pattern and processes all matching .npz files,
 placing outputs into separate folders:
@@ -60,12 +62,13 @@ import jax.numpy as jnp
 
 from mhd_tearing_solve import (
     make_k_arrays, make_dealias_mask, project_div_free,
-    energy_from_hat, dissipation_rates, tearing_amplitude,
-    curl_from_hat, compute_Az_from_hat, grad_from_hat
+    energy_from_hat, dissipation_rates,
+    curl_from_hat, compute_Az_from_hat, grad_from_hat,
+    count_local_extrema_1d
 )
 
 # -----------------------------------------------------------------------------#
-# Linear regression helper
+# Linear regression helper (used for spectra + old gamma fallback)
 # -----------------------------------------------------------------------------#
 
 def _linear_regression_with_stats(t, y):
@@ -88,7 +91,7 @@ def _linear_regression_with_stats(t, y):
     return a, b, R2, y_fit
 
 # -----------------------------------------------------------------------------#
-# Robust automatic linear-window selector
+# Robust automatic linear-window selector (fallback when gamma not saved)
 # -----------------------------------------------------------------------------#
 
 def select_linear_window(
@@ -171,6 +174,32 @@ def select_linear_window(
     mask_lin = np.zeros_like(w, dtype=bool)
     mask_lin[best_slice] = True
     return mask_lin
+
+# -----------------------------------------------------------------------------#
+# Fallback tearing amplitude (for old .npz without tearing_amp_series)
+# -----------------------------------------------------------------------------#
+
+def tearing_amplitude_np(B_hat, Lx, Ly, Lz, band_width_frac=0.25):
+    """
+    RMS of Bx in a band around the current sheet (|x-Lx/2| < band_width_frac*Lx/2).
+
+    Pure NumPy version for post-processing / backward compatibility.
+    """
+    B = np.fft.ifftn(B_hat, axes=(1, 2, 3)).real
+    Bx = B[0]
+
+    Nx = Bx.shape[0]
+    x = np.linspace(0.0, Lx, Nx, endpoint=False)
+    xc = 0.5 * Lx
+    band_half = band_width_frac * 0.5 * Lx
+
+    mask = (np.abs(x - xc)[:, None, None] < band_half)
+    Bx_band = np.where(mask, Bx, 0.0)
+
+    num = np.sum(Bx_band**2)
+    den = np.sum(mask.astype(float)) + 1e-16
+    rms = np.sqrt(num / den)
+    return rms
 
 # -----------------------------------------------------------------------------#
 # Shell spectrum helper
@@ -342,9 +371,49 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     nu = float(data["nu"]); eta = float(data["eta"])
     B0 = float(data["B0"]); a = float(data["a"])
     B_g = float(data["B_g"]); eps_B = float(data["eps_B"])
-    gamma_FKR = float(data["gamma_FKR"])
-    S = float(data["S"])
-    Delta_prime_a = float(data["Delta_prime_a"])
+    gamma_FKR = float(data.get("gamma_FKR", np.nan))
+    # S may be stored under "S", "S_sheet", or "S_a"
+    if "S" in data:
+        S = float(data["S"])
+    elif "S_sheet" in data:
+        S = float(data["S_sheet"])
+    elif "S_a" in data:
+        S = float(data["S_a"])
+    else:
+        S = np.nan
+    Delta_prime_a = float(data.get("Delta_prime_a", np.nan))
+
+    # Sweet–Parker metrics (if present)
+    vA = float(data["vA"]) if "vA" in data else B0  # default ρ = 1
+    S_sheet = float(data.get("S_sheet", S))
+    delta_SP = float(data["delta_SP"]) if "delta_SP" in data else np.nan
+    v_in_SP = float(data["v_in_SP"]) if "v_in_SP" in data else np.nan
+    E_SP = float(data["E_SP"]) if "E_SP" in data else np.nan
+
+    # New diagnostic time series if present
+    if "mode_amp_series" in data:
+        mode_amp_arr = np.array(data["mode_amp_series"])
+    else:
+        mode_amp_arr = None
+
+    if "tearing_amp_series" in data:
+        tearing_amp_arr = np.array(data["tearing_amp_series"])
+    else:
+        tearing_amp_arr = None
+
+    gamma_fit_saved = data.get("gamma_fit", None)
+    lnA_fit_saved = data.get("lnA_fit", None)
+    mask_lin_saved = data.get("mask_lin", None)
+
+    if gamma_fit_saved is not None:
+        gamma_fit = float(np.array(gamma_fit_saved))
+    else:
+        gamma_fit = np.nan
+
+    Az_xpt_series = np.array(data["Az_xpt_series"]) if "Az_xpt_series" in data else None
+    E_rec_series_saved = np.array(data["E_rec_series"]) if "E_rec_series" in data else None
+    n_plasmoids_final_saved = int(data["n_plasmoids_final"]) if "n_plasmoids_final" in data else None
+
     ix0 = int(data["ix0"]); iy1 = int(data["iy1"]); iz0 = int(data["iz0"])
 
     eq_mode = data.get("equilibrium_mode", "original")
@@ -354,7 +423,7 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
 
     # Alfven speed (rho0 = 1)
     rho0 = 1.0
-    V_A = B0 / np.sqrt(rho0)
+    V_A = vA  # already B0 / sqrt(rho0) in new files; fallback B0 above
 
     # Figures directory: figures_<stem>/
     stem = os.path.splitext(os.path.basename(infile))[0]
@@ -369,6 +438,8 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     print(f"Lx,Ly,Lz        = {Lx},{Ly},{Lz}")
     print(f"nu={nu}, eta={eta}, B0={B0}, a={a}, B_g={B_g}, eps_B={eps_B}")
     print(f"S={S:.3e}, Delta' a={Delta_prime_a:.3e}, gamma_FKR={gamma_FKR:.3e}")
+    print(f"Sweet–Parker: S_sheet={S_sheet:.3e}, delta_SP={delta_SP:.3e}, "
+          f"v_in_SP={v_in_SP:.3e}, E_SP={E_SP:.3e}")
     print(f"Assuming rho0={rho0}, V_A={V_A:.3f}")
     print("Output figures/movies in:", fig_dir)
     print("============================================")
@@ -378,6 +449,7 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     mask_dealias = make_dealias_mask(Nx, Ny, Nz, NX_arr, NY_arr, NZ_arr)
     mid_z = Nz // 2
     iy_center = Ny // 2
+    ix_center = Nx // 2
 
     # Diagnostics arrays
     E_kin_list = []
@@ -424,13 +496,22 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
         eps_visc_list.append(float(eps_visc_i))
         eps_ohm_list.append(float(eps_ohm_i))
 
-        # Tearing amplitude (RMS Bx near sheet)
-        A_rms = tearing_amplitude(B_hat_i, Lx, Ly, Lz, band_width_frac=0.25)
+        # Tearing amplitude (RMS Bx near sheet) – use saved series if present
+        if tearing_amp_arr is not None:
+            A_rms = tearing_amp_arr[i]
+        else:
+            A_rms = tearing_amplitude_np(
+                np.array(B_hat_frames[i]), Lx, Ly, Lz, band_width_frac=0.25
+            )
         tearing_amp_list.append(float(A_rms))
 
-        # Single Fourier mode amplitude
-        Bx_hat_i = np.array(B_hat_i[0])
-        mode_amp_list.append(float(np.abs(Bx_hat_i[ix0, iy1, iz0])))
+        # Single Fourier mode amplitude – use saved series if present
+        if mode_amp_arr is not None:
+            mode_amp = mode_amp_arr[i]
+        else:
+            Bx_hat_i = np.array(B_hat_i[0])
+            mode_amp = np.abs(Bx_hat_i[ix0, iy1, iz0])
+        mode_amp_list.append(float(mode_amp))
 
         # Velocity diagnostics
         v_i = np.fft.ifftn(np.array(v_hat_i), axes=(1, 2, 3)).real
@@ -470,10 +551,13 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
         Jpeak_list.append(J_peak)
 
         # Island / plasmoid count: count extrema of Az(x, y=L_y/2)
-        Az_line = Az_mid[:, iy_center]
-        dAz = np.diff(Az_line)
-        sign = np.sign(dAz)
-        n_islands = int(np.sum(sign[:-1] * sign[1:] < 0))
+        # Az_line = Az_mid[:, iy_center]
+        # dAz = np.diff(Az_line)
+        # sign = np.sign(dAz)
+        # n_islands = int(np.sum(sign[:-1] * sign[1:] < 0))
+        n_plasmoids_final = count_local_extrema_1d(Az_mid[-1, :])
+        n_islands = n_plasmoids_final // 2
+        
         island_count_list.append(n_islands)
 
         # Jz kurtosis on mid-plane (Zhdankin-style intermittency)
@@ -510,8 +594,8 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     eps_visc_arr = np.array(eps_visc_list)
     eps_ohm_arr = np.array(eps_ohm_list)
     E_cons_arr = np.array(E_cons_list)
-    tearing_amp_arr = np.array(tearing_amp_list)
-    mode_amp_arr = np.array(mode_amp_list)
+    tearing_amp_arr = np.array(tearing_amp_list) if tearing_amp_arr is None else tearing_amp_arr
+    mode_amp_arr = np.array(mode_amp_list) if mode_amp_arr is None else mode_amp_arr
     v_rms_arr = np.array(v_rms_list)
     v_max_arr = np.array(v_max_list)
     psi_rec_arr = np.array(psi_rec_list)
@@ -584,7 +668,7 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
           f"{prefix}tearing_mode_velocity_scales.png")
 
     # ---------------------------------------------------------------------#
-    # 3) Tearing diagnostics with robust linear fit
+    # 3) Tearing diagnostics with robust linear fit (using saved gamma if any)
     # ---------------------------------------------------------------------#
     fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 
@@ -601,9 +685,13 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     axs[0].grid(True, alpha=0.3)
     axs[0].legend()
 
-    # Linear-phase fit
     log_mode = np.log(mode_amp_arr + 1e-30)
-    mask_lin = select_linear_window(ts_np, mode_amp_arr, w0=mode_amp_arr[0])
+
+    # Linear-phase window & fit:
+    if mask_lin_saved is not None:
+        mask_lin = np.array(mask_lin_saved, dtype=bool)
+    else:
+        mask_lin = select_linear_window(ts_np, mode_amp_arr, w0=mode_amp_arr[0])
     idx_lin = np.where(mask_lin)[0]
     if idx_lin.size < 3:
         idx_lin = np.arange(2, max(5, len(ts_np) // 3))
@@ -611,12 +699,28 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     i0, i1 = int(idx_lin[0]), int(idx_lin[-1])
     t_fit = ts_np[idx_lin]
     logA_fit = log_mode[idx_lin]
-    gamma_fit, b_fit, R2_fit, _ = _linear_regression_with_stats(t_fit, logA_fit)
-    logA_line = b_fit + gamma_fit * ts_np
 
-    print(f"[FIT] Measured tearing gamma ≈ {gamma_fit:.3e}, R^2 ≈ {R2_fit:.4f}")
+    if np.isnan(gamma_fit):
+        # Fallback: re-fit if not saved
+        gamma_fit_local, b_fit, R2_fit, _ = _linear_regression_with_stats(t_fit, logA_fit)
+        logA_line = b_fit + gamma_fit_local * ts_np
+        gamma_fit_plot = gamma_fit_local
+        R2_fit_plot = R2_fit
+    else:
+        gamma_fit_plot = gamma_fit
+        if lnA_fit_saved is not None:
+            logA_line = np.array(lnA_fit_saved)
+        else:
+            # reconstruct line
+            a_tmp, b_tmp, R2_tmp, _ = _linear_regression_with_stats(t_fit, logA_fit)
+            logA_line = b_tmp + a_tmp * ts_np
+        # estimate R² for display
+        _, _, R2_fit_plot, _ = _linear_regression_with_stats(t_fit, logA_fit)
+
+    print(f"[FIT] Measured tearing gamma ≈ {gamma_fit_plot:.3e}, "
+          f"R^2 ≈ {R2_fit_plot:.4f}")
     if not np.isnan(gamma_FKR):
-        ratio = gamma_fit / gamma_FKR
+        ratio = gamma_fit_plot / gamma_FKR
         print(f"[COMP] gamma_fit/gamma_FKR ≈ {ratio:.3f}")
     else:
         ratio = np.nan
@@ -625,7 +729,7 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     axs[1].axvspan(ts_np[i0], ts_np[i1], color="grey", alpha=0.2,
                    label="linear fit window")
     axs[1].plot(ts_np, logA_line, "k--",
-                label=rf"fit: $\gamma \approx {gamma_fit:.3e}$")
+                label=rf"fit: $\gamma \approx {gamma_fit_plot:.3e}$")
     axs[1].set_xlabel("t")
     axs[1].set_ylabel(r"$\ln |B_x(k_x=0,k_y=1)|$")
     axs[1].set_title("Mode growth (linear phase shaded)")
@@ -634,7 +738,7 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
 
     if not np.isnan(gamma_FKR):
         txt = (
-            rf"$\gamma_\mathrm{{fit}} \approx {gamma_fit:.3e}$" + "\n"
+            rf"$\gamma_\mathrm{{fit}} \approx {gamma_fit_plot:.3e}$" + "\n"
             rf"$\gamma_\mathrm{{FKR}} \approx {gamma_FKR:.3e}$" + "\n"
             rf"$\gamma_\mathrm{{fit}}/\gamma_\mathrm{{FKR}} \approx {ratio:.2f}$"
         )
@@ -661,14 +765,18 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
           f"{prefix}tearing_mode_diagnostics.png")
 
     # ---------------------------------------------------------------------#
-    # 4) Reconnected flux and (smoothed) reconnection rate (Loureiro-style)
+    # 4) Reconnected flux and reconnection rate
+    #     Prefer E_rec_series from solver (X-point based), fallback to dΔψ/dt
     # ---------------------------------------------------------------------#
-    recon_rate = np.gradient(psi_rec_arr, ts_np)
+    if E_rec_series_saved is not None:
+        recon_rate_raw = E_rec_series_saved
+    else:
+        recon_rate_raw = np.gradient(psi_rec_arr, ts_np)
 
     # Simple moving-average smoothing for reconnection rate
     window = 5 if len(ts_np) >= 5 else 3
     kernel = np.ones(window) / window
-    recon_rate_smooth = np.convolve(recon_rate, kernel, mode="same")
+    recon_rate_smooth = np.convolve(recon_rate_raw, kernel, mode="same")
 
     fig, axs = plt.subplots(1, 2, figsize=(11, 4))
 
@@ -684,13 +792,13 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
     axs[0].grid(True, alpha=0.3)
     axs[0].legend(loc="best", fontsize=9)
 
-    axs[1].plot(ts_np, recon_rate, alpha=0.4,
-                label=r"$d\Delta\psi/dt$ (raw)")
+    axs[1].plot(ts_np, recon_rate_raw, alpha=0.4,
+                label=r"$E_{\rm rec}$ (raw)")
     axs[1].plot(ts_np, recon_rate_smooth, "C1",
-                label=r"$d\Delta\psi/dt$ (smoothed)")
+                label=r"$E_{\rm rec}$ (smoothed)")
     axs[1].set_xlabel("t")
-    axs[1].set_ylabel(r"$d\Delta\psi/dt$")
-    axs[1].set_title("Reconnection rate")
+    axs[1].set_ylabel(r"$E_{\rm rec}$")
+    axs[1].set_title("Reconnection rate (X-point proxy)")
     axs[1].grid(True, alpha=0.3)
     axs[1].legend(fontsize=9)
 
@@ -709,12 +817,16 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
 
     fig, axs = plt.subplots(1, 3, figsize=(15, 4))
 
-    axs[0].plot(ts_np, sheet_thickness_arr / a)
+    axs[0].plot(ts_np, sheet_thickness_arr / a, label=r"$\delta/a$")
+    if not np.isnan(delta_SP):
+        axs[0].axhline(delta_SP / a, color="k", linestyle="--",
+                       label=r"Sweet–Parker $\delta_{\rm SP}/a$")
     axs[0].axvspan(ts_np[i0], ts_np[i1], color="grey", alpha=0.15)
     axs[0].set_xlabel("t")
     axs[0].set_ylabel(r"$\delta / a$")
     axs[0].set_title("Current-sheet half-thickness")
     axs[0].grid(True, alpha=0.3)
+    axs[0].legend(fontsize=9)
 
     axs[1].plot(ts_np, E_rec_dimless)
     axs[1].axhline(0.0, color="k", linewidth=1.0)
@@ -754,12 +866,17 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
 
     fig, ax = plt.subplots(figsize=(6.5, 5))
 
+    k_shell_last = None
+    EB_spec_last = None
+
     for idx, lab in zip(spec_indices, spec_labels):
         B_hat_i = np.array(B_hat_frames[idx])
         v_hat_i = np.array(v_hat_frames[idx])
         k_shell, EB_spec, Ev_spec = compute_shell_spectrum(
             kx, ky, kz, B_hat_i, v_hat_i, nbins=32
         )
+        k_shell_last = k_shell
+        EB_spec_last = EB_spec
 
         mask_pos = (k_shell > 0) & (EB_spec > 0) & (Ev_spec > 0)
         k_plot = k_shell[mask_pos]
@@ -789,8 +906,10 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
                           linewidth=2.0,
                           label=rf"peak fit: $E_B \propto k^{{{slope:.2f}}}$")
 
-    if len(k_shell) > 0:
-        k_ref = np.median(k_shell[k_shell > 0]) if np.any(k_shell > 0) else 1.0
+    if (k_shell_last is not None) and np.any(k_shell_last > 0):
+        k_shell = k_shell_last
+        EB_spec = EB_spec_last
+        k_ref = np.median(k_shell[k_shell > 0])
         E_ref = np.max(EB_spec) if np.any(EB_spec > 0) else 1.0
         k_line_ref = np.array([k_ref / 4, k_ref * 4])
         line_32 = E_ref * (k_line_ref / k_ref) ** (-3.0 / 2.0)
@@ -961,7 +1080,86 @@ def process_one_file(infile: str, extra_prefix: str, make_movies: bool):
           f"{prefix}tearing_snapshots.png")
 
     # ---------------------------------------------------------------------#
-    # 8) Movies
+    # 8) NEW (1/2): Amplitude–flux & reconnection phase-space (literature style)
+    # ---------------------------------------------------------------------#
+    # Following modern tearing/reconnection papers, show:
+    #   (a) Δψ vs tearing amplitude (normalized)
+    #   (b) E_rec/(B0 V_A) vs tearing amplitude (normalized)
+    E_rec_dimless_full = recon_rate_raw / (B0 * V_A + 1e-16)
+    A_norm = tearing_amp_arr / A_rms0
+    psi_norm = psi_rec_arr / (B0 * a + 1e-16)
+
+    fig, axs = plt.subplots(1, 2, figsize=(11, 4))
+
+    axs[0].loglog(
+        A_norm, psi_norm, "o-",
+        ms=3,
+        label="trajectory"
+    )
+    axs[0].set_xlabel(r"${\rm RMS}\,B_x / ({\rm RMS}\,B_x)_0$")
+    axs[0].set_ylabel(r"$\Delta\psi / (B_0 a)$")
+    axs[0].set_title("Amplitude–flux relation")
+    axs[0].grid(True, which="both", alpha=0.3)
+
+    axs[1].plot(
+        A_norm, E_rec_dimless_full, "o-",
+        ms=3,
+        label=r"$E_{\rm rec}/(B_0 V_A)$"
+    )
+    axs[1].set_xlabel(r"${\rm RMS}\,B_x / ({\rm RMS}\,B_x)_0$")
+    axs[1].set_ylabel(r"$E_{\rm rec} / (B_0 V_A)$")
+    axs[1].set_title("Reconnection vs tearing amplitude")
+    axs[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(prefix + "amplitude_flux_phase_space.png",
+                bbox_inches="tight")
+    plt.close(fig)
+    print("[DONE] Saved "
+          f"{prefix}amplitude_flux_phase_space.png")
+
+    # ---------------------------------------------------------------------#
+    # 9) NEW (2/2): Plasmoids vs intermittency / reconnection
+    # ---------------------------------------------------------------------#
+    # Inspired by plasmoid-dominated reconnection literature:
+    #   (a) E_rec_dimless vs island_count
+    #   (b) Jz kurtosis vs island_count
+    t_norm = (ts_np - ts_np[0]) / (ts_np[-1] - ts_np[0] + 1e-16)
+
+    fig, axs = plt.subplots(1, 2, figsize=(11, 4))
+
+    sc0 = axs[0].scatter(
+        island_count_arr, E_rec_dimless_full,
+        c=t_norm, cmap="viridis", s=20, edgecolor="none"
+    )
+    axs[0].set_xlabel("Island count")
+    axs[0].set_ylabel(r"$E_{\rm rec} / (B_0 V_A)$")
+    axs[0].set_title("Reconnection vs plasmoid count")
+    axs[0].grid(True, alpha=0.3)
+    cbar0 = fig.colorbar(sc0, ax=axs[0])
+    cbar0.set_label(r"normalized time $t/t_{\rm end}$")
+
+    sc1 = axs[1].scatter(
+        island_count_arr, Jkurt_arr,
+        c=t_norm, cmap="viridis", s=20, edgecolor="none"
+    )
+    axs[1].axhline(3.0, color="k", linestyle="--", linewidth=1.0)
+    axs[1].set_xlabel("Island count")
+    axs[1].set_ylabel(r"$\kappa(J_z)$")
+    axs[1].set_title("Intermittency vs plasmoid count")
+    axs[1].grid(True, which="both", alpha=0.3)
+    cbar1 = fig.colorbar(sc1, ax=axs[1])
+    cbar1.set_label(r"normalized time $t/t_{\rm end}$")
+
+    fig.tight_layout()
+    fig.savefig(prefix + "plasmoids_vs_intermittency.png",
+                bbox_inches="tight")
+    plt.close(fig)
+    print("[DONE] Saved "
+          f"{prefix}plasmoids_vs_intermittency.png")
+
+    # ---------------------------------------------------------------------#
+    # 10) Movies
     # ---------------------------------------------------------------------#
     if make_movies:
         print("[MOVIE] Building tearing-mode movies ...")

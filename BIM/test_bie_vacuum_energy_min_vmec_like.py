@@ -27,7 +27,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-import bim as bie
+import bim_original as bie
 
 
 # ---------------------------------------------------------------------
@@ -901,9 +901,6 @@ def test_manufactured_harmonic_polynomial_inside_sphere():
     With the current point-cloud Nyström + clipped kernel we expect O(10^-1)
     relative accuracy at this resolution, not machine precision.
     """
-    import numpy as np
-    import jax.numpy as jnp
-    import bim as bie  # adjust import if needed
 
     R = 1.0
     P, N = make_unit_sphere(R=R)  # (Npts,3) points and normals on sphere
