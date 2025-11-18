@@ -94,7 +94,7 @@ class InverseDesignConfig:
     target_complexity: float = 1e-5      # desired plasmoid complexity
 
     # Trade-off between matching f_kin and complexity
-    lambda_complexity: float = 1.0
+    lambda_complexity: float = 10.0
 
     # Bounds for eta and nu (log10-space)
     log10_eta_min: float = -4.5
