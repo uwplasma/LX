@@ -112,17 +112,21 @@ class InverseDesignConfig:
 
 
 # -----------------------------------------------------------------------------
-# Small neural network: design MLP
+# Small neural network: design MLP (manual stack of Linear layers)
 # -----------------------------------------------------------------------------
 
 class DesignMLP(eqx.Module):
     """MLP mapping latent design z -> (log10_eta, log10_nu)."""
 
     layers: List[eqx.nn.Linear]
-    activation: Any = eqx.static_field()
+    activation: Any = eqx.field(static=True)
 
     def __init__(self, in_dim: int, hidden_width: int, hidden_depth: int,
                  key: jax.random.PRNGKey):
+        # We build:
+        #   Linear(in_dim -> hidden_width)
+        #   (hidden_depth-1) × Linear(hidden_width -> hidden_width)
+        #   Linear(hidden_width -> 2)
         keys = jax.random.split(key, hidden_depth + 1)
 
         layers: List[eqx.nn.Linear] = []
@@ -138,15 +142,28 @@ class DesignMLP(eqx.Module):
         self.activation = jax.nn.tanh
 
     def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
-        x = z
-        # Ensure shape (..., in_dim)
+        """
+        Forward pass.
+
+        For the current config we take latent_dim = 1, so:
+          - z is a scalar or shape (1,)
+          - we treat it as a 1D vector of length in_dim
+        No batch dimension is used; each Linear sees a vector of shape (in_features,).
+        """
+        x = jnp.asarray(z, dtype=jnp.float64)
+
+        # Ensure x has shape (in_dim,) rather than scalar
         if x.ndim == 0:
-            x = x[None]  # (1,)
+            x = jnp.expand_dims(x, 0)   # (1,)
+
+        # Pass through hidden layers
         for layer in self.layers[:-1]:
-            x = self.activation(layer(x))
-        x = self.layers[-1](x)
-        # x has shape (batch, 2) for batched input; we want (2,) for scalar z
-        return x.squeeze(0)
+            x = self.activation(layer(x))   # stays 1D
+
+        # Final linear layer -> 2 outputs
+        x = self.layers[-1](x)             # shape (2,)
+
+        return x  # (log10_eta, log10_nu)
 
 
 # -----------------------------------------------------------------------------
@@ -268,7 +285,7 @@ def make_loss_fn(cfg: InverseDesignConfig):
             "nu": nu,
             "f_kin": f_kin,
             "complexity": complexity,
-            "res": res,
+            # "res": res,
         }
         return loss, aux
 
@@ -276,24 +293,35 @@ def make_loss_fn(cfg: InverseDesignConfig):
 
 
 # Filtered versions for Equinox (only differentiate w.r.t. trainable params)
-def build_training_step(cfg: InverseDesignConfig):
+def build_training_step(
+    cfg: InverseDesignConfig,
+    optimizer: optax.GradientTransformation,
+    static_model: DesignMLP,
+):
     loss_fn = make_loss_fn(cfg)
 
-    @eqx.filter_value_and_grad
-    def loss_and_grad(model: DesignMLP, key: jax.random.PRNGKey):
-        return loss_fn(model, key)
+    # loss as a function of (params, key), with static_model closed over
+    def loss_from_params(params, key):
+        # Rebuild full model from params + static parts
+        model = eqx.combine(params, static_model)
+        loss, aux = loss_fn(model, key)
+        return loss, aux
 
-    def step(model: DesignMLP,
-             opt_state: optax.OptState,
-             key: jax.random.PRNGKey,
-             optimizer: optax.GradientTransformation):
-        (loss_val, aux), grads = loss_and_grad(model, key)
-        updates, opt_state = optimizer.update(grads, opt_state, model)
-        model = eqx.apply_updates(model, updates)
-        return model, opt_state, loss_val, aux
+    # Take gradient w.r.t. `params` only, but keep aux
+    grad_fn = jax.value_and_grad(loss_from_params, argnums=0, has_aux=True)
+
+    @jax.jit
+    def step(params, opt_state, key):
+        # Compute loss and gradients w.r.t. params
+        (loss_val, aux), grads = grad_fn(params, key)
+
+        # Optax update on params only
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+
+        return params, opt_state, loss_val, aux
 
     return step
-
 
 # -----------------------------------------------------------------------------
 # Plotting utilities
@@ -386,10 +414,14 @@ def main():
         key=key_model,
     )
 
-    optimizer = optax.adam(cfg.learning_rate)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    # Split model into trainable array params and static structure
+    params, static_model = eqx.partition(model, eqx.is_array)
 
-    training_step = build_training_step(cfg)
+    optimizer = optax.adam(cfg.learning_rate)
+    opt_state = optimizer.init(params)
+
+    # Build jitted training step that closes over optimizer + static_model
+    training_step = build_training_step(cfg, optimizer, static_model)
 
     # 2. Optional: run a baseline simulation with some reference eta0, nu0
     #    (e.g., the central point in log10-space), for comparison.
@@ -422,9 +454,9 @@ def main():
     print("\n[TRAIN] Starting inverse-design training loop...")
     for step in range(cfg.n_train_steps):
         key_train, key_step = jax.random.split(key_train)
-
-        model, opt_state, loss_val, aux = training_step(
-            model, opt_state, key_step, optimizer
+        
+        params, opt_state, loss_val, aux = training_step(
+            params, opt_state, key_step
         )
 
         loss_float = float(loss_val)
@@ -454,15 +486,34 @@ def main():
 
         last_aux = aux
 
-    # 4. Final designed simulation result
+    # 4. Final designed parameters from training
     assert last_aux is not None, "Training loop did not run."
-    res_final = last_aux["res"]
     eta_final = float(last_aux["eta"])
     nu_final  = float(last_aux["nu"])
     print(
         "\n[FINAL] Designed parameters: "
         f"eta={eta_final:.3e}, nu={nu_final:.3e}"
     )
+
+    # 4b. Re-run a dedicated simulation at (eta_final, nu_final)
+    #     outside jit to get a full result dict `res_final`.
+    f_kin_final, comp_final, res_final = _simulate_metrics(
+        jnp.array(eta_final, dtype=jnp.float64),
+        jnp.array(nu_final, dtype=jnp.float64),
+        cfg,
+    )
+    print(
+        f"[FINAL] f_kin_final={float(f_kin_final):.4f}, "
+        f"complexity_final={float(comp_final):.3e}"
+    )
+
+    # Rebuild the final DesignMLP from the trained params + static structure
+    final_model = eqx.combine(params, static_model)
+
+    # Save the trained design network to disk
+    model_path = "design_mlp_final.eqx"
+    eqx.tree_serialise_leaves(model_path, final_model)
+    print(f"[SAVE] Saved trained DesignMLP to {model_path}")
 
     # 5. Save a dedicated NPZ for the final run so it can be post-processed
     #    by mhd_tearing_postprocess.py

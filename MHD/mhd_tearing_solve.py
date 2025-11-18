@@ -463,19 +463,17 @@ def estimate_growth_rate(
     """
     JAX-friendly estimate of the linear growth rate γ from an amplitude trace A(t).
 
-    Compared to the previous NumPy implementation, this version is:
-      * fully JAX / autodiff compatible,
-      * intentionally *less convoluted*:
-          - we select a fixed time window [t_low, t_high] by fractions of the
-            total interval, then perform a linear regression of ln A vs t.
+    Compared to the previous NumPy-style implementation, this version:
+      * avoids dynamic slicing ts[i0:i1] which JAX disallows under jit,
+      * uses a boolean mask + weighted regression over the *full* arrays.
 
     Parameters
     ----------
     ts   : 1D array of times (monotonic)
     amp  : 1D array of amplitude A(t), e.g. |B_x(kx=0,ky=1,kz=0)|
-    w0   : optional reference amplitude (unused here but kept for API compat.)
+    w0   : unused (kept for API compatibility)
     frac_low, frac_high : fractions of the total time interval used for fitting
-    n_sub_win, min_points : kept for backward compatibility (unused)
+    n_sub_win, min_points : kept for API compatibility; min_points is enforced.
 
     Returns
     -------
@@ -487,31 +485,43 @@ def estimate_growth_rate(
     amp = jnp.asarray(amp)
 
     T = ts.shape[0]
-    # Guard against tiny time series
     T_min = 4
     T_eff = jnp.maximum(T, T_min)
 
-    # Choose a simple fixed window in time:
+    # Choose window indices as *JAX scalars* (tracers under jit)
     i0_f = frac_low * (T_eff - 1)
     i1_f = frac_high * (T_eff - 1)
-    i0 = jnp.int32(jnp.floor(i0_f))
-    i1 = jnp.int32(jnp.ceil(i1_f))
-    i1 = jnp.maximum(i1, i0 + 4)
+    i0 = jnp.floor(i0_f).astype(jnp.int32)
+    i1 = jnp.ceil(i1_f).astype(jnp.int32)
+
+    # Enforce a minimum number of points
+    i1 = jnp.maximum(i1, i0 + min_points)
     i1 = jnp.minimum(i1, T)
 
     lnA = jnp.log(amp + 1e-30)
-    ts_win  = ts[i0:i1]
-    lnA_win = lnA[i0:i1]
 
-    # Linear regression lnA_win ≈ a t + b
-    gamma_fit, intercept, R2, a_err = _linear_regression_stats_jax(ts_win, lnA_win)
+    # Build a boolean mask instead of slicing
+    idx = jnp.arange(T, dtype=jnp.int32)
+    mask_good = (idx >= i0) & (idx < i1)
+    w = mask_good.astype(ts.dtype)  # weights: 1 inside window, 0 outside
 
-    # Build lnA_fit over the *full* time array using the fitted line
+    # Weighted linear regression lnA ≈ a t + b over full arrays with weights w
+    W = jnp.sum(w) + 1e-16
+
+    x = ts
+    y = lnA
+
+    x_mean = jnp.sum(w * x) / W
+    y_mean = jnp.sum(w * y) / W
+
+    cov_xy = jnp.sum(w * (x - x_mean) * (y - y_mean)) / W
+    var_x  = jnp.sum(w * (x - x_mean) ** 2) / W + 1e-16
+
+    gamma_fit = cov_xy / var_x
+    intercept = y_mean - gamma_fit * x_mean
+
+    # Fitted lnA over the *full* time array
     lnA_fit = gamma_fit * ts + intercept
-
-    # Boolean mask indicating the window used
-    idx_all = jnp.arange(T)
-    mask_good = (idx_all >= i0) & (idx_all < i1)
 
     return gamma_fit, lnA_fit, mask_good
 

@@ -31,12 +31,14 @@ This script:
        _run_tearing_simulation_and_diagnostics.
   2) Uses the JAX-based plasmoid_complexity_metric and energy traces to
      build the objective.
-  3) Performs gradient descent on log(eta), log(nu).
+  3) Performs gradient descent on log(eta), log(nu), tracking the
+     *best-so-far* parameters.
   4) Produces publication-ready plots:
        - optimization history,
        - (eta,nu) "phase diagram" colored by complexity,
        - energy evolution (initial vs optimized, with late-time window),
-       - midplane A_z profile (initial vs optimized).
+       - midplane A_z profile (initial vs optimized),
+       - final-time B_x(x,y) and A_z(x,y) fields (initial vs optimized).
 
 Usage:
   python mhd_tearing_energy_plasmoid_opt.py
@@ -48,7 +50,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -58,6 +60,8 @@ import matplotlib.pyplot as plt
 from mhd_tearing_solve import (
     _run_tearing_simulation_and_diagnostics,
     plasmoid_complexity_metric,
+    compute_k_arrays_np,
+    compute_Az_hat_np,
 )
 
 # --- modest styling to make plots “paper-like” ---
@@ -107,8 +111,9 @@ class EnergyPlasmoidConfig:
 
     # Optimization hyperparameters
     n_opt_steps: int = 20
-    lr_log_eta: float = 0.5
-    lr_log_nu: float = 0.5
+    # Learning rates in *log*-space; a bit conservative for stability
+    lr_log_eta: float = 0.3
+    lr_log_nu: float = 0.3
 
     # Initial guesses
     eta0: float = 1e-3
@@ -116,9 +121,10 @@ class EnergyPlasmoidConfig:
 
     # Plasmoid-like regime is usually better in the force-free equilibrium
     equilibrium_mode: str = "forcefree"
-    
-# ---- helper
-    
+
+
+# ---- helper for saving to NPZ ------------------------------------------------
+
 def _prepare_npz_payload(res: Dict[str, Any],
                          extra_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
@@ -129,21 +135,26 @@ def _prepare_npz_payload(res: Dict[str, Any],
     """
     payload: Dict[str, Any] = {}
     for key, val in res.items():
+        # Simple scalars / strings
         if isinstance(val, (int, float, np.number, str)):
             payload[key] = val
             continue
+        # JAX / NumPy arrays, lists, etc.
         try:
             payload[key] = np.asarray(val)
         except Exception:
+            # If it really cannot be converted, we just skip it.
             pass
 
     if extra_meta is not None:
         payload.update(extra_meta)
     return payload
 
+
 # --------------------------- Objective functional ---------------------------#
 
-def _simulate_energy_plasmoid(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig):
+def _simulate_energy_plasmoid(theta: jnp.ndarray,
+                              cfg: EnergyPlasmoidConfig):
     """
     Run the tearing simulation for given theta=[log_eta, log_nu] and
     return (f_kin, complexity, t_tail_start, t_tail_end, res).
@@ -157,7 +168,7 @@ def _simulate_energy_plasmoid(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig):
     eta = jnp.exp(log_eta)
     nu = jnp.exp(log_nu)
 
-    # Run the MHD simulation
+    # Run the MHD simulation (JAX-based, but called in Python space)
     res = _run_tearing_simulation_and_diagnostics(
         Nx=cfg.Nx,
         Ny=cfg.Ny,
@@ -183,8 +194,8 @@ def _simulate_energy_plasmoid(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig):
     E_mag = res["E_mag"]
     Az_final_mid = res["Az_final_mid"]
 
-    # --- Late-time window diagnostics ---
-    T = ts.shape[0]          # integer (Python int when traced)
+    # --- Late-time window diagnostics (in index space) ---
+    T = ts.shape[0]          # number of frames
     i0 = int(cfg.tail_frac_start * (T - 1))
     i0 = max(0, min(i0, T - 1))
     t_tail_start = ts[i0]
@@ -200,7 +211,7 @@ def _simulate_energy_plasmoid(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig):
 
     complexity = plasmoid_complexity_metric(Az_final_mid)
 
-    # Attach a few diagnostics back into res for plotting
+    # Attach a few diagnostics back into res for plotting / saving
     res = dict(res)
     res["f_kin"] = f_kin
     res["complexity"] = complexity
@@ -212,7 +223,8 @@ def _simulate_energy_plasmoid(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig):
     return f_kin, complexity, t_tail_start, t_tail_end, res
 
 
-def objective(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig) -> jnp.ndarray:
+def objective(theta: jnp.ndarray,
+              cfg: EnergyPlasmoidConfig) -> jnp.ndarray:
     """
     Objective functional for energy/plasmoid design:
 
@@ -225,7 +237,7 @@ def objective(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig) -> jnp.ndarray:
       - no float(...) on tracers
       - use jax.debug.print for logging.
     """
-    f_kin, complexity, t_tail_start, t_tail_end, _ = _simulate_energy_plasmoid(
+    f_kin, complexity, t_tail_start, t_tail_end, res = _simulate_energy_plasmoid(
         theta, cfg
     )
 
@@ -235,10 +247,16 @@ def objective(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig) -> jnp.ndarray:
     # AD-safe debug printing
     eta = jnp.exp(theta[0])
     nu = jnp.exp(theta[1])
+
+    # Extra debug: growth rate comparison if available
+    gamma_FKR = res.get("gamma_FKR", jnp.nan)
+    gamma_fit = res.get("gamma_fit", jnp.nan)
+
     jax.debug.print(
         "[OBJ] eta={eta:.4e}, nu={nu:.4e}, "
         "f_kin={f_kin:.4f}, C_plas={comp:.4e}, "
         "score={score:.4e}, J={J:.4e}, "
+        "gamma_FKR={gF:.3e}, gamma_fit={gf:.3e}, "
         "t_tail=[{t0:.2f},{t1:.2f}]",
         eta=eta,
         nu=nu,
@@ -246,6 +264,8 @@ def objective(theta: jnp.ndarray, cfg: EnergyPlasmoidConfig) -> jnp.ndarray:
         comp=complexity,
         score=score,
         J=J,
+        gF=gamma_FKR,
+        gf=gamma_fit,
         t0=t_tail_start,
         t1=t_tail_end,
     )
@@ -260,9 +280,10 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
     Gradient-descent optimization of (log_eta, log_nu).
 
     Returns:
-      history: dict with arrays of eta, nu, f_kin, complexity, score, J, etc.
-      res_init: simulation at initial (eta0,nu0)
-      res_opt:  simulation at optimized (eta,nu)
+      history:   dict with arrays of eta, nu, f_kin, complexity, score, J, etc.
+      res_init:  simulation at initial (eta0,nu0)
+      res_best:  simulation at *best-scoring* (eta,nu)
+      best_info: dict with best theta, iteration, score, etc.
     """
     theta0 = jnp.array([jnp.log(cfg.eta0), jnp.log(cfg.nu0)])
 
@@ -291,10 +312,15 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
 
     eta0_val = float(cfg.eta0)
     nu0_val = float(cfg.nu0)
+
+    gamma_FKR0 = float(res_init.get("gamma_FKR", np.nan))
+    gamma_fit0 = float(res_init.get("gamma_fit", np.nan))
+
     print(
         "[INIT] eta0={eta:.4e}, nu0={nu:.4e}, "
         "f_kin0={fk:.4f}, C_plas0={cp:.4e}, "
         "score0={sc:.4e}, J0={J:.4e}, "
+        "gamma_FKR0={gF:.3e}, gamma_fit0={gfi:.3e}, "
         "t_tail=[{t0:.2f},{t1:.2f}]".format(
             eta=eta0_val,
             nu=nu0_val,
@@ -302,6 +328,8 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
             cp=float(comp0),
             sc=float(score0),
             J=float(J0),
+            gF=gamma_FKR0,
+            gfi=gamma_fit0,
             t0=float(t_tail_start0),
             t1=float(t_tail_end0),
         )
@@ -319,19 +347,28 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
     history["grad_nu"].append(np.nan)
 
     theta = theta0
-    res_opt = res_init
+
+    # Best-so-far bookkeeping
+    best_score = float(score0)
+    best_theta = np.array(theta0)
+    best_iter = 0
+    res_best = res_init
+    best_f_kin = float(f_kin0)
+    best_complexity = float(comp0)
 
     # --------------------- Optimization loop ----------------------#
     print("\n[OPT] Starting gradient descent on (log_eta, log_nu)...")
     for k in range(cfg.n_opt_steps):
+        # Evaluate objective & gradient at current theta
         J_val, grad_theta = value_and_grad(theta, cfg)
         g_eta, g_nu = grad_theta
 
-        # Update in log-space
-        theta = theta - jnp.array([cfg.lr_log_eta * g_eta,
-                                   cfg.lr_log_nu * g_nu])
+        # Simple gradient descent in log-space
+        theta = theta - jnp.array(
+            [cfg.lr_log_eta * g_eta, cfg.lr_log_nu * g_nu]
+        )
 
-        # Diagnostics at new theta
+        # Diagnostics at updated theta
         f_kin_k, comp_k, t_tail_start_k, t_tail_end_k, res_k = (
             _simulate_energy_plasmoid(theta, cfg)
         )
@@ -347,7 +384,7 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
         history["f_kin"].append(float(f_kin_k))
         history["complexity"].append(float(comp_k))
         history["score"].append(float(score_k))
-        history["J"].append(float(J_val))
+        history["J"].append(float(J_val))  # J evaluated at pre-update theta
         history["t_tail_start"].append(float(t_tail_start_k))
         history["t_tail_end"].append(float(t_tail_end_k))
         history["grad_eta"].append(grad_eta_k)
@@ -356,7 +393,7 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
         print(
             "[OPT step {k:02d}] eta={eta:.4e}, nu={nu:.4e}, "
             "f_kin={fk:.4f}, C_plas={cp:.4e}, "
-            "score={sc:.4e}, J={J:.4e}, "
+            "score={sc:.4e}, J(prev)={J:.4e}, "
             "|grad_eta|={ge:.3e}, |grad_nu|={gn:.3e}, "
             "t_tail=[{t0:.2f},{t1:.2f}]".format(
                 k=k,
@@ -373,9 +410,36 @@ def run_optimization(cfg: EnergyPlasmoidConfig):
             )
         )
 
-        res_opt = res_k
+        # Update best-so-far
+        if float(score_k) > best_score:
+            best_score = float(score_k)
+            best_theta = np.array(theta)
+            best_iter = k + 1  # because k=0 corresponds to 1st update
+            res_best = res_k
+            best_f_kin = float(f_kin_k)
+            best_complexity = float(comp_k)
+            print(
+                "      [BEST] updated at iter {it:02d}: "
+                "score={sc:.4e}, f_kin={fk:.4f}, C_plas={cp:.4e}, "
+                "eta={eta:.4e}, nu={nu:.4e}".format(
+                    it=best_iter,
+                    sc=best_score,
+                    fk=best_f_kin,
+                    cp=best_complexity,
+                    eta=float(jnp.exp(best_theta[0])),
+                    nu=float(jnp.exp(best_theta[1])),
+                )
+            )
 
-    return history, res_init, res_opt
+    best_info = dict(
+        best_theta=best_theta,
+        best_iter=best_iter,
+        best_score=best_score,
+        best_f_kin=best_f_kin,
+        best_complexity=best_complexity,
+    )
+
+    return history, res_init, res_best, best_info
 
 
 # --------------------------- Plotting utilities -----------------------------#
@@ -432,7 +496,6 @@ def plot_eta_nu_phase(history: Dict[str, List[float]],
     eta = np.asarray(history["eta"])
     nu = np.asarray(history["nu"])
     comp = np.asarray(history["complexity"])
-    iters = np.arange(len(eta))
 
     fig, ax = plt.subplots(figsize=(5.0, 4.5), constrained_layout=True)
 
@@ -463,7 +526,7 @@ def plot_energy_comparison(res_init: Dict[str, Any],
     ]:
         ts = np.array(res["ts"])
         E_kin = np.array(res["E_kin"])
-        E_mag = np.array(res["E_mag"])
+        E_mag = np.array(res["E_kin"]*0 + res["E_mag"])  # ensure copy
 
         t_tail_start = float(res.get("t_tail_start", cfg.tail_frac_start * cfg.t1))
         t_tail_end = float(res.get("t_tail_end", cfg.t1))
@@ -494,7 +557,8 @@ def plot_energy_comparison(res_init: Dict[str, Any],
 def plot_Az_midplane_comparison(res_init: Dict[str, Any],
                                 res_opt: Dict[str, Any]):
     """
-    Compare midplane A_z profile at final time for initial vs optimized runs.
+    Compare midplane A_z profile at final time for initial vs optimized runs
+    (1D cut).
     """
     fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
 
@@ -514,6 +578,75 @@ def plot_Az_midplane_comparison(res_init: Dict[str, Any],
     print("[PLOT] Saved energy_plasmoid_Az_midplane_comparison.png")
 
 
+def _extract_final_Bx_Az_xy(res: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    From a simulation result dict, reconstruct final-time B_x(x,y) and
+    A_z(x,y) on the z=0 midplane for visualization.
+    """
+    B_hat_T = np.asarray(res["B_hat"][-1])  # (3, Nx, Ny, Nz)
+    Nx, Ny, Nz = B_hat_T.shape[1], B_hat_T.shape[2], B_hat_T.shape[3]
+    Lx, Ly, Lz = float(res["Lx"]), float(res["Ly"]), float(res["Lz"])
+
+    # Real-space B
+    B_real = np.fft.ifftn(B_hat_T, axes=(1, 2, 3)).real
+    Bx_xy = B_real[0, :, :, 0]  # z=0 plane
+
+    # Flux function A_z from B_hat
+    kx, ky, kz, NX, NY, NZ = compute_k_arrays_np(Nx, Ny, Nz, Lx, Ly, Lz)
+    Az_hat = compute_Az_hat_np(B_hat_T, kx, ky)
+    Az_real = np.fft.ifftn(Az_hat, axes=(0, 1, 2)).real
+    Az_xy = Az_real[:, :, 0]  # z=0 plane
+
+    return Bx_xy, Az_xy
+
+
+def plot_final_field_comparison(res_init: Dict[str, Any],
+                                res_opt: Dict[str, Any],
+                                cfg: EnergyPlasmoidConfig):
+    """
+    2D fields at final time for initial vs optimized runs:
+
+      - B_x(x,y,t_final) on z=0 plane
+      - A_z(x,y,t_final) on z=0 plane
+    """
+    Bx_init, Az_init = _extract_final_Bx_Az_xy(res_init)
+    Bx_opt, Az_opt = _extract_final_Bx_Az_xy(res_opt)
+
+    x = np.linspace(0.0, cfg.Lx, cfg.Nx, endpoint=False)
+    y = np.linspace(0.0, cfg.Ly, cfg.Ny, endpoint=False)
+    X, Y = np.meshgrid(x, y, indexing="ij")
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8), constrained_layout=True)
+
+    im0 = axes[0, 0].pcolormesh(X, Y, Bx_init, shading="auto")
+    axes[0, 0].set_title(r"$B_x(x,y,t_{\mathrm{final}})$ (initial)")
+    axes[0, 0].set_xlabel(r"$x$")
+    axes[0, 0].set_ylabel(r"$y$")
+    fig.colorbar(im0, ax=axes[0, 0])
+
+    im1 = axes[0, 1].pcolormesh(X, Y, Bx_opt, shading="auto")
+    axes[0, 1].set_title(r"$B_x(x,y,t_{\mathrm{final}})$ (optimized)")
+    axes[0, 1].set_xlabel(r"$x$")
+    axes[0, 1].set_ylabel(r"$y$")
+    fig.colorbar(im1, ax=axes[0, 1])
+
+    im2 = axes[1, 0].pcolormesh(X, Y, Az_init, shading="auto")
+    axes[1, 0].set_title(r"$A_z(x,y,t_{\mathrm{final}})$ (initial)")
+    axes[1, 0].set_xlabel(r"$x$")
+    axes[1, 0].set_ylabel(r"$y$")
+    fig.colorbar(im2, ax=axes[1, 0])
+
+    im3 = axes[1, 1].pcolormesh(X, Y, Az_opt, shading="auto")
+    axes[1, 1].set_title(r"$A_z(x,y,t_{\mathrm{final}})$ (optimized)")
+    axes[1, 1].set_xlabel(r"$x$")
+    axes[1, 1].set_ylabel(r"$y$")
+    fig.colorbar(im3, ax=axes[1, 1])
+
+    fig.suptitle("Final-time fields: initial vs optimized", fontsize=14)
+    fig.savefig("energy_plasmoid_final_fields.png", dpi=300)
+    print("[PLOT] Saved energy_plasmoid_final_fields.png")
+
+
 # ----------------------------------- main -----------------------------------#
 
 def main():
@@ -524,14 +657,28 @@ def main():
     print("========================================================")
     print(cfg)
 
-    history, res_init, res_opt = run_optimization(cfg)
+    history, res_init, res_opt, best_info = run_optimization(cfg)
+
+    print(
+        "\n[SUMMARY] Best score={sc:.4e} at iter={it:02d} with "
+        "f_kin={fk:.4f}, C_plas={cp:.4e}, "
+        "eta={eta:.4e}, nu={nu:.4e}".format(
+            sc=best_info["best_score"],
+            it=best_info["best_iter"],
+            fk=best_info["best_f_kin"],
+            cp=best_info["best_complexity"],
+            eta=float(np.exp(best_info["best_theta"][0])),
+            nu=float(np.exp(best_info["best_theta"][1])),
+        )
+    )
 
     print("\n[POST] Making plots...")
     plot_optimization_history(history, cfg)
     plot_eta_nu_phase(history, cfg)
     plot_energy_comparison(res_init, res_opt, cfg)
     plot_Az_midplane_comparison(res_init, res_opt)
-    
+    plot_final_field_comparison(res_init, res_opt, cfg)
+
     # Save initial and optimized solutions as .npz for postprocessing
     print("\n[SAVE] Writing initial and optimized solutions for postprocessing...")
 
@@ -555,15 +702,14 @@ def main():
         res_opt,
         extra_meta={
             "opt_script": "mhd_tearing_energy_plasmoid_opt",
-            "opt_kind": "plasmoid_opt",
+            "opt_kind": "plasmoid_opt_best",
             "alpha": cfg.alpha,
             "beta": cfg.beta,
         },
     )
-    fname_opt = stem_base + "_opt.npz"
+    fname_opt = stem_base + "_opt_best.npz"
     np.savez(fname_opt, **payload_opt)
-    print(f"[SAVE] Optimized solution saved to {fname_opt}")
-
+    print(f"[SAVE] Optimized (best) solution saved to {fname_opt}")
 
     print("\n[DONE] Energy/Plasmoid optimization finished.")
 
