@@ -8,7 +8,7 @@ End-to-end differentiable inverse design for tearing-mediated reconnection.
 We use the differentiable pseudo-spectral MHD tearing solver
 (mhd_tearing_solve.py) as a *layer* inside a neural network:
 
-    z  --(MLP g_theta)-->  (log_eta, log_nu)
+    z  --(MLP g_theta)-->  (log10_eta, log10_nu)
                        ->  (eta, nu)
                        ->  MHD simulation
                        ->  reconnection metrics (f_kin, C_plasmoid)
@@ -26,8 +26,14 @@ Outputs:
       * inverse_design_training_history.png
   - Post-optimization simulation comparison:
       * inverse_design_energy_evolution.png
+      * inverse_design_energy_fraction.png
+      * inverse_design_reconnection_rate.png
+      * inverse_design_tearing_growth.png
+      * inverse_design_Az_midplane_profiles.png
   - NPZ checkpoint for the final ("designed") run:
       * mhd_tearing_inverse_design_solution_final.npz
+  - Serialized trained design network:
+      * design_mlp_final.eqx
 
 The final NPZ can be post-processed with:
 
@@ -285,19 +291,18 @@ def make_loss_fn(cfg: InverseDesignConfig):
             "nu": nu,
             "f_kin": f_kin,
             "complexity": complexity,
-            # "res": res,
         }
         return loss, aux
 
     return loss_fn
 
 
-# Filtered versions for Equinox (only differentiate w.r.t. trainable params)
 def build_training_step(
     cfg: InverseDesignConfig,
     optimizer: optax.GradientTransformation,
     static_model: DesignMLP,
 ):
+    """Build a jitted training step that updates only the trainable params."""
     loss_fn = make_loss_fn(cfg)
 
     # loss as a function of (params, key), with static_model closed over
@@ -323,6 +328,7 @@ def build_training_step(
 
     return step
 
+
 # -----------------------------------------------------------------------------
 # Plotting utilities
 # -----------------------------------------------------------------------------
@@ -347,12 +353,12 @@ def plot_training_history(history: Dict[str, List[float]]):
     axes[1, 0].plot(steps, history["f_kin"], marker="o")
     axes[1, 0].set_xlabel("training step")
     axes[1, 0].set_ylabel(r"$f_{\mathrm{kin}}$")
-    axes[1, 0].set_title("Kinetic energy fraction")
+    axes[1, 0].set_title("Kinetic energy fraction (tail-averaged)")
 
     axes[1, 1].plot(steps, history["complexity"], marker="o")
     axes[1, 1].set_xlabel("training step")
     axes[1, 1].set_ylabel(r"$C_{\mathrm{plasmoid}}$")
-    axes[1, 1].set_title("Plasmoid complexity")
+    axes[1, 1].set_title("Plasmoid complexity (midplane)")
 
     fig.suptitle("Differentiable inverse design training history", fontsize=14)
     fig.savefig("inverse_design_training_history.png", dpi=300)
@@ -362,10 +368,11 @@ def plot_training_history(history: Dict[str, List[float]]):
 
 def plot_energy_evolution(res_init: Dict[str, Any],
                           res_final: Dict[str, Any]):
+    """Kinetic and magnetic energy vs time, initial vs designed."""
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
 
     for res, lab, color in [
-        (res_init, "initial", "C0"),
+        (res_init, "baseline", "C0"),
         (res_final, "designed", "C3"),
     ]:
         ts = np.array(res["ts"])
@@ -385,9 +392,128 @@ def plot_energy_evolution(res_init: Dict[str, Any],
     axes[1].set_title("Magnetic energy vs time")
     axes[1].legend(fontsize=8)
 
-    fig.suptitle("Energy evolution: initial vs inversely-designed run", fontsize=14)
+    fig.suptitle("Energy evolution: baseline vs inversely-designed run", fontsize=14)
     fig.savefig("inverse_design_energy_evolution.png", dpi=300)
     print("[PLOT] Saved inverse_design_energy_evolution.png")
+    plt.close(fig)
+
+
+def plot_energy_fraction(res_init: Dict[str, Any],
+                         res_final: Dict[str, Any]):
+    """Plot f_kin(t) = E_kin / (E_kin + E_mag) for baseline vs designed."""
+    fig, ax = plt.subplots(figsize=(5.5, 4), constrained_layout=True)
+
+    for res, lab, color in [
+        (res_init, "baseline", "C0"),
+        (res_final, "designed", "C3"),
+    ]:
+        ts = np.array(res["ts"])
+        E_kin = np.array(res["E_kin"])
+        E_mag = np.array(res["E_mag"])
+        f_kin_t = E_kin / (E_kin + E_mag + 1e-30)
+        ax.plot(ts, f_kin_t, label=lab, color=color)
+
+    ax.set_xlabel(r"$t$")
+    ax.set_ylabel(r"$E_{\mathrm{kin}} / (E_{\mathrm{kin}} + E_{\mathrm{mag}})$")
+    ax.set_title("Kinetic-energy fraction vs time")
+    ax.legend(fontsize=8)
+    fig.savefig("inverse_design_energy_fraction.png", dpi=300)
+    print("[PLOT] Saved inverse_design_energy_fraction.png")
+    plt.close(fig)
+
+
+def plot_reconnection_rate(res_init: Dict[str, Any],
+                           res_final: Dict[str, Any]):
+    """Plot reconnection-rate proxy E_rec(t) from A_z at the X-point."""
+    fig, ax = plt.subplots(figsize=(5.5, 4), constrained_layout=True)
+
+    for res, lab, color in [
+        (res_init, "baseline", "C0"),
+        (res_final, "designed", "C3"),
+    ]:
+        ts = np.array(res["ts"])
+        E_rec = np.array(res["E_rec_series"])
+        ax.plot(ts, E_rec, label=lab, color=color)
+
+    ax.set_xlabel(r"$t$")
+    ax.set_ylabel(r"$E_{\mathrm{rec}}(t)$ (proxy)")
+    ax.set_title("Reconnection-rate proxy from $A_z$ at X-point")
+    ax.legend(fontsize=8)
+    fig.savefig("inverse_design_reconnection_rate.png", dpi=300)
+    print("[PLOT] Saved inverse_design_reconnection_rate.png")
+    plt.close(fig)
+
+
+def plot_tearing_growth(res_init: Dict[str, Any],
+                        res_final: Dict[str, Any]):
+    """
+    Plot tearing mode amplitude and exponential fit, baseline vs designed.
+
+    Shows |B_x(kx=0,ky=1,kz=0)|(t) on a log scale, with lnA_fit(t) overlaid
+    and the linear-fit window shaded.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+
+    for ax, (res, lab) in zip(
+        axes,
+        [(res_init, "baseline"), (res_final, "designed")],
+    ):
+        ts = np.array(res["ts"])
+        mode_amp = np.array(res["mode_amp_series"])
+        lnA_fit = np.array(res["lnA_fit"])
+        mask_lin = np.array(res["mask_lin"]).astype(bool)
+
+        A_fit = np.exp(lnA_fit)
+
+        ax.semilogy(ts, mode_amp, label=r"$|B_x(k_x{=}0,k_y{=}1,k_z{=}0)|$", lw=1.8)
+        ax.semilogy(ts, A_fit, "--", label=r"fit: $\exp(\gamma t)$", lw=1.8)
+
+        # Shade the linear fit window
+        if np.any(mask_lin):
+            t_min = ts[mask_lin].min()
+            t_max = ts[mask_lin].max()
+            ax.axvspan(t_min, t_max, alpha=0.15, color="grey",
+                       label="fit window")
+
+        gamma_fit = float(np.array(res["gamma_fit"]))
+        ax.set_xlabel(r"$t$")
+        ax.set_ylabel(r"mode amplitude")
+        ax.set_title(f"Tearing growth ({lab}), $\\gamma_{{\\rm fit}}\\approx{gamma_fit:.3e}$")
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Tearing-mode amplitude and fitted exponential growth", fontsize=14)
+    fig.savefig("inverse_design_tearing_growth.png", dpi=300)
+    print("[PLOT] Saved inverse_design_tearing_growth.png")
+    plt.close(fig)
+
+
+def plot_Az_midplane_profiles(res_init: Dict[str, Any],
+                              res_final: Dict[str, Any]):
+    """
+    Plot A_z(y) on the midplane at final time, baseline vs designed.
+
+    Uses Az_final_mid, which is A_z(x_mid, y, z=0, t=t_final).
+    """
+    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+
+    for res, lab, color in [
+        (res_init, "baseline", "C0"),
+        (res_final, "designed", "C3"),
+    ]:
+        Az_mid = np.array(res["Az_final_mid"])
+        Ly = float(res["Ly"])
+        Ny = Az_mid.shape[0]
+        y = np.linspace(0.0, Ly, Ny, endpoint=False)
+        complexity = float(np.array(res["complexity_final"]))
+
+        ax.plot(y, Az_mid, label=f"{lab} (C≈{complexity:.2e})", color=color)
+
+    ax.set_xlabel(r"$y$")
+    ax.set_ylabel(r"$A_z(x_{\mathrm{mid}},y,z{=}0,t_{\mathrm{final}})$")
+    ax.set_title(r"Midplane flux function $A_z$ at final time")
+    ax.legend(fontsize=8)
+    fig.savefig("inverse_design_Az_midplane_profiles.png", dpi=300)
+    print("[PLOT] Saved inverse_design_Az_midplane_profiles.png")
     plt.close(fig)
 
 
@@ -423,20 +549,28 @@ def main():
     # Build jitted training step that closes over optimizer + static_model
     training_step = build_training_step(cfg, optimizer, static_model)
 
-    # 2. Optional: run a baseline simulation with some reference eta0, nu0
-    #    (e.g., the central point in log10-space), for comparison.
+    # 2. Baseline simulation at mid-range (eta0, nu0) for comparison
     log10_eta0 = 0.5 * (cfg.log10_eta_min + cfg.log10_eta_max)
     log10_nu0  = 0.5 * (cfg.log10_nu_min  + cfg.log10_nu_max)
     eta0 = 10.0**log10_eta0
     nu0  = 10.0**log10_nu0
 
     print("\n[BASELINE] Running baseline simulation at mid-range (eta0, nu0)...")
-    f_kin0, comp0, res_init = _simulate_metrics(eta0, nu0, cfg)
+    f_kin0, comp0, res_init = _simulate_metrics(
+        jnp.array(eta0, dtype=jnp.float64),
+        jnp.array(nu0, dtype=jnp.float64),
+        cfg,
+    )
     print(
         f"[BASELINE] log10_eta0={log10_eta0:.3f}, log10_nu0={log10_nu0:.3f}, "
         f"eta0={eta0:.3e}, nu0={nu0:.3e}, "
         f"f_kin0={float(f_kin0):.4f}, complexity0={float(comp0):.3e}"
     )
+    # Save a dedicated NPZ for the final run so it can be post-processed
+    #    by mhd_tearing_postprocess.py
+    outfile = "mhd_tearing_inverse_design_solution_initial.npz"
+    np.savez(outfile, **res_init)
+    print(f"[SAVE] Saved initial solution to {outfile}")
 
     # 3. Training loop (each step runs one full MHD simulation)
     history = {
@@ -454,7 +588,7 @@ def main():
     print("\n[TRAIN] Starting inverse-design training loop...")
     for step in range(cfg.n_train_steps):
         key_train, key_step = jax.random.split(key_train)
-        
+
         params, opt_state, loss_val, aux = training_step(
             params, opt_state, key_step
         )
@@ -521,10 +655,14 @@ def main():
     np.savez(outfile, **res_final)
     print(f"[SAVE] Saved final designed solution to {outfile}")
 
-    # 6. Make plots
-    print("\n[PLOT] Making training and energy plots...")
+    # 6. Make plots (training + baseline vs designed)
+    print("\n[PLOT] Making training and physics diagnostics plots...")
     plot_training_history(history)
     plot_energy_evolution(res_init, res_final)
+    plot_energy_fraction(res_init, res_final)
+    plot_reconnection_rate(res_init, res_final)
+    plot_tearing_growth(res_init, res_final)
+    plot_Az_midplane_profiles(res_init, res_final)
 
     print("\n[DONE] Inverse design script finished.")
 

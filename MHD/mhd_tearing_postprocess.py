@@ -337,9 +337,9 @@ def parse_args():
     p.add_argument(
         "pattern",
         nargs="?",
-        default="mhd_tearing_solution*.npz",
+        default="mhd_tearing*.npz",
         help="Input .npz filename or glob pattern "
-             "(default: mhd_tearing_solution*.npz)",
+             "(default: mhd_tearing*.npz)",
     )
     p.add_argument(
         "--no-make-movies",
