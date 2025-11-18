@@ -229,6 +229,17 @@ def _simulate_metrics(eta: jnp.ndarray,
 
     return f_kin, complexity, res
 
+def _squash_to_interval(raw: jnp.ndarray, xmin: float, xmax: float) -> jnp.ndarray:
+    """
+    Map an unconstrained 'raw' value to [xmin, xmax] smoothly using tanh.
+
+    raw ~ O(1)  -> near the middle of the interval
+    large |raw| -> asymptotically approach bounds, but with nonzero gradients.
+    """
+    center = 0.5 * (xmin + xmax)
+    half_width = 0.5 * (xmax - xmin)
+    return center + half_width * jnp.tanh(raw)
+
 
 # -----------------------------------------------------------------------------
 # Loss function and training step
@@ -254,9 +265,9 @@ def make_loss_fn(cfg: InverseDesignConfig):
 
     def loss_fn(model: DesignMLP, key: jax.random.PRNGKey) -> Tuple[jnp.ndarray, Dict[str, Any]]:
         # Forward pass through MLP
-        log10_eta_nu = model(z_train)  # shape (2,)
-        log10_eta = _clip_log10(log10_eta_nu[0], cfg.log10_eta_min, cfg.log10_eta_max)
-        log10_nu  = _clip_log10(log10_eta_nu[1], cfg.log10_nu_min,  cfg.log10_nu_max)
+        raw_log10_eta, raw_log10_nu = model(z_train)  # unconstrained outputs
+        log10_eta = _squash_to_interval(raw_log10_eta, cfg.log10_eta_min, cfg.log10_eta_max)
+        log10_nu  = _squash_to_interval(raw_log10_nu,  cfg.log10_nu_min,  cfg.log10_nu_max)
 
         # Convert to physical parameters
         eta = 10.0**log10_eta
@@ -295,7 +306,6 @@ def make_loss_fn(cfg: InverseDesignConfig):
         return loss, aux
 
     return loss_fn
-
 
 def build_training_step(
     cfg: InverseDesignConfig,
@@ -566,11 +576,20 @@ def main():
         f"eta0={eta0:.3e}, nu0={nu0:.3e}, "
         f"f_kin0={float(f_kin0):.4f}, complexity0={float(comp0):.3e}"
     )
-    # Save a dedicated NPZ for the final run so it can be post-processed
+    # Save a dedicated NPZ for the initial run so it can be post-processed
     #    by mhd_tearing_postprocess.py
     outfile = "mhd_tearing_inverse_design_solution_initial.npz"
     np.savez(outfile, **res_init)
     print(f"[SAVE] Saved initial solution to {outfile}")
+
+    def simple_loss(log10_eta, log10_nu):
+        eta = 10.0**log10_eta
+        nu  = 10.0**log10_nu
+        f_kin, C, _ = _simulate_metrics(eta, nu, cfg)
+        return (f_kin - cfg.target_f_kin)**2 + cfg.lambda_complexity * (C - cfg.target_complexity)**2
+
+    grad_eta, grad_nu = jax.grad(simple_loss, argnums=(0, 1))(jnp.array(-3.0), jnp.array(-3.0))
+    print(f"Gradient at (-3,-3): dL/dlog10_eta={grad_eta:.3e}, dL/dlog10_nu={grad_nu:.3e}")
 
     # 3. Training loop (each step runs one full MHD simulation)
     history = {
