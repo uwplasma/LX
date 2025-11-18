@@ -103,7 +103,7 @@ class IdealTearingConfig:
     gamma_star: float = 1.0    # target normalized growth rate gamma_hat = gamma a / vA
 
     # Optimization hyperparameters
-    n_opt_steps: int = 15
+    n_opt_steps: int = 20
     lr_log_a: float = 0.5      # learning rate for log(a)
 
     # Initial guess for a
@@ -220,6 +220,33 @@ def objective(log_a: jnp.ndarray, cfg: IdealTearingConfig) -> jnp.ndarray:
     )
 
     return J
+
+# --------- helper
+
+def _prepare_npz_payload(res: Dict[str, Any],
+                         extra_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """
+    Convert the result dict from _run_tearing_simulation_and_diagnostics
+    into something np.savez can digest (NumPy arrays + scalars).
+
+    Any extra_meta entries are added on top.
+    """
+    payload: Dict[str, Any] = {}
+    for key, val in res.items():
+        # Keep simple scalars/strings as-is
+        if isinstance(val, (int, float, np.number, str)):
+            payload[key] = val
+            continue
+        # Try to turn everything else into a NumPy array
+        try:
+            payload[key] = np.asarray(val)
+        except Exception:
+            # If something really can't be converted (e.g. a callable), skip it
+            pass
+
+    if extra_meta is not None:
+        payload.update(extra_meta)
+    return payload
 
 
 # --------------------------- Optimization driver ----------------------------#
@@ -543,6 +570,39 @@ def main():
     plot_gamma_vs_a(history, cfg)
     plot_growth_rate_comparison(res_init, res_opt)
     plot_energy_comparison(res_init, res_opt)
+    
+    # Save initial and optimized solutions as .npz for postprocessing
+    print("\n[SAVE] Writing initial and optimized solutions for postprocessing...")
+
+    # Common stem: ideal-tearing, equilibrium mode, target S
+    stem_base = f"mhd_tearing_solution_ideal_{cfg.equilibrium_mode}_S{int(cfg.S_target)}"
+
+    payload_init = _prepare_npz_payload(
+        res_init,
+        extra_meta={
+            "opt_script": "mhd_tearing_ideal_tearing_opt",
+            "opt_kind": "ideal_tearing_init",
+            "S_target": cfg.S_target,
+            "gamma_star": cfg.gamma_star,
+        },
+    )
+    fname_init = stem_base + "_init.npz"
+    np.savez(fname_init, **payload_init)
+    print(f"[SAVE] Initial solution saved to {fname_init}")
+
+    payload_opt = _prepare_npz_payload(
+        res_opt,
+        extra_meta={
+            "opt_script": "mhd_tearing_ideal_tearing_opt",
+            "opt_kind": "ideal_tearing_opt",
+            "S_target": cfg.S_target,
+            "gamma_star": cfg.gamma_star,
+        },
+    )
+    fname_opt = stem_base + "_opt.npz"
+    np.savez(fname_opt, **payload_opt)
+    print(f"[SAVE] Optimized solution saved to {fname_opt}")
+
 
     print("\n[DONE] Ideal tearing optimization finished.")
 
