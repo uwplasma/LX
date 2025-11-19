@@ -973,9 +973,9 @@ def main(
 
 if __name__ == "__main__":
     # Default example (adjust to your filenames)
-    default_solution = "wout_precise_QA_mfs_energymin_vmec_like_solution.npz"
+    # default_solution = "wout_precise_QA_mfs_energymin_vmec_like_solution.npz"
     # default_solution = "wout_precise_QH_mfs_energymin_vmec_like_solution.npz"
-    # default_solution = "slam_surface_mfs_energymin_vmec_like_solution.npz"
+    default_solution = "slam_surface_mfs_energymin_vmec_like_solution.npz"
     # default_solution = "knot_tube_mfs_energymin_vmec_like_solution.npz"
 
     nfp_default = 2

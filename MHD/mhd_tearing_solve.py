@@ -41,6 +41,7 @@ import jax.numpy as jnp
 
 import diffrax as dfx
 import numpy as np
+from jax import lax
 
 Array = jnp.ndarray
 
@@ -452,78 +453,77 @@ def _linear_regression_stats_jax(x: Array, y: Array):
 
 
 def estimate_growth_rate(
-    ts: Array,
-    amp: Array,
-    w0: float | None = None,
-    frac_low: float = 0.10,
-    frac_high: float = 0.60,
-    n_sub_win: int = 5,
-    min_points: int = 6,
+    ts: jnp.ndarray,
+    mode_amp: jnp.ndarray,
+    w0: jnp.ndarray,
+    *,
+    lower_factor: float = 5.0,
+    upper_frac_of_max: float = 0.3,
+    min_points: int = 8,
 ):
     """
-    JAX-friendly estimate of the linear growth rate γ from an amplitude trace A(t).
+    Estimate tearing growth rate by fitting ln|B_x| over an amplitude-based window.
 
-    Compared to the previous NumPy-style implementation, this version:
-      * avoids dynamic slicing ts[i0:i1] which JAX disallows under jit,
-      * uses a boolean mask + weighted regression over the *full* arrays.
+    - We choose points such that:
+          lower_factor * w0 <= |B_x| <= upper_frac_of_max * max(|B_x|)
+      which (for your runs) nicely isolates the exponential rise.
 
-    Parameters
-    ----------
-    ts   : 1D array of times (monotonic)
-    amp  : 1D array of amplitude A(t), e.g. |B_x(kx=0,ky=1,kz=0)|
-    w0   : unused (kept for API compatibility)
-    frac_low, frac_high : fractions of the total time interval used for fitting
-    n_sub_win, min_points : kept for API compatibility; min_points is enforced.
-
-    Returns
-    -------
-    gamma_fit : scalar slope of ln A vs t on the chosen window
-    lnA_fit   : ln A_fit(t) over the full ts array (same shape as ts)
-    mask_good : boolean mask selecting the window used for the fit
+    - If that window has too few points, we fall back to fitting all times.
     """
+
     ts = jnp.asarray(ts)
-    amp = jnp.asarray(amp)
+    A = jnp.asarray(mode_amp)
+    eps = 1e-30
 
-    T = ts.shape[0]
-    T_min = 4
-    T_eff = jnp.maximum(T, T_min)
+    # Amplitude-based mask
+    wmax = jnp.max(A)
+    lower = lower_factor * w0
+    upper = upper_frac_of_max * wmax
+    mask = (A >= lower) & (A <= upper)
 
-    # Choose window indices as *JAX scalars* (tracers under jit)
-    i0_f = frac_low * (T_eff - 1)
-    i1_f = frac_high * (T_eff - 1)
-    i0 = jnp.floor(i0_f).astype(jnp.int32)
-    i1 = jnp.ceil(i1_f).astype(jnp.int32)
+    def _fit_on_mask(mask_local):
+        # Select masked points
+        t_sel = ts[mask_local]
+        A_sel = A[mask_local]
+        lnA_sel = jnp.log(jnp.maximum(A_sel, eps))
 
-    # Enforce a minimum number of points
-    i1 = jnp.maximum(i1, i0 + min_points)
-    i1 = jnp.minimum(i1, T)
+        t_mean = jnp.mean(t_sel)
+        y_mean = jnp.mean(lnA_sel)
+        dt = t_sel - t_mean
+        dy = lnA_sel - y_mean
+        denom = jnp.sum(dt**2) + 1e-30
+        gamma = jnp.sum(dt * dy) / denom
+        c = y_mean - gamma * t_mean
 
-    lnA = jnp.log(amp + 1e-30)
+        # Reconstruct lnA fit on the full time array (for plotting)
+        lnA_fit_full = gamma * ts + c
 
-    # Build a boolean mask instead of slicing
-    idx = jnp.arange(T, dtype=jnp.int32)
-    mask_good = (idx >= i0) & (idx < i1)
-    w = mask_good.astype(ts.dtype)  # weights: 1 inside window, 0 outside
+        # Boolean mask for plotting
+        return gamma, lnA_fit_full, mask_local
 
-    # Weighted linear regression lnA ≈ a t + b over full arrays with weights w
-    W = jnp.sum(w) + 1e-16
+    def _fallback(_):
+        # Fit over all times if the window is too small
+        lnA_all = jnp.log(jnp.maximum(A, eps))
+        t_mean = jnp.mean(ts)
+        y_mean = jnp.mean(lnA_all)
+        dt = ts - t_mean
+        dy = lnA_all - y_mean
+        denom = jnp.sum(dt**2) + 1e-30
+        gamma = jnp.sum(dt * dy) / denom
+        c = y_mean - gamma * t_mean
+        lnA_fit_full = gamma * ts + c
+        mask_all = jnp.ones_like(ts, dtype=bool)
+        return gamma, lnA_fit_full, mask_all
 
-    x = ts
-    y = lnA
+    n_points = jnp.sum(mask.astype(jnp.int32))
+    gamma, lnA_fit_full, mask_lin = lax.cond(
+        n_points >= min_points,
+        lambda _: _fit_on_mask(mask),
+        _fallback,
+        operand=None,
+    )
 
-    x_mean = jnp.sum(w * x) / W
-    y_mean = jnp.sum(w * y) / W
-
-    cov_xy = jnp.sum(w * (x - x_mean) * (y - y_mean)) / W
-    var_x  = jnp.sum(w * (x - x_mean) ** 2) / W + 1e-16
-
-    gamma_fit = cov_xy / var_x
-    intercept = y_mean - gamma_fit * x_mean
-
-    # Fitted lnA over the *full* time array
-    lnA_fit = gamma_fit * ts + intercept
-
-    return gamma_fit, lnA_fit, mask_good
+    return gamma, lnA_fit_full, mask_lin
 
 # -----------------------------------------------------------------------------#
 # Reconnection and island / plasmoid diagnostics

@@ -2109,10 +2109,10 @@ def solve_fci(npz_file: str, grid_N: int = 64, N_phi: int = 128, eps: float = 1e
 
 if __name__ == "__main__":
 
-    default_solution = "wout_precise_QA_solution.npz"
+    # default_solution = "wout_precise_QA_solution.npz"
     # default_solution = "wout_precise_QH_solution.npz"
     # default_solution = "wout_SLAM_4_coils_solution.npz"
-    # default_solution = "wout_SLAM_6_coils_solution.npz"
+    default_solution = "wout_SLAM_6_coils_solution.npz"
     # default_solution = "knot_tube_solution.npz"
 
     nfp_default = 2

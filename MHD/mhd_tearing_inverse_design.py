@@ -18,26 +18,13 @@ simulation* so that the reconnection metrics match a desired target:
 
     y* = (f_kin*, C_plasmoid*)
 
-This is a minimal demonstration of "differentiable physics for inverse
-design" applied to MHD tearing and plasmoid reconnection.
+This script runs the inverse design, saves:
+  - baseline (mid-range) run,
+  - mid-training run,
+  - final designed run,
+  - training history for post-processing,
 
-Outputs:
-  - History plots:
-      * inverse_design_training_history.png
-  - Post-optimization simulation comparison:
-      * inverse_design_energy_evolution.png
-      * inverse_design_energy_fraction.png
-      * inverse_design_reconnection_rate.png
-      * inverse_design_tearing_growth.png
-      * inverse_design_Az_midplane_profiles.png
-  - NPZ checkpoint for the final ("designed") run:
-      * mhd_tearing_inverse_design_solution_final.npz
-  - Serialized trained design network:
-      * design_mlp_final.eqx
-
-The final NPZ can be post-processed with:
-
-    python mhd_tearing_postprocess.py mhd_tearing_inverse_design_solution_final.npz
+and produces publication-ready diagnostic figures.
 """
 
 from __future__ import annotations
@@ -47,6 +34,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple
 
 import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -82,21 +70,21 @@ class InverseDesignConfig:
     # Time integration
     t0: float = 0.0
     t1: float = 60.0
-    n_frames: int = 120
+    n_frames: int = 150
     dt0: float = 5e-4
 
     # Equilibrium
-    equilibrium_mode: str = "forcefree"   # plasmoid-prone; "original" also possible
+    equilibrium_mode: str = "forcefree"   # "forcefree" or "original"
 
-    # Target reconnection behaviour
-    # These are dimensionless, data-driven and should be tuned
-    target_f_kin: float = 0.03           # desired late-time kinetic energy fraction
-    target_complexity: float = 1e-5      # desired plasmoid complexity
+    # Target reconnection behaviour (values are overridden in main()
+    # depending on equilibrium_mode)
+    target_f_kin: float = 0.03
+    target_complexity: float = 1e-5
 
     # Trade-off between matching f_kin and complexity
-    lambda_complexity: float = 10.0
+    lambda_complexity: float = 1e3
 
-    # Bounds for eta and nu (log10-space)
+    # Bounds for eta and nu (log10-space) 
     log10_eta_min: float = -4.5
     log10_eta_max: float = -2.0
     log10_nu_min: float = -4.5
@@ -106,8 +94,8 @@ class InverseDesignConfig:
     latent_dim: int = 1                  # dimension of latent design variable z
     hidden_width: int = 32
     hidden_depth: int = 2
-    learning_rate: float = 1e-2
-    n_train_steps: int = 10              # keep small initially (each step runs a full sim)
+    learning_rate: float = 1e-3
+    n_train_steps: int = 25              # each step runs a full simulation
     print_every: int = 1
 
     # Latent design value to train at (scalar)
@@ -115,7 +103,6 @@ class InverseDesignConfig:
 
     # Random seed
     seed: int = 1234
-
 
 # -----------------------------------------------------------------------------
 # Small neural network: design MLP (manual stack of Linear layers)
@@ -227,7 +214,9 @@ def _simulate_metrics(eta: jnp.ndarray,
 
     complexity = plasmoid_complexity_metric(Az_final_mid)
 
-    return f_kin, complexity, res
+    gamma_fit = res["gamma_fit"]
+    return f_kin, complexity, gamma_fit, res
+
 
 def _squash_to_interval(raw: jnp.ndarray, xmin: float, xmax: float) -> jnp.ndarray:
     """
@@ -244,11 +233,6 @@ def _squash_to_interval(raw: jnp.ndarray, xmin: float, xmax: float) -> jnp.ndarr
 # -----------------------------------------------------------------------------
 # Loss function and training step
 # -----------------------------------------------------------------------------
-
-def _clip_log10(x_log10: jnp.ndarray, xmin: float, xmax: float) -> jnp.ndarray:
-    """Clip log10 values into [xmin, xmax] in a differentiable-friendly way."""
-    return jnp.clip(x_log10, xmin, xmax)
-
 
 def make_loss_fn(cfg: InverseDesignConfig):
     """
@@ -274,11 +258,11 @@ def make_loss_fn(cfg: InverseDesignConfig):
         nu  = 10.0**log10_nu
 
         # Run MHD simulation and get metrics (differentiable!)
-        f_kin, complexity, res = _simulate_metrics(eta, nu, cfg)
+        f_kin, complexity, gamma_fit, res = _simulate_metrics(eta, nu, cfg)
 
-        # Loss
         diff_f = f_kin - target[0]
         diff_c = complexity - target[1]
+
         loss = diff_f**2 + cfg.lambda_complexity * diff_c**2
 
         # Debug printing (AD-safe)
@@ -306,6 +290,7 @@ def make_loss_fn(cfg: InverseDesignConfig):
         return loss, aux
 
     return loss_fn
+
 
 def build_training_step(
     cfg: InverseDesignConfig,
@@ -534,6 +519,18 @@ def plot_Az_midplane_profiles(res_init: Dict[str, Any],
 def main():
     cfg = InverseDesignConfig()
 
+    # Choose targets depending on equilibrium_mode
+    if cfg.equilibrium_mode == "forcefree":
+        cfg.target_f_kin = 0.035
+        cfg.target_complexity = 5e-4
+    elif cfg.equilibrium_mode == "original":
+        cfg.target_f_kin = 0.015
+        cfg.target_complexity = 2e-4
+    else:
+        raise ValueError(f"Unknown equilibrium_mode: {cfg.equilibrium_mode}")
+
+    cfg.lambda_complexity = 1e3  # complexity term scaled to match f_kin variations
+
     print("========================================================")
     print(" Differentiable inverse design for tearing reconnection ")
     print("========================================================")
@@ -553,9 +550,12 @@ def main():
     # Split model into trainable array params and static structure
     params, static_model = eqx.partition(model, eqx.is_array)
 
-    optimizer = optax.adam(cfg.learning_rate)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),    # NEW: gradient clipping
+        optax.adam(cfg.learning_rate),
+    )
     opt_state = optimizer.init(params)
-
+    
     # Build jitted training step that closes over optimizer + static_model
     training_step = build_training_step(cfg, optimizer, static_model)
 
@@ -566,7 +566,7 @@ def main():
     nu0  = 10.0**log10_nu0
 
     print("\n[BASELINE] Running baseline simulation at mid-range (eta0, nu0)...")
-    f_kin0, comp0, res_init = _simulate_metrics(
+    f_kin0, comp0, gamma_fit0, res_init = _simulate_metrics(
         jnp.array(eta0, dtype=jnp.float64),
         jnp.array(nu0, dtype=jnp.float64),
         cfg,
@@ -577,22 +577,22 @@ def main():
         f"f_kin0={float(f_kin0):.4f}, complexity0={float(comp0):.3e}"
     )
     # Save a dedicated NPZ for the initial run so it can be post-processed
-    #    by mhd_tearing_postprocess.py
-    outfile = "mhd_tearing_inverse_design_solution_initial.npz"
+    outfile = f"mhd_tearing_inverse_design_solution_initial_{cfg.equilibrium_mode}.npz"
     np.savez(outfile, **res_init)
     print(f"[SAVE] Saved initial solution to {outfile}")
 
+    # Quick gradient check in (log10_eta, log10_nu) space around (-3,-3)
     def simple_loss(log10_eta, log10_nu):
         eta = 10.0**log10_eta
         nu  = 10.0**log10_nu
-        f_kin, C, _ = _simulate_metrics(eta, nu, cfg)
+        f_kin, C, gamma_fit, _ = _simulate_metrics(eta, nu, cfg)
         return (f_kin - cfg.target_f_kin)**2 + cfg.lambda_complexity * (C - cfg.target_complexity)**2
 
     grad_eta, grad_nu = jax.grad(simple_loss, argnums=(0, 1))(jnp.array(-3.0), jnp.array(-3.0))
     print(f"Gradient at (-3,-3): dL/dlog10_eta={grad_eta:.3e}, dL/dlog10_nu={grad_nu:.3e}")
 
     # 3. Training loop (each step runs one full MHD simulation)
-    history = {
+    history: Dict[str, List[float]] = {
         "loss": [],
         "log10_eta": [],
         "log10_nu": [],
@@ -603,6 +603,11 @@ def main():
     }
 
     last_aux = None
+    
+    # Track best parameters by loss (early-stopping style)
+    best_loss = float("inf")
+    best_params = params
+    best_aux = None
 
     print("\n[TRAIN] Starting inverse-design training loop...")
     for step in range(cfg.n_train_steps):
@@ -627,6 +632,11 @@ def main():
         history["nu"].append(nu)
         history["f_kin"].append(f_kin)
         history["complexity"].append(comp)
+        
+        if loss_float < best_loss:
+            best_loss = loss_float
+            best_params = params
+            best_aux = aux
 
         if (step % cfg.print_every) == 0:
             print(
@@ -639,18 +649,46 @@ def main():
 
         last_aux = aux
 
-    # 4. Final designed parameters from training
-    assert last_aux is not None, "Training loop did not run."
+    # Save training history for publication-grade postprocessing
+    hist_path = f"inverse_design_history_{cfg.equilibrium_mode}.npz"
+    np.savez(hist_path, **history)
+    print(f"[SAVE] Saved inverse-design training history to {hist_path}")
+
+    # 4. Final designed parameters from best training step (early stopping)
+    assert best_aux is not None, "Training loop did not run."
+    params = best_params          # use the best parameters, not the last ones
+    last_aux = best_aux
+
     eta_final = float(last_aux["eta"])
     nu_final  = float(last_aux["nu"])
     print(
-        "\n[FINAL] Designed parameters: "
-        f"eta={eta_final:.3e}, nu={nu_final:.3e}"
+        "\n[FINAL] Designed parameters (best checkpoint): "
+        f"eta={eta_final:.3e}, nu={nu_final:.3e}, best_loss={best_loss:.3e}"
     )
 
-    # 4b. Re-run a dedicated simulation at (eta_final, nu_final)
-    #     outside jit to get a full result dict `res_final`.
-    f_kin_final, comp_final, res_final = _simulate_metrics(
+    # 4b. Mid-training run for diagnostics
+    mid_index = len(history["eta"]) // 2
+    eta_mid = history["eta"][mid_index]
+    nu_mid = history["nu"][mid_index]
+    print(
+        f"[MID] Running mid-training simulation at step {mid_index}: "
+        f"eta_mid={eta_mid:.3e}, nu_mid={nu_mid:.3e}"
+    )
+    f_kin_mid, comp_mid, gamma_fit_mid, res_mid = _simulate_metrics(
+        jnp.array(eta_mid, dtype=jnp.float64),
+        jnp.array(nu_mid, dtype=jnp.float64),
+        cfg,
+    )
+    print(
+        f"[MID] f_kin_mid={float(f_kin_mid):.4f}, "
+        f"complexity_mid={float(comp_mid):.3e}"
+    )
+    outfile_mid = f"mhd_tearing_inverse_design_solution_mid_{cfg.equilibrium_mode}.npz"
+    np.savez(outfile_mid, **res_mid)
+    print(f"[SAVE] Saved mid-training solution to {outfile_mid}")
+
+    # 4c. Final dedicated simulation at (eta_final, nu_final)
+    f_kin_final, comp_final, gamma_fit_final, res_final = _simulate_metrics(
         jnp.array(eta_final, dtype=jnp.float64),
         jnp.array(nu_final, dtype=jnp.float64),
         cfg,
@@ -664,15 +702,14 @@ def main():
     final_model = eqx.combine(params, static_model)
 
     # Save the trained design network to disk
-    model_path = "design_mlp_final.eqx"
+    model_path = f"design_mlp_final_{cfg.equilibrium_mode}.eqx"
     eqx.tree_serialise_leaves(model_path, final_model)
     print(f"[SAVE] Saved trained DesignMLP to {model_path}")
 
     # 5. Save a dedicated NPZ for the final run so it can be post-processed
-    #    by mhd_tearing_postprocess.py
-    outfile = "mhd_tearing_inverse_design_solution_final.npz"
-    np.savez(outfile, **res_final)
-    print(f"[SAVE] Saved final designed solution to {outfile}")
+    outfile_final = f"mhd_tearing_inverse_design_solution_final_{cfg.equilibrium_mode}.npz"
+    np.savez(outfile_final, **res_final)
+    print(f"[SAVE] Saved final designed solution to {outfile_final}")
 
     # 6. Make plots (training + baseline vs designed)
     print("\n[PLOT] Making training and physics diagnostics plots...")
