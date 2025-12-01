@@ -207,16 +207,13 @@ def run_metrics_for_eq_mode(
     f_kin, complexity, gamma_fit
     """
     cfg = build_inverse_cfg(fig_cfg, eq_mode)
-    f_kin, complexity, res = _simulate_metrics(
+    f_kin, complexity, gamma_fit, res = _simulate_metrics(
         jnp.asarray(eta, dtype=jnp.float64),
         jnp.asarray(nu, dtype=jnp.float64),
         cfg,
     )
 
-    # gamma_fit is stored by _run_tearing_simulation_and_diagnostics in res
-    gamma_fit = float(np.asarray(res.get("gamma_fit", np.nan)))
-
-    return float(f_kin), float(complexity), gamma_fit
+    return float(f_kin), float(complexity), float(gamma_fit)
 
 
 # -----------------------------------------------------------------------------#

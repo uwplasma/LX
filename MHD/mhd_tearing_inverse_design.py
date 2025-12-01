@@ -82,7 +82,7 @@ class InverseDesignConfig:
     target_complexity: float = 1e-5
 
     # Trade-off between matching f_kin and complexity
-    lambda_complexity: float = 1e3
+    lambda_complexity: float = 1.0
 
     # Bounds for eta and nu (log10-space) 
     log10_eta_min: float = -4.5
@@ -519,15 +519,9 @@ def plot_Az_midplane_profiles(res_init: Dict[str, Any],
 def main():
     cfg = InverseDesignConfig()
 
-    # Choose targets depending on equilibrium_mode
-    if cfg.equilibrium_mode == "forcefree":
-        cfg.target_f_kin = 0.035
-        cfg.target_complexity = 5e-4
-    elif cfg.equilibrium_mode == "original":
-        cfg.target_f_kin = 0.015
-        cfg.target_complexity = 2e-4
-    else:
-        raise ValueError(f"Unknown equilibrium_mode: {cfg.equilibrium_mode}")
+    cfg.target_f_kin = 0.03
+    cfg.target_complexity = 1e-5
+    cfg.lambda_complexity = 1.0
 
     cfg.lambda_complexity = 1e3  # complexity term scaled to match f_kin variations
 

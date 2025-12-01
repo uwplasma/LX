@@ -402,55 +402,6 @@ def sweet_parker_metrics(B0: float, a: float, eta: float) -> Dict[str, Array]:
 # -----------------------------------------------------------------------------#
 # Growth-rate estimator (JAX, robust-ish)
 # -----------------------------------------------------------------------------#
-# -----------------------------------------------------------------------------#
-# JAX-based linear regression + simple growth-rate estimator
-# -----------------------------------------------------------------------------#
-
-def _linear_regression_stats_jax(x: Array, y: Array):
-    """
-    Simple JAX-only linear regression y = a x + b with diagnostics.
-
-    Parameters
-    ----------
-    x, y : 1D jax.numpy arrays, same shape
-
-    Returns
-    -------
-    a      : slope
-    b      : intercept
-    R2     : coefficient of determination
-    a_err  : naive standard error estimate for the slope (not used in AD)
-    """
-    x = jnp.asarray(x)
-    y = jnp.asarray(y)
-    N = x.shape[0]
-
-    x_mean = jnp.mean(x)
-    y_mean = jnp.mean(y)
-
-    # Covariance and variance
-    cov_xy = jnp.mean((x - x_mean) * (y - y_mean))
-    var_x  = jnp.mean((x - x_mean)**2) + 1e-16
-
-    a = cov_xy / var_x
-    b = y_mean - a * x_mean
-
-    # Diagnostics: R² and slope error
-    y_pred = a * x + b
-    resid = y - y_pred
-    RSS = jnp.sum(resid**2)
-    TSS = jnp.sum((y - y_mean)**2) + 1e-16
-    R2  = 1.0 - RSS / TSS
-
-    # Standard error of slope (approximate)
-    # NOTE: this has little meaning for AD but is useful for debug plots.
-    dof = jnp.maximum(N - 2, 1)
-    sigma2 = RSS / dof
-    x_var_sum = jnp.sum((x - x_mean)**2) + 1e-16
-    a_err = jnp.sqrt(sigma2 / x_var_sum)
-
-    return a, b, R2, a_err
-
 
 def estimate_growth_rate(
     ts: jnp.ndarray,
@@ -462,65 +413,75 @@ def estimate_growth_rate(
     min_points: int = 8,
 ):
     """
-    Estimate tearing growth rate by fitting ln|B_x| over an amplitude-based window.
+    JAX-friendly growth-rate estimate.
 
-    - We choose points such that:
+    - Picks an amplitude window:
           lower_factor * w0 <= |B_x| <= upper_frac_of_max * max(|B_x|)
-      which (for your runs) nicely isolates the exponential rise.
+      to isolate the exponential phase.
 
-    - If that window has too few points, we fall back to fitting all times.
+    - Performs masked linear regression of ln|B_x| vs t using weighted sums
+      (no boolean indexing), so it works under jit/vmap.
+
+    Returns:
+        gamma_fit, lnA_fit_full(ts), mask_lin
     """
 
     ts = jnp.asarray(ts)
     A = jnp.asarray(mode_amp)
     eps = 1e-30
 
-    # Amplitude-based mask
+    # Build amplitude-based mask
     wmax = jnp.max(A)
     lower = lower_factor * w0
     upper = upper_frac_of_max * wmax
-    mask = (A >= lower) & (A <= upper)
+    mask = (A >= lower) & (A <= upper)         # bool[T]
+    w = mask.astype(ts.dtype)                  # 0/1 weights, same shape as ts
 
-    def _fit_on_mask(mask_local):
-        # Select masked points
-        t_sel = ts[mask_local]
-        A_sel = A[mask_local]
-        lnA_sel = jnp.log(jnp.maximum(A_sel, eps))
+    def _fit_weighted(args):
+        ts_local, A_local, w_local = args
 
-        t_mean = jnp.mean(t_sel)
-        y_mean = jnp.mean(lnA_sel)
-        dt = t_sel - t_mean
-        dy = lnA_sel - y_mean
-        denom = jnp.sum(dt**2) + 1e-30
-        gamma = jnp.sum(dt * dy) / denom
-        c = y_mean - gamma * t_mean
+        lnA = jnp.log(jnp.maximum(A_local, eps))
 
-        # Reconstruct lnA fit on the full time array (for plotting)
-        lnA_fit_full = gamma * ts + c
+        S_w  = jnp.sum(w_local) + 1e-30
+        S_t  = jnp.sum(w_local * ts_local)
+        S_y  = jnp.sum(w_local * lnA)
+        S_tt = jnp.sum(w_local * ts_local * ts_local)
+        S_ty = jnp.sum(w_local * ts_local * lnA)
 
-        # Boolean mask for plotting
-        return gamma, lnA_fit_full, mask_local
+        denom = (S_tt - S_t * S_t / S_w) + 1e-30
+        gamma = (S_ty - S_t * S_y / S_w) / denom
+        c = (S_y - gamma * S_t) / S_w
 
-    def _fallback(_):
-        # Fit over all times if the window is too small
-        lnA_all = jnp.log(jnp.maximum(A, eps))
-        t_mean = jnp.mean(ts)
-        y_mean = jnp.mean(lnA_all)
-        dt = ts - t_mean
-        dy = lnA_all - y_mean
-        denom = jnp.sum(dt**2) + 1e-30
-        gamma = jnp.sum(dt * dy) / denom
-        c = y_mean - gamma * t_mean
-        lnA_fit_full = gamma * ts + c
-        mask_all = jnp.ones_like(ts, dtype=bool)
+        lnA_fit_full = gamma * ts_local + c
+        return gamma, lnA_fit_full, mask
+
+    def _fit_all(args):
+        ts_local, A_local, _ = args
+        lnA = jnp.log(jnp.maximum(A_local, eps))
+        w_local = jnp.ones_like(ts_local, dtype=ts_local.dtype)
+
+        S_w  = jnp.sum(w_local)
+        S_t  = jnp.sum(w_local * ts_local)
+        S_y  = jnp.sum(w_local * lnA)
+        S_tt = jnp.sum(w_local * ts_local * ts_local)
+        S_ty = jnp.sum(w_local * ts_local * lnA)
+
+        denom = (S_tt - S_t * S_t / S_w) + 1e-30
+        gamma = (S_ty - S_t * S_y / S_w) / denom
+        c = (S_y - gamma * S_t) / S_w
+
+        lnA_fit_full = gamma * ts_local + c
+        mask_all = jnp.ones_like(ts_local, dtype=bool)
         return gamma, lnA_fit_full, mask_all
 
-    n_points = jnp.sum(mask.astype(jnp.int32))
+    # How many masked points?
+    n_points = jnp.sum(w).astype(jnp.int32)
+
     gamma, lnA_fit_full, mask_lin = lax.cond(
         n_points >= min_points,
-        lambda _: _fit_on_mask(mask),
-        _fallback,
-        operand=None,
+        _fit_weighted,
+        _fit_all,
+        operand=(ts, A, w),
     )
 
     return gamma, lnA_fit_full, mask_lin
