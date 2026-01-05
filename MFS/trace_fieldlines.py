@@ -731,7 +731,7 @@ if __name__ == "__main__":
     if 'QH' in default_solution: nfp_default = 4
     if 'SLAM' in default_solution:
         n_save_default = 0.5; tfinal_default = 15000
-        seeds_default = "2.55:0:0,2.:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
+        seeds_default = "2.55:0:0,2.65:0:0,2.75:0:0,2.8:0:0,2.85:0:0,2.9:0:0,2.95:0:0,3.0:0:0"
     if 'knot' in default_solution:
         nfp_default = 3; tfinal_default = 120; n_save_default = 5
         seeds_default = "1.14:0:0,1.17:0:0,1.2:0:0,1.23:0:0,1.26:0:0,1.29:0:0,1.32:0:0,1.35:0:0"

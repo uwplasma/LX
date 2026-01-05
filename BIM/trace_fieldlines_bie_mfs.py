@@ -871,7 +871,7 @@ def main(
                     label = None
                 ax_p.scatter(
                     Rk[mask_s], Zk[mask_s],
-                    s=0.5, alpha=0.85, rasterized=True,
+                    s=0.8, alpha=0.95, rasterized=True,
                     color=color, label=label,
                 )
 
@@ -973,20 +973,25 @@ def main(
 
 if __name__ == "__main__":
     # Default example (adjust to your filenames)
-    default_solution = "wout_precise_QA_mfs_energymin_vmec_like_solution.npz"
+    # default_solution = "wout_precise_QA_mfs_energymin_vmec_like_solution.npz"
     # default_solution = "wout_precise_QH_mfs_energymin_vmec_like_solution.npz"
-    # default_solution = "slam_surface_mfs_energymin_vmec_like_solution.npz"
+    default_solution = "wout_SLAM_6_coils_mfs_energymin_vmec_like_solution.npz"
     # default_solution = "knot_tube_mfs_energymin_vmec_like_solution.npz"
 
     nfp_default = 2
-    tfinal_default = 0.2
+    tfinal_default = 100
     seeds_default = None
     n_save_default = 10  # so n_save_total ≈ n_save * tfinal
 
     if "QH" in default_solution:
         nfp_default = 4
+        tfinal_default = 5000
+        n_save_default = 1
     if "knot" in default_solution:
         nfp_default = 3
+    if "SLAM" in default_solution:
+        tfinal_default = 40000;n_save_default = 0.05
+        seeds_default = "2.65:0:0,3.1:0:0,2.75:0:0,3.2:0:0,2.85:0:0,2.9:0:0,3.25:0:0,3.0:0:0"
 
     ap = argparse.ArgumentParser(
         description="Trace field lines inside an MFS-based vacuum field solution."
@@ -1031,7 +1036,7 @@ if __name__ == "__main__":
                     help="Half-width of selection strip (fraction of spread) in e2.")
     ap.add_argument("--plane-tol-frac", type=float, default=0.10,
                     help="For torus: |s| tolerance along a_hat (fraction of span).")
-    ap.add_argument("--inward-frac", type=float, default=0.02,
+    ap.add_argument("--inward-frac", type=float, default=0.3,
                     help="Inward nudge fraction based on local spacing.")
     ap.add_argument("--poincare-tight", action="store_true", default=True,
                     help="Tight axes based on data percentiles; disables equal aspect.")

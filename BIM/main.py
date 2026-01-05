@@ -927,8 +927,8 @@ if __name__ == "__main__":
     # Default example (adjust file_name to your case)
     # file_name = "wout_precise_QH"
     # file_name = "wout_precise_QA"
-    file_name = "wout_SLAM_6_coils"
-    # file_name = "wout_SLAM_4_coils"
+    # file_name = "wout_SLAM_6_coils"
+    file_name = "wout_SLAM_4_coils"
     # file_name = "sflm_rm4"
     # file_name = "knot_tube"
     
